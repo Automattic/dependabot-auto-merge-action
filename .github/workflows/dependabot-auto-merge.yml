@@ -1,0 +1,244 @@
+name: Dependabot auto-merge
+
+on:
+    workflow_call:
+        inputs:
+            event-name:
+                description: 'Pass ${{ github.event_name }} from the caller workflow so jobs can route correctly.'
+                type: string
+                required: true
+            cvss-threshold:
+                description: 'Minimum CVSS score to qualify for auto-merge (Gate 2). Float string, e.g. "7.0".'
+                type: string
+                default: '7.0'
+            compatibility-threshold:
+                description: 'Minimum Dependabot compatibility score % for direct dependencies (Gate 3).'
+                type: number
+                default: 80
+            age-days:
+                description: 'Minimum days a PR must be open before the scheduled job merges it.'
+                type: number
+                default: 7
+            merge-method:
+                description: 'Merge strategy passed to gh pr merge: squash, merge, or rebase.'
+                type: string
+                default: 'squash'
+            fast-track-label:
+                description: 'Label that bypasses all gates and enables immediate auto-merge.'
+                type: string
+                default: 'security-fast-track'
+            review-label:
+                description: 'Label applied to PRs that fail a gate and need human review.'
+                type: string
+                default: 'sirt-review-required'
+            pending-label:
+                description: 'Label applied to PRs that passed all gates and are awaiting the age gate.'
+                type: string
+                default: 'auto-merge-pending'
+            review-team:
+                description: 'Optional GitHub team slug (org/team) to @-mention in review-required comments.'
+                type: string
+                default: ''
+
+permissions:
+    pull-requests: write
+    contents: write
+    security-events: read
+
+jobs:
+    # Runs on every Dependabot PR event. Checks eligibility gates and labels
+    # the PR accordingly. The age gate is handled by the scheduled job below.
+    evaluate-pr:
+        name: Evaluate security PR eligibility
+        runs-on: ubuntu-latest
+        if: inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
+        steps:
+            - uses: dependabot/fetch-metadata@v2
+              id: meta
+
+            # Human override: a reviewer has verified this is a legitimate security
+            # fix. Bypass all automated gates and enable auto-merge immediately.
+            - name: Fast-track — human-verified override (bypasses all gates)
+              id: fast-track
+              if: contains(github.event.pull_request.labels.*.name, inputs.fast-track-label)
+              run: |
+                  gh pr merge --auto --${{ inputs.merge-method }} "$PR_URL"
+              env:
+                  PR_URL: ${{ github.event.pull_request.html_url }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # Gate 1: must be a security advisory, not a routine version bump.
+            # fetch-metadata only embeds ghsa-id for direct-dependency security
+            # update PRs, so indirect deps always come through empty here.
+            - name: Gate 1 — security advisory check
+              id: gate1
+              if: steps.fast-track.conclusion == 'skipped'
+              run: |
+                  if [ -z "${{ steps.meta.outputs.ghsa-id }}" ]; then
+                      echo "pass=false" >> $GITHUB_OUTPUT
+                      echo "No GHSA ID from PR metadata — checking Dependabot alerts API."
+                  else
+                      echo "pass=true" >> $GITHUB_OUTPUT
+                      echo "cvss=${{ steps.meta.outputs.cvss }}" >> $GITHUB_OUTPUT
+                  fi
+
+            # Gate 1 fallback: for indirect dependencies, fetch-metadata cannot embed
+            # advisory data. Query the Dependabot alerts API directly and match open
+            # alerts against the packages being updated.
+            - name: Gate 1 fallback — Dependabot alerts API (indirect deps)
+              id: gate1-fallback
+              if: steps.fast-track.conclusion == 'skipped' && steps.gate1.outputs.pass == 'false'
+              run: |
+                  PKGS="${{ steps.meta.outputs.dependency-names }}"
+                  RESULT=$(gh api "repos/$GITHUB_REPOSITORY/dependabot/alerts" \
+                    --jq '[.[] | select(.state == "open" and .security_advisory.ghsa_id != null)
+                           | select(.dependency.package.name as $n |
+                               ($PKGS | split(", ") | index($n)) != null)]
+                           | sort_by(-.security_advisory.cvss.score) | first
+                           | {ghsa: .security_advisory.ghsa_id,
+                              cvss: (.security_advisory.cvss.score // 0)}' 2>/dev/null)
+                  if [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
+                      echo "pass=false" >> $GITHUB_OUTPUT
+                      echo "cvss=0" >> $GITHUB_OUTPUT
+                      echo "No matching open Dependabot alert found — routine version update."
+                  else
+                      GHSA=$(echo "$RESULT" | jq -r '.ghsa')
+                      CVSS=$(echo "$RESULT" | jq -r '.cvss')
+                      echo "pass=true" >> $GITHUB_OUTPUT
+                      echo "cvss=$CVSS" >> $GITHUB_OUTPUT
+                      echo "Advisory $GHSA (CVSS $CVSS) found via Dependabot alerts API."
+                  fi
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # Resolve the effective CVSS from whichever source succeeded.
+            - name: Resolve effective CVSS
+              id: cvss
+              if: |
+                  steps.fast-track.conclusion == 'skipped' &&
+                  (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
+              run: |
+                  CVSS="${{ steps.gate1.outputs.cvss }}"
+                  [ -z "$CVSS" ] || [ "$CVSS" = "0" ] && CVSS="${{ steps.gate1-fallback.outputs.cvss }}"
+                  echo "value=$CVSS" >> $GITHUB_OUTPUT
+
+            # Metadata check: fail closed if CVSS is still unavailable after both sources.
+            - name: Verify advisory metadata is available
+              id: metadata-check
+              if: |
+                  steps.fast-track.conclusion == 'skipped' &&
+                  (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
+              run: |
+                  CVSS="${{ steps.cvss.outputs.value }}"
+                  if [ -z "$CVSS" ] || [ "$CVSS" = "0" ]; then
+                      echo "available=false" >> $GITHUB_OUTPUT
+                      echo "CVSS unavailable — failing closed."
+                  else
+                      echo "available=true" >> $GITHUB_OUTPUT
+                  fi
+
+            # Gate 2: high or critical severity.
+            - name: Gate 2 — severity check (CVSS ≥ ${{ inputs.cvss-threshold }})
+              id: gate2
+              if: |
+                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.metadata-check.outputs.available == 'true'
+              run: |
+                  CVSS="${{ steps.cvss.outputs.value }}"
+                  THRESHOLD="${{ inputs.cvss-threshold }}"
+                  if (( $(echo "$CVSS >= $THRESHOLD" | bc -l) )); then
+                      echo "pass=true" >> $GITHUB_OUTPUT
+                  else
+                      echo "pass=false" >> $GITHUB_OUTPUT
+                      echo "CVSS $CVSS is below the threshold of $THRESHOLD."
+                  fi
+
+            # Gate 3: compatibility score.
+            # Skipped for indirect-dep PRs: fetch-metadata cannot provide a score
+            # for transitive dependencies. The age gate provides the timing safeguard.
+            - name: Gate 3 — compatibility score (≥ ${{ inputs.compatibility-threshold }}%)
+              id: gate3
+              if: |
+                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.gate2.outputs.pass == 'true' &&
+                  steps.gate1-fallback.outputs.pass != 'true' &&
+                  steps.meta.outputs.compatibility-score != ''
+              run: |
+                  SCORE="${{ steps.meta.outputs.compatibility-score }}"
+                  THRESHOLD="${{ inputs.compatibility-threshold }}"
+                  if [ "${SCORE:-0}" -ge "$THRESHOLD" ]; then
+                      echo "pass=true" >> $GITHUB_OUTPUT
+                  else
+                      echo "pass=false" >> $GITHUB_OUTPUT
+                      echo "Compatibility score $SCORE is below $THRESHOLD%."
+                  fi
+
+            # Metadata unavailable or gates 2/3 failed — label for human review.
+            - name: Label — ${{ inputs.review-label }}
+              if: |
+                  steps.fast-track.conclusion == 'skipped' &&
+                  (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true') &&
+                  (steps.metadata-check.outputs.available == 'false' ||
+                   steps.gate2.outputs.pass == 'false' ||
+                   steps.gate3.outputs.pass == 'false')
+              run: |
+                  if [ "${{ steps.metadata-check.outputs.available }}" == "false" ]; then
+                      REASON="advisory metadata (CVSS) was unavailable — failing closed"
+                  elif [ "${{ steps.gate2.outputs.pass }}" == "false" ]; then
+                      REASON="CVSS score (${{ steps.cvss.outputs.value }}) is below the threshold of ${{ inputs.cvss-threshold }}"
+                  else
+                      REASON="compatibility score (${{ steps.meta.outputs.compatibility-score }}%) is below the required ${{ inputs.compatibility-threshold }}%"
+                  fi
+                  TEAM_MENTION=""
+                  if [ -n "${{ inputs.review-team }}" ]; then
+                      TEAM_MENTION=" cc @${{ inputs.review-team }}"
+                  fi
+                  gh pr edit "$PR_URL" --add-label "${{ inputs.review-label }}"
+                  gh pr comment "$PR_URL" --body "This PR has been routed to the security-review path: $REASON.$TEAM_MENTION"
+              env:
+                  PR_URL: ${{ github.event.pull_request.html_url }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # All gates cleared — label as pending for the scheduled age-gate check.
+            - name: Label — ${{ inputs.pending-label }} (awaiting age gate)
+              if: |
+                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.gate2.outputs.pass == 'true' &&
+                  (steps.gate3.conclusion == 'skipped' || steps.gate3.outputs.pass == 'true') &&
+                  !contains(github.event.pull_request.labels.*.name, inputs.pending-label)
+              run: |
+                  gh pr edit "$PR_URL" --add-label "${{ inputs.pending-label }}"
+              env:
+                  PR_URL: ${{ github.event.pull_request.html_url }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # Labeling step failed — notify so the failure doesn't go unnoticed.
+            - name: Notify on labeling failure
+              if: failure()
+              run: |
+                  echo "Workflow failed for PR ${{ github.event.pull_request.html_url }}"
+
+    # Runs daily. Finds PRs labelled with the pending label that have cleared
+    # the age gate and enables auto-merge on them.
+    scheduled-merge:
+        name: Scheduled merge of eligible PRs
+        runs-on: ubuntu-latest
+        if: inputs.event-name == 'schedule'
+        steps:
+            - name: Merge PRs past age gate
+              run: |
+                  gh pr list \
+                      --repo "$GITHUB_REPOSITORY" \
+                      --author "app/dependabot" \
+                      --label "${{ inputs.pending-label }}" \
+                      --state open \
+                      --json number,createdAt \
+                      --jq '.[] | select(
+                          ((now - (.createdAt | fromdateiso8601)) / 86400) >= ${{ inputs.age-days }}
+                      ) | .number' \
+                  | while read PR_NUM; do
+                      echo "Enabling auto-merge on PR #$PR_NUM"
+                      gh pr merge "$PR_NUM" --auto --${{ inputs.merge-method }} --repo "$GITHUB_REPOSITORY" || true
+                  done
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
