@@ -94,9 +94,10 @@ jobs:
                     --jq '[.[] | select(.state == "open" and .security_advisory.ghsa_id != null)
                            | select(.dependency.package.name as $n |
                                ($PKGS | split(", ") | index($n)) != null)]
-                           | sort_by(-.security_advisory.cvss.score) | first
+                           | sort_by(-(.security_advisory.cvss.score // 0)) | first
+                           | select(. != null)
                            | {ghsa: .security_advisory.ghsa_id,
-                              cvss: (.security_advisory.cvss.score // 0)}' 2>/dev/null)
+                              cvss: (.security_advisory.cvss.score // 0)}' 2>/dev/null) || true
                   if [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
                       echo "pass=false" >> $GITHUB_OUTPUT
                       echo "cvss=0" >> $GITHUB_OUTPUT
