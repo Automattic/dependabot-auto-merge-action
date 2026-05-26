@@ -107,8 +107,8 @@ jobs:
                           RESULT=""
                       }
                   else
-                      echo "::warning::Gate 1 fallback: Dependabot alerts API call failed — $(echo "$API_RESPONSE" | head -c 300)"
-                      RESULT=""
+                      echo "::error::Gate 1 fallback: Dependabot alerts API call failed — $(echo "$API_RESPONSE" | head -c 300)"
+                      exit 1
                   fi
 
                   if [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
