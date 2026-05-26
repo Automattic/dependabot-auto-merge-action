@@ -2,6 +2,10 @@ name: Dependabot auto-merge
 
 on:
     workflow_call:
+        secrets:
+            token:
+                description: 'Token with security-events: read for the Dependabot alerts API. Pass a PAT or fine-grained token when GITHUB_TOKEN lacks access (e.g. in orgs with restricted default permissions). Defaults to GITHUB_TOKEN.'
+                required: false
         inputs:
             event-name:
                 description: 'Pass github.event_name from the caller workflow so jobs can route correctly.'
@@ -123,7 +127,7 @@ jobs:
                       echo "Advisory $GHSA (CVSS $CVSS) found via Dependabot alerts API."
                   fi
               env:
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_TOKEN: ${{ secrets.token || github.token }}
 
             # Resolve the effective CVSS from whichever source succeeded.
             - name: Resolve effective CVSS

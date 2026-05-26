@@ -79,6 +79,12 @@ Your default branch needs a branch protection rule (or ruleset) with at least on
 | `pending-label` | string | `'auto-merge-pending'` | Label applied when a PR passes all gates and is waiting for the age gate. |
 | `review-team` | string | `''` | Optional. GitHub team slug (`org/team`) @-mentioned in review-required comments. |
 
+## Secrets
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `token` | No | Token used to call the Dependabot alerts API (Gate 1 fallback for indirect deps). Defaults to `GITHUB_TOKEN`. Pass a PAT or fine-grained token when `GITHUB_TOKEN` lacks `security-events: read` access — common in orgs with restricted default permissions. |
+
 ## Customisation examples
 
 Lower the CVSS threshold and shorten the age gate:
@@ -121,6 +127,26 @@ permissions:
 ```
 
 These are the minimum required. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
+
+### When GITHUB_TOKEN returns 403 on the Dependabot alerts API
+
+Some organisations restrict `GITHUB_TOKEN` so it cannot read security events, even when `security-events: read` is declared. In that case the Gate 1 fallback step will fail with a 403. The fix is to create a PAT (or a fine-grained token with **Security events → Read** on the target repo) and pass it as a secret:
+
+```yaml
+jobs:
+    dependabot-auto-merge:
+        uses: asahasrabuddhe/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1
+        permissions:
+            pull-requests: write
+            contents: write
+            security-events: read
+        with:
+            event-name: ${{ github.event_name }}
+        secrets:
+            token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+```
+
+Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`.
 
 ## How it works
 
