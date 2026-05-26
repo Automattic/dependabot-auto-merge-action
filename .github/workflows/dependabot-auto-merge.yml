@@ -90,14 +90,27 @@ jobs:
               if: steps.fast-track.conclusion == 'skipped' && steps.gate1.outputs.pass == 'false'
               run: |
                   PKGS="${{ steps.meta.outputs.dependency-names }}"
-                  RESULT=$(gh api "repos/$GITHUB_REPOSITORY/dependabot/alerts" \
-                    --jq '[.[] | select(.state == "open" and .security_advisory.ghsa_id != null)
+
+                  # Split API call and jq into separate stages so each failure
+                  # mode surfaces as a named warning rather than a silent exit-1.
+                  if API_RESPONSE=$(gh api "repos/$GITHUB_REPOSITORY/dependabot/alerts" 2>&1); then
+                      RESULT=$(echo "$API_RESPONSE" | jq \
+                          --arg pkgs "$PKGS" \
+                          '[.[] | select(.state == "open" and .security_advisory.ghsa_id != null)
                            | select(.dependency.package.name as $n |
-                               ($PKGS | split(", ") | index($n)) != null)]
+                               ($pkgs | split(", ") | index($n)) != null)]
                            | sort_by(-(.security_advisory.cvss.score // 0)) | first
                            | select(. != null)
                            | {ghsa: .security_advisory.ghsa_id,
-                              cvss: (.security_advisory.cvss.score // 0)}' 2>/dev/null) || true
+                              cvss: (.security_advisory.cvss.score // 0)}' 2>&1) || {
+                          echo "::warning::Gate 1 fallback: jq filter failed on Dependabot alerts response — treating as no advisory match."
+                          RESULT=""
+                      }
+                  else
+                      echo "::warning::Gate 1 fallback: Dependabot alerts API call failed — $(echo "$API_RESPONSE" | head -c 300)"
+                      RESULT=""
+                  fi
+
                   if [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
                       echo "pass=false" >> $GITHUB_OUTPUT
                       echo "cvss=0" >> $GITHUB_OUTPUT
