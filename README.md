@@ -34,7 +34,7 @@ permissions:
 
 jobs:
     dependabot-auto-merge:
-        uses: asahasrabuddhe/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1
         permissions:
             pull-requests: write
             contents: write
@@ -135,7 +135,7 @@ Some organisations restrict `GITHUB_TOKEN` so it cannot read security events, ev
 ```yaml
 jobs:
     dependabot-auto-merge:
-        uses: asahasrabuddhe/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1
         permissions:
             pull-requests: write
             contents: write
