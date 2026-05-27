@@ -115,8 +115,14 @@ jobs:
                           RESULT=""
                       }
                   else
-                      echo "::error::Gate 1 fallback: Dependabot alerts API call failed — $(echo "$API_RESPONSE" | head -c 300)"
-                      exit 1
+                      STATUS=$(echo "$API_RESPONSE" | jq -r '.status // empty' 2>/dev/null)
+                      if [ "$STATUS" = "404" ]; then
+                          echo "::warning::Gate 1 fallback: Dependabot alerts are not enabled on this repository — treating as no advisory match."
+                          RESULT=""
+                      else
+                          echo "::error::Gate 1 fallback: Dependabot alerts API call failed — $(echo "$API_RESPONSE" | head -c 300)"
+                          exit 1
+                      fi
                   fi
 
                   if [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
