@@ -66,8 +66,9 @@ jobs:
               id: fast-track
               if: contains(github.event.pull_request.labels.*.name, inputs.fast-track-label)
               run: |
-                  gh pr merge --auto --${{ inputs.merge-method }} "$PR_URL"
+                  gh pr merge --auto --"$MERGE_METHOD" "$PR_URL"
               env:
+                  MERGE_METHOD: ${{ inputs.merge-method }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -78,13 +79,16 @@ jobs:
               id: gate1
               if: steps.fast-track.conclusion == 'skipped'
               run: |
-                  if [ -z "${{ steps.meta.outputs.ghsa-id }}" ]; then
-                      echo "pass=false" >> $GITHUB_OUTPUT
+                  if [ -z "$GHSA_ID" ]; then
+                      echo "pass=false" >> "$GITHUB_OUTPUT"
                       echo "No GHSA ID from PR metadata — checking Dependabot alerts API."
                   else
-                      echo "pass=true" >> $GITHUB_OUTPUT
-                      echo "cvss=${{ steps.meta.outputs.cvss }}" >> $GITHUB_OUTPUT
+                      echo "pass=true" >> "$GITHUB_OUTPUT"
+                      echo "cvss=$CVSS" >> "$GITHUB_OUTPUT"
                   fi
+              env:
+                  GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
+                  CVSS: ${{ steps.meta.outputs.cvss }}
 
             # Gate 1 fallback: for indirect dependencies, fetch-metadata cannot embed
             # advisory data. Query the Dependabot alerts API directly and match open
@@ -93,7 +97,7 @@ jobs:
               id: gate1-fallback
               if: steps.fast-track.conclusion == 'skipped' && steps.gate1.outputs.pass == 'false'
               run: |
-                  PKGS="${{ steps.meta.outputs.dependency-names }}"
+                  PKGS="$DEPENDENCY_NAMES"
 
                   # Split API call and jq into separate stages so each failure
                   # mode surfaces as a named warning rather than a silent exit-1.
@@ -116,17 +120,18 @@ jobs:
                   fi
 
                   if [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
-                      echo "pass=false" >> $GITHUB_OUTPUT
-                      echo "cvss=0" >> $GITHUB_OUTPUT
+                      echo "pass=false" >> "$GITHUB_OUTPUT"
+                      echo "cvss=0" >> "$GITHUB_OUTPUT"
                       echo "No matching open Dependabot alert found — routine version update."
                   else
                       GHSA=$(echo "$RESULT" | jq -r '.ghsa')
                       CVSS=$(echo "$RESULT" | jq -r '.cvss')
-                      echo "pass=true" >> $GITHUB_OUTPUT
-                      echo "cvss=$CVSS" >> $GITHUB_OUTPUT
+                      echo "pass=true" >> "$GITHUB_OUTPUT"
+                      echo "cvss=$CVSS" >> "$GITHUB_OUTPUT"
                       echo "Advisory $GHSA (CVSS $CVSS) found via Dependabot alerts API."
                   fi
               env:
+                  DEPENDENCY_NAMES: ${{ steps.meta.outputs.dependency-names }}
                   GH_TOKEN: ${{ secrets.token || github.token }}
 
             # Resolve the effective CVSS from whichever source succeeded.
@@ -136,9 +141,12 @@ jobs:
                   steps.fast-track.conclusion == 'skipped' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
               run: |
-                  CVSS="${{ steps.gate1.outputs.cvss }}"
-                  [ -z "$CVSS" ] || [ "$CVSS" = "0" ] && CVSS="${{ steps.gate1-fallback.outputs.cvss }}"
-                  echo "value=$CVSS" >> $GITHUB_OUTPUT
+                  CVSS="$GATE1_CVSS"
+                  [ -z "$CVSS" ] || [ "$CVSS" = "0" ] && CVSS="$GATE1_FALLBACK_CVSS"
+                  echo "value=$CVSS" >> "$GITHUB_OUTPUT"
+              env:
+                  GATE1_CVSS: ${{ steps.gate1.outputs.cvss }}
+                  GATE1_FALLBACK_CVSS: ${{ steps.gate1-fallback.outputs.cvss }}
 
             # Metadata check: fail closed if CVSS is still unavailable after both sources.
             - name: Verify advisory metadata is available
@@ -147,13 +155,14 @@ jobs:
                   steps.fast-track.conclusion == 'skipped' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
               run: |
-                  CVSS="${{ steps.cvss.outputs.value }}"
                   if [ -z "$CVSS" ] || [ "$CVSS" = "0" ]; then
-                      echo "available=false" >> $GITHUB_OUTPUT
+                      echo "available=false" >> "$GITHUB_OUTPUT"
                       echo "CVSS unavailable — failing closed."
                   else
-                      echo "available=true" >> $GITHUB_OUTPUT
+                      echo "available=true" >> "$GITHUB_OUTPUT"
                   fi
+              env:
+                  CVSS: ${{ steps.cvss.outputs.value }}
 
             # Gate 2: high or critical severity.
             - name: Gate 2 — severity check (CVSS ≥ ${{ inputs.cvss-threshold }})
@@ -162,14 +171,15 @@ jobs:
                   steps.fast-track.conclusion == 'skipped' &&
                   steps.metadata-check.outputs.available == 'true'
               run: |
-                  CVSS="${{ steps.cvss.outputs.value }}"
-                  THRESHOLD="${{ inputs.cvss-threshold }}"
                   if (( $(echo "$CVSS >= $THRESHOLD" | bc -l) )); then
-                      echo "pass=true" >> $GITHUB_OUTPUT
+                      echo "pass=true" >> "$GITHUB_OUTPUT"
                   else
-                      echo "pass=false" >> $GITHUB_OUTPUT
+                      echo "pass=false" >> "$GITHUB_OUTPUT"
                       echo "CVSS $CVSS is below the threshold of $THRESHOLD."
                   fi
+              env:
+                  CVSS: ${{ steps.cvss.outputs.value }}
+                  THRESHOLD: ${{ inputs.cvss-threshold }}
 
             # Gate 3: compatibility score.
             # Skipped for indirect-dep PRs: fetch-metadata cannot provide a score
@@ -182,14 +192,15 @@ jobs:
                   steps.gate1-fallback.outputs.pass != 'true' &&
                   steps.meta.outputs.compatibility-score != ''
               run: |
-                  SCORE="${{ steps.meta.outputs.compatibility-score }}"
-                  THRESHOLD="${{ inputs.compatibility-threshold }}"
                   if [ "${SCORE:-0}" -ge "$THRESHOLD" ]; then
-                      echo "pass=true" >> $GITHUB_OUTPUT
+                      echo "pass=true" >> "$GITHUB_OUTPUT"
                   else
-                      echo "pass=false" >> $GITHUB_OUTPUT
+                      echo "pass=false" >> "$GITHUB_OUTPUT"
                       echo "Compatibility score $SCORE is below $THRESHOLD%."
                   fi
+              env:
+                  SCORE: ${{ steps.meta.outputs.compatibility-score }}
+                  THRESHOLD: ${{ inputs.compatibility-threshold }}
 
             # Metadata unavailable or gates 2/3 failed — label for human review.
             - name: Label — ${{ inputs.review-label }}
@@ -200,20 +211,28 @@ jobs:
                    steps.gate2.outputs.pass == 'false' ||
                    steps.gate3.outputs.pass == 'false')
               run: |
-                  if [ "${{ steps.metadata-check.outputs.available }}" == "false" ]; then
+                  if [ "$METADATA_AVAILABLE" == "false" ]; then
                       REASON="advisory metadata (CVSS) was unavailable — failing closed"
-                  elif [ "${{ steps.gate2.outputs.pass }}" == "false" ]; then
-                      REASON="CVSS score (${{ steps.cvss.outputs.value }}) is below the threshold of ${{ inputs.cvss-threshold }}"
+                  elif [ "$GATE2_PASS" == "false" ]; then
+                      REASON="CVSS score ($CVSS) is below the threshold of $THRESHOLD"
                   else
-                      REASON="compatibility score (${{ steps.meta.outputs.compatibility-score }}%) is below the required ${{ inputs.compatibility-threshold }}%"
+                      REASON="compatibility score ($COMPAT_SCORE%) is below the required $COMPAT_THRESHOLD%"
                   fi
                   TEAM_MENTION=""
-                  if [ -n "${{ inputs.review-team }}" ]; then
-                      TEAM_MENTION=" cc @${{ inputs.review-team }}"
+                  if [ -n "$REVIEW_TEAM" ]; then
+                      TEAM_MENTION=" cc @$REVIEW_TEAM"
                   fi
-                  gh pr edit "$PR_URL" --add-label "${{ inputs.review-label }}"
+                  gh pr edit "$PR_URL" --add-label "$REVIEW_LABEL"
                   gh pr comment "$PR_URL" --body "This PR has been routed to the security-review path: $REASON.$TEAM_MENTION"
               env:
+                  METADATA_AVAILABLE: ${{ steps.metadata-check.outputs.available }}
+                  GATE2_PASS: ${{ steps.gate2.outputs.pass }}
+                  CVSS: ${{ steps.cvss.outputs.value }}
+                  THRESHOLD: ${{ inputs.cvss-threshold }}
+                  COMPAT_SCORE: ${{ steps.meta.outputs.compatibility-score }}
+                  COMPAT_THRESHOLD: ${{ inputs.compatibility-threshold }}
+                  REVIEW_TEAM: ${{ inputs.review-team }}
+                  REVIEW_LABEL: ${{ inputs.review-label }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -225,8 +244,9 @@ jobs:
                   (steps.gate3.conclusion == 'skipped' || steps.gate3.outputs.pass == 'true') &&
                   !contains(github.event.pull_request.labels.*.name, inputs.pending-label)
               run: |
-                  gh pr edit "$PR_URL" --add-label "${{ inputs.pending-label }}"
+                  gh pr edit "$PR_URL" --add-label "$PENDING_LABEL"
               env:
+                  PENDING_LABEL: ${{ inputs.pending-label }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -234,7 +254,9 @@ jobs:
             - name: Notify on labeling failure
               if: failure()
               run: |
-                  echo "Workflow failed for PR ${{ github.event.pull_request.html_url }}"
+                  echo "Workflow failed for PR $PR_URL"
+              env:
+                  PR_URL: ${{ github.event.pull_request.html_url }}
 
     # Runs daily. Finds PRs labelled with the pending label that have cleared
     # the age gate and enables auto-merge on them.
@@ -248,15 +270,17 @@ jobs:
                   gh pr list \
                       --repo "$GITHUB_REPOSITORY" \
                       --author "app/dependabot" \
-                      --label "${{ inputs.pending-label }}" \
+                      --label "$PENDING_LABEL" \
                       --state open \
                       --json number,createdAt \
-                      --jq '.[] | select(
-                          ((now - (.createdAt | fromdateiso8601)) / 86400) >= ${{ inputs.age-days }}
-                      ) | .number' \
-                  | while read PR_NUM; do
+                  | jq -r --argjson age "$AGE_DAYS" \
+                      '.[] | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age) | .number' \
+                  | while read -r PR_NUM; do
                       echo "Enabling auto-merge on PR #$PR_NUM"
-                      gh pr merge "$PR_NUM" --auto --${{ inputs.merge-method }} --repo "$GITHUB_REPOSITORY" || true
+                      gh pr merge "$PR_NUM" --auto --"$MERGE_METHOD" --repo "$GITHUB_REPOSITORY" || true
                   done
               env:
+                  PENDING_LABEL: ${{ inputs.pending-label }}
+                  AGE_DAYS: ${{ inputs.age-days }}
+                  MERGE_METHOD: ${{ inputs.merge-method }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
