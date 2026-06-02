@@ -57,7 +57,7 @@ jobs:
         runs-on: ubuntu-latest
         if: inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
         steps:
-            - uses: dependabot/fetch-metadata@v2
+            - uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2.5.0
               id: meta
 
             # Human override: a reviewer has verified this is a legitimate security
