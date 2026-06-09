@@ -101,10 +101,10 @@ jobs:
 
                   # Split API call and jq into separate stages so each failure
                   # mode surfaces as a named warning rather than a silent exit-1.
-                  if API_RESPONSE=$(gh api "repos/$GITHUB_REPOSITORY/dependabot/alerts" 2>&1); then
+                  if API_RESPONSE=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/dependabot/alerts?state=open&per_page=100" 2>&1); then
                       RESULT=$(echo "$API_RESPONSE" | jq \
                           --arg pkgs "$PKGS" \
-                          '[.[] | select(.state == "open" and .security_advisory.ghsa_id != null)
+                          '[.[][] | select(.security_advisory.ghsa_id != null)
                            | select(.dependency.package.name as $n |
                                ($pkgs | split(", ") | index($n)) != null)]
                            | sort_by(-(.security_advisory.cvss.score // 0)) | first
