@@ -267,18 +267,27 @@ jobs:
         steps:
             - name: Merge PRs past age gate
               run: |
-                  gh pr list \
+                  # Collect PR numbers first, then iterate in the main shell: a
+                  # piped `while read` runs in a subshell, where FAILED would be
+                  # lost and every merge failure silently reported as success.
+                  PR_NUMS=$(gh pr list \
                       --repo "$GITHUB_REPOSITORY" \
                       --author "app/dependabot" \
                       --label "$PENDING_LABEL" \
                       --state open \
                       --json number,createdAt \
                   | jq -r --argjson age "$AGE_DAYS" \
-                      '.[] | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age) | .number' \
-                  | while read -r PR_NUM; do
+                      '.[] | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age) | .number')
+
+                  FAILED=0
+                  for PR_NUM in $PR_NUMS; do
                       echo "Enabling auto-merge on PR #$PR_NUM"
-                      gh pr merge "$PR_NUM" --auto --"$MERGE_METHOD" --repo "$GITHUB_REPOSITORY" || true
+                      if ! ERR=$(gh pr merge "$PR_NUM" --auto --"$MERGE_METHOD" --repo "$GITHUB_REPOSITORY" 2>&1 >/dev/null); then
+                          echo "::error::Failed to enable auto-merge on PR #$PR_NUM — $(echo "$ERR" | head -c 500 | tr '\n' ' ')"
+                          FAILED=1
+                      fi
                   done
+                  exit $FAILED
               env:
                   PENDING_LABEL: ${{ inputs.pending-label }}
                   AGE_DAYS: ${{ inputs.age-days }}
