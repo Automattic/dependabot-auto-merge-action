@@ -11,7 +11,7 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 | 3 | Compatibility score | ≥ 80% | Direct deps only; indirect deps skip this gate since fetch-metadata can't provide a score. |
 | 4 | Age gate | 7 days | Scheduled job merges passing PRs after `age-days` days. |
 
-PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A `security-fast-track` label on any PR bypasses all gates immediately.
+PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A `security-fast-track` label on any PR bypasses all gates immediately. When a PR is fast-tracked, a one-time audit comment is posted recording who applied the label, when, and a link to the workflow run.
 
 ## Usage
 
@@ -154,7 +154,7 @@ Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TO
 
 Runs on every opened/updated/labelled Dependabot PR:
 
-1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately and exit.
+1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately, post a one-time audit comment (label applier, UTC timestamp, workflow-run link), and exit. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it.
 2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID. If missing (indirect dep), fall back to the Dependabot Alerts API and match open security alerts against the updated packages.
 3. **Gate 2** — require CVSS ≥ `cvss-threshold`.
 4. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
@@ -167,5 +167,6 @@ Runs on the cron you define in the caller. Finds open PRs labelled `pending-labe
 ## Security notes
 
 - The workflow only acts on PRs authored by `app/dependabot`.
+- The fast-track path leaves an audit comment on the PR, so gate bypasses are attributable after the fact.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
 - `security-events: read` is required to call the Dependabot Alerts API for indirect dependency lookups.
