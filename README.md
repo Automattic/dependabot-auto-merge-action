@@ -61,9 +61,13 @@ Auto-merge must be allowed in your repo settings:
 
 > **Settings → General → Pull Requests → Allow auto-merge** ✓
 
+The workflow's preflight job verifies this at runtime and fails with an error pointing back here if it's disabled.
+
 ### 4. Branch protection
 
 Your default branch needs a branch protection rule (or ruleset) with at least one required status check. Without it, GitHub won't queue an auto-merge.
+
+Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fully verify ruleset-based required status checks with the default `GITHUB_TOKEN`. Classic branch protection details are only readable by admin tokens, so with classic protection the preflight can confirm the branch is protected but only warns that it cannot verify the checks themselves. If neither is configured, preflight fails with an error pointing back here.
 
 ## Inputs
 
@@ -150,9 +154,23 @@ Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TO
 
 ## How it works
 
+### `preflight` job (runs first on both triggers)
+
+Verifies the repo is actually configured for auto-merge before either merge path runs, and fails fast with actionable errors instead of letting `gh pr merge --auto` fail late (or silently never queue). Two checks:
+
+1. **"Allow auto-merge" is enabled** on the repo. Disabled → the job fails with an error pointing at the setting.
+2. **The default branch has required status checks** — ruleset-based checks are verified first; if none, the job falls back to classic branch protection. No ruleset checks and no protection rule → the job fails.
+
+Two cases warn and continue instead of failing, because the condition is unverifiable rather than known-bad:
+
+- The token cannot see the "Allow auto-merge" setting (it's only returned to tokens with push access).
+- The branch has classic protection, but the token cannot read its details (the endpoint requires admin — the standard `GITHUB_TOKEN` limitation). Migrating to rulesets makes this fully verifiable.
+
+A red preflight is intentional: it surfaces a repo where auto-merge could never have worked. It adds roughly 10–20 seconds of runner spin-up per Dependabot event.
+
 ### `evaluate-pr` job (triggers on `pull_request_target`)
 
-Runs on every opened/updated/labelled Dependabot PR:
+Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
 
 1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately and exit.
 2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID. If missing (indirect dep), fall back to the Dependabot Alerts API and match open security alerts against the updated packages.
@@ -162,7 +180,7 @@ Runs on every opened/updated/labelled Dependabot PR:
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
-Runs on the cron you define in the caller. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each.
+Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each.
 
 ## Security notes
 
