@@ -50,11 +50,102 @@ permissions:
     security-events: read
 
 jobs:
+    # Verifies the repo is actually configured for auto-merge before either
+    # merge path runs. `gh pr merge --auto` fails (or silently never queues)
+    # when "Allow auto-merge" is off or the default branch has no required
+    # status checks — fail fast here with actionable errors instead.
+    preflight:
+        name: Preflight — repo auto-merge configuration
+        runs-on: ubuntu-latest
+        if: |
+            inputs.event-name == 'schedule' ||
+            (inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]')
+        steps:
+            - name: Check auto-merge setting and required status checks
+              run: |
+                  FAIL=0
+                  DOCS="https://github.com/Automattic/dependabot-auto-merge-action#usage"
+
+                  # --- Check 1: "Allow auto-merge" repo setting ---------------
+                  # allow_auto_merge is only returned to tokens with push
+                  # access, so distinguish false (misconfigured) from absent
+                  # (unverifiable). The same call yields the default branch.
+                  if ! REPO_JSON=$(gh api "repos/$GITHUB_REPOSITORY" 2>&1); then
+                      echo "::error::Preflight: cannot read repository metadata — $(echo "$REPO_JSON" | head -c 300 | tr '\n' ' ')"
+                      exit 1
+                  fi
+
+                  ALLOW_AUTO_MERGE=$(echo "$REPO_JSON" | jq -r 'if .allow_auto_merge == true then "true" elif .allow_auto_merge == false then "false" else "unknown" end')
+                  DEFAULT_BRANCH=$(echo "$REPO_JSON" | jq -r '.default_branch')
+
+                  case "$ALLOW_AUTO_MERGE" in
+                      true)
+                          echo "OK: 'Allow auto-merge' is enabled on $GITHUB_REPOSITORY."
+                          ;;
+                      false)
+                          echo "::error::Preflight: 'Allow auto-merge' is disabled on $GITHUB_REPOSITORY, so gh pr merge --auto cannot work. Enable it under Settings → General → Pull Requests → Allow auto-merge. Setup docs: $DOCS (section '3. Enable auto-merge on the repo')."
+                          FAIL=1
+                          ;;
+                      *)
+                          echo "::warning::Preflight: this token cannot see the 'Allow auto-merge' setting (requires push access) — skipping the check. If auto-merge fails later, verify Settings → General → Pull Requests → Allow auto-merge."
+                          ;;
+                  esac
+
+                  # --- Check 2: required status checks on the default branch --
+                  # Rulesets are readable with contents: read — the recommended
+                  # path — so they are checked first.
+                  ENC_BRANCH=$(printf '%s' "$DEFAULT_BRANCH" | jq -sRr '@uri')
+
+                  RULESET_CHECKS=0
+                  if RULES_JSON=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$ENC_BRANCH?per_page=100" 2>&1); then
+                      RULESET_CHECKS=$(echo "$RULES_JSON" | jq '[.[] | select(.type == "required_status_checks")] | length' 2>/dev/null || echo 0)
+                  else
+                      echo "::warning::Preflight: could not read branch rulesets — $(echo "$RULES_JSON" | head -c 300 | tr '\n' ' '). Falling back to classic branch protection check."
+                  fi
+
+                  if [ "$RULESET_CHECKS" -gt 0 ]; then
+                      echo "OK: default branch '$DEFAULT_BRANCH' has $RULESET_CHECKS ruleset-based required status check rule(s)."
+                  else
+                      # No ruleset checks — check classic branch protection.
+                      # .protected is readable without admin; the /protection
+                      # detail endpoint is admin-only, so an error there while
+                      # the branch IS protected means "cannot verify checks",
+                      # not "no checks" → warn and continue.
+                      if BRANCH_JSON=$(gh api "repos/$GITHUB_REPOSITORY/branches/$ENC_BRANCH" 2>&1); then
+                          PROTECTED=$(echo "$BRANCH_JSON" | jq -r '.protected // false')
+                      else
+                          echo "::warning::Preflight: could not read default branch info — $(echo "$BRANCH_JSON" | head -c 300 | tr '\n' ' '). Skipping the required status checks verification."
+                          PROTECTED="unknown"
+                      fi
+
+                      if [ "$PROTECTED" = "true" ]; then
+                          if PROT_JSON=$(gh api "repos/$GITHUB_REPOSITORY/branches/$ENC_BRANCH/protection" 2>&1); then
+                              HAS_CHECKS=$(echo "$PROT_JSON" | jq '.required_status_checks != null')
+                              if [ "$HAS_CHECKS" = "true" ]; then
+                                  echo "OK: classic branch protection on '$DEFAULT_BRANCH' requires status checks."
+                              else
+                                  echo "::error::Preflight: branch protection on '$DEFAULT_BRANCH' has no required status checks, so GitHub will never queue an auto-merge. Add at least one required status check via a ruleset (Settings → Rules → Rulesets) or the branch protection rule (Settings → Branches). Setup docs: $DOCS (section '4. Branch protection')."
+                                  FAIL=1
+                              fi
+                          else
+                              echo "::warning::Preflight: '$DEFAULT_BRANCH' has classic branch protection, but this token cannot read its details (endpoint requires admin). Assuming required status checks are configured — auto-merge will fail later if they are not. Consider migrating to rulesets, which this check can verify."
+                          fi
+                      elif [ "$PROTECTED" = "false" ]; then
+                          echo "::error::Preflight: default branch '$DEFAULT_BRANCH' has no ruleset-based required status checks and no classic branch protection rule. gh pr merge --auto needs at least one required status check to queue against. Add one via a ruleset (Settings → Rules → Rulesets, recommended) or classic branch protection (Settings → Branches). Setup docs: $DOCS (section '4. Branch protection')."
+                          FAIL=1
+                      fi
+                  fi
+
+                  exit "$FAIL"
+              env:
+                  GH_TOKEN: ${{ github.token }}
+
     # Runs on every Dependabot PR event. Checks eligibility gates and labels
     # the PR accordingly. The age gate is handled by the scheduled job below.
     evaluate-pr:
         name: Evaluate security PR eligibility
         runs-on: ubuntu-latest
+        needs: preflight
         if: inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
         steps:
             - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
@@ -70,6 +161,50 @@ jobs:
               env:
                   MERGE_METHOD: ${{ inputs.merge-method }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # Audit trail: the fast-track path enables auto-merge silently, so
+            # record who applied the label, when, and the workflow run on the PR.
+            # The hidden marker makes this exactly-once: repeated synchronize
+            # events find it in an existing comment and skip.
+            - name: Fast-track — post audit comment (once)
+              if: steps.fast-track.conclusion == 'success'
+              run: |
+                  MARKER='<!-- dependabot-auto-merge:fast-track-audit -->'
+
+                  if gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+                      --jq '.[].body' | grep -qF "$MARKER"; then
+                      echo "Fast-track audit comment already exists — skipping."
+                      exit 0
+                  fi
+
+                  if [ "$EVENT_ACTION" = "labeled" ] && [ "$LABEL_NAME" = "$FAST_TRACK_LABEL" ]; then
+                      APPLIED_BY="@$SENDER"
+                  else
+                      APPLIED_BY="not recorded — the label was already present when this $EVENT_ACTION event ran"
+                  fi
+
+                  TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+                  BODY=$(cat <<EOF
+                  $MARKER
+                  **Fast-track audit** — auto-merge was enabled on this PR via the **$FAST_TRACK_LABEL** label, bypassing all gates.
+
+                  - **Label applied by:** $APPLIED_BY
+                  - **When (UTC):** $TIMESTAMP
+                  - **Workflow run:** $RUN_URL
+                  EOF
+                  )
+
+                  gh pr comment "$PR_URL" --body "$BODY"
+              env:
+                  EVENT_ACTION: ${{ github.event.action }}
+                  LABEL_NAME: ${{ github.event.label.name }}
+                  SENDER: ${{ github.event.sender.login }}
+                  FAST_TRACK_LABEL: ${{ inputs.fast-track-label }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+                  PR_URL: ${{ github.event.pull_request.html_url }}
+                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             # Gate 1: must be a security advisory, not a routine version bump.
@@ -263,6 +398,7 @@ jobs:
     scheduled-merge:
         name: Scheduled merge of eligible PRs
         runs-on: ubuntu-latest
+        needs: preflight
         if: inputs.event-name == 'schedule'
         steps:
             - name: Merge PRs past age gate

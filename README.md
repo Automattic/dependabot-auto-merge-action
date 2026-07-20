@@ -11,7 +11,7 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 | 3 | Compatibility score | ≥ 80% | Direct deps only; indirect deps skip this gate since fetch-metadata can't provide a score. |
 | 4 | Age gate | 7 days | Scheduled job merges passing PRs after `age-days` days. |
 
-PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A `security-fast-track` label on any PR bypasses all gates immediately.
+PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A `security-fast-track` label on any PR bypasses all gates immediately. When a PR is fast-tracked, a one-time audit comment is posted recording who applied the label, when, and a link to the workflow run.
 
 ## Usage
 
@@ -84,9 +84,13 @@ Auto-merge must be allowed in your repo settings:
 
 > **Settings → General → Pull Requests → Allow auto-merge** ✓
 
+The workflow's preflight job verifies this at runtime and fails with an error pointing back here if it's disabled.
+
 ### 5. Branch protection (manual alternative)
 
 Your default branch needs a branch protection rule (or ruleset) with at least one required status check. Without it, GitHub won't queue an auto-merge.
+
+Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fully verify ruleset-based required status checks with the default `GITHUB_TOKEN`. Classic branch protection details are only readable by admin tokens, so with classic protection the preflight can confirm the branch is protected but only warns that it cannot verify the checks themselves. If neither is configured, preflight fails with an error pointing back here. (`scripts/bootstrap.sh` creates a ruleset, so bootstrapped repos are fully verifiable by preflight.)
 
 Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**) — the Gate 1 fallback for indirect dependencies queries the Dependabot Alerts API.
 
@@ -175,11 +179,25 @@ Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TO
 
 ## How it works
 
+### `preflight` job (runs first on both triggers)
+
+Verifies the repo is actually configured for auto-merge before either merge path runs, and fails fast with actionable errors instead of letting `gh pr merge --auto` fail late (or silently never queue). Two checks:
+
+1. **"Allow auto-merge" is enabled** on the repo. Disabled → the job fails with an error pointing at the setting.
+2. **The default branch has required status checks** — ruleset-based checks are verified first; if none, the job falls back to classic branch protection. No ruleset checks and no protection rule → the job fails.
+
+Two cases warn and continue instead of failing, because the condition is unverifiable rather than known-bad:
+
+- The token cannot see the "Allow auto-merge" setting (it's only returned to tokens with push access).
+- The branch has classic protection, but the token cannot read its details (the endpoint requires admin — the standard `GITHUB_TOKEN` limitation). Migrating to rulesets makes this fully verifiable.
+
+A red preflight is intentional: it surfaces a repo where auto-merge could never have worked. It adds roughly 10–20 seconds of runner spin-up per Dependabot event.
+
 ### `evaluate-pr` job (triggers on `pull_request_target`)
 
-Runs on every opened/updated/labelled Dependabot PR:
+Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
 
-1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately and exit.
+1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately, post a one-time audit comment (label applier, UTC timestamp, workflow-run link), and exit. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it.
 2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID. If missing (indirect dep), fall back to the Dependabot Alerts API and match open security alerts against the updated packages.
 3. **Gate 2** — require CVSS ≥ `cvss-threshold`.
 4. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
@@ -187,10 +205,11 @@ Runs on every opened/updated/labelled Dependabot PR:
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
-Runs on the cron you define in the caller. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each.
+Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each.
 
 ## Security notes
 
 - The workflow only acts on PRs authored by `app/dependabot`.
+- The fast-track path leaves an audit comment on the PR, so gate bypasses are attributable after the fact.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
 - `security-events: read` is required to call the Dependabot Alerts API for indirect dependency lookups.
