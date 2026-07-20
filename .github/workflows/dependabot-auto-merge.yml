@@ -163,6 +163,50 @@ jobs:
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+            # Audit trail: the fast-track path enables auto-merge silently, so
+            # record who applied the label, when, and the workflow run on the PR.
+            # The hidden marker makes this exactly-once: repeated synchronize
+            # events find it in an existing comment and skip.
+            - name: Fast-track — post audit comment (once)
+              if: steps.fast-track.conclusion == 'success'
+              run: |
+                  MARKER='<!-- dependabot-auto-merge:fast-track-audit -->'
+
+                  if gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+                      --jq '.[].body' | grep -qF "$MARKER"; then
+                      echo "Fast-track audit comment already exists — skipping."
+                      exit 0
+                  fi
+
+                  if [ "$EVENT_ACTION" = "labeled" ] && [ "$LABEL_NAME" = "$FAST_TRACK_LABEL" ]; then
+                      APPLIED_BY="@$SENDER"
+                  else
+                      APPLIED_BY="not recorded — the label was already present when this $EVENT_ACTION event ran"
+                  fi
+
+                  TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+                  BODY=$(cat <<EOF
+                  $MARKER
+                  **Fast-track audit** — auto-merge was enabled on this PR via the **$FAST_TRACK_LABEL** label, bypassing all gates.
+
+                  - **Label applied by:** $APPLIED_BY
+                  - **When (UTC):** $TIMESTAMP
+                  - **Workflow run:** $RUN_URL
+                  EOF
+                  )
+
+                  gh pr comment "$PR_URL" --body "$BODY"
+              env:
+                  EVENT_ACTION: ${{ github.event.action }}
+                  LABEL_NAME: ${{ github.event.label.name }}
+                  SENDER: ${{ github.event.sender.login }}
+                  FAST_TRACK_LABEL: ${{ inputs.fast-track-label }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+                  PR_URL: ${{ github.event.pull_request.html_url }}
+                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
             # Gate 1: must be a security advisory, not a routine version bump.
             # fetch-metadata only embeds ghsa-id for direct-dependency security
             # update PRs, so indirect deps always come through empty here.
