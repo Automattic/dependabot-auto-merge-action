@@ -45,7 +45,30 @@ jobs:
 
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
 
-### 2. Create the required labels
+### 2. Bootstrap the repo prerequisites
+
+[`scripts/bootstrap.sh`](scripts/bootstrap.sh) configures everything else the workflow needs — auto-merge allowed, a required status check on the default branch, the three labels, and Dependabot vulnerability alerts. Every step is idempotent: re-runs are safe and report what is already correct.
+
+```bash
+./scripts/bootstrap.sh owner/repo --required-check "your-check-name" --dry-run
+./scripts/bootstrap.sh owner/repo --required-check "your-check-name"
+```
+
+Start with `--dry-run` — it prints every mutation (method, path, payload) without executing anything.
+
+The script uses the gh CLI's credentials (`gh auth login` or `GH_TOKEN`). Settings mutations need an **admin** role on the target repo; a fine-grained PAT scoped to the repo needs:
+
+| Permission | Level | Used for |
+|------------|-------|----------|
+| Administration | Read & write | Auto-merge setting, rulesets, vulnerability alerts |
+| Issues | Read & write | Labels |
+| Metadata | Read | Implied by the above |
+
+`--required-check` must match the check-run name exactly as it appears on a PR's Checks tab (for GitHub Actions, the job's name). To list check names on a recent commit: `gh api repos/OWNER/REPO/commits/COMMIT_SHA/check-runs --jq '.check_runs[].name'`. If the default branch already has required status checks (ruleset or classic branch protection), the script leaves them alone.
+
+If you use custom label names (see the inputs below), create those labels manually instead — the script only manages the default set. The manual equivalents of each step follow.
+
+### 3. Create the required labels (manual alternative)
 
 The workflow needs three labels to exist in your repo. Create them once:
 
@@ -55,15 +78,17 @@ gh label create "auto-merge-pending"  --color "e4e669" --description "Passed all
 gh label create "sirt-review-required" --color "d93f0b" --description "Requires human security review"
 ```
 
-### 3. Enable auto-merge on the repo
+### 4. Enable auto-merge on the repo (manual alternative)
 
 Auto-merge must be allowed in your repo settings:
 
 > **Settings → General → Pull Requests → Allow auto-merge** ✓
 
-### 4. Branch protection
+### 5. Branch protection (manual alternative)
 
 Your default branch needs a branch protection rule (or ruleset) with at least one required status check. Without it, GitHub won't queue an auto-merge.
+
+Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**) — the Gate 1 fallback for indirect dependencies queries the Dependabot Alerts API.
 
 ## Inputs
 

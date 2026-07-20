@@ -5,9 +5,11 @@ on:
         branches: [main]
         paths:
             - '.github/workflows/**'
+            - 'scripts/**'
     pull_request:
         paths:
             - '.github/workflows/**'
+            - 'scripts/**'
 
 jobs:
     actionlint:
@@ -22,4 +24,14 @@ jobs:
               shell: bash
             - name: Check workflow files
               run: ${{ steps.get_actionlint.outputs.executable }} -color
+              shell: bash
+
+    shellcheck:
+        name: shellcheck
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+            - name: Check shell scripts
+              # shellcheck is preinstalled on ubuntu-latest
+              run: shellcheck --severity=warning scripts/*.sh
               shell: bash
