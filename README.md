@@ -56,15 +56,16 @@ That's it. All inputs have defaults that match the original P2 configuration, so
 
 Start with `--dry-run` — it prints every mutation (method, path, payload) without executing anything.
 
-The script uses the gh CLI's credentials (`gh auth login` or `GH_TOKEN`). Settings mutations need an **admin** role on the target repo; a fine-grained PAT scoped to the repo needs:
+The script uses the gh CLI's credentials (`gh auth login` or `GH_TOKEN`). `GH_TOKEN`/`GITHUB_TOKEN` apply to github.com and ghe.com; for GitHub Enterprise Server set `GH_HOST` and `GH_ENTERPRISE_TOKEN` (or `GITHUB_ENTERPRISE_TOKEN`). Settings mutations need an **admin** role on the target repo; a fine-grained PAT scoped to the repo needs:
 
 | Permission | Level | Used for |
 |------------|-------|----------|
 | Administration | Read & write | Auto-merge setting, rulesets, vulnerability alerts |
+| Contents | Read & write | Reading merge-related settings such as `allow_auto_merge` |
 | Issues | Read & write | Labels |
 | Metadata | Read | Implied by the above |
 
-`--required-check` must match the check-run name exactly as it appears on a PR's Checks tab (for GitHub Actions, the job's name). To list check names on a recent commit: `gh api repos/OWNER/REPO/commits/COMMIT_SHA/check-runs --jq '.check_runs[].name'`. If the default branch already has required status checks (ruleset or classic branch protection), the script leaves them alone.
+`--required-check` must match the check-run name exactly as it appears on a PR's Checks tab (for GitHub Actions, the job's name). To list check names on a recent commit: `gh api --paginate repos/OWNER/REPO/commits/COMMIT_SHA/check-runs --jq '.check_runs[].name'`. If the default branch already has required status checks (ruleset or classic branch protection), the script leaves them alone.
 
 If you use custom label names (see the inputs below), create those labels manually instead — the script only manages the default set. The manual equivalents of each step follow.
 
