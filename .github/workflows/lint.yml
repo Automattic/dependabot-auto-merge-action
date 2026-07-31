@@ -6,10 +6,12 @@ on:
         paths:
             - '.github/workflows/**'
             - 'scripts/**'
+            - 'tests/**'
     pull_request:
         paths:
             - '.github/workflows/**'
             - 'scripts/**'
+            - 'tests/**'
 
 jobs:
     actionlint:
@@ -35,5 +37,19 @@ jobs:
               # shellcheck is preinstalled on ubuntu-latest. find keeps the
               # coverage recursive to match the scripts/** trigger paths;
               # -exec {} + propagates shellcheck's exit status.
-              run: find scripts -type f -name '*.sh' -exec shellcheck --severity=warning {} +
+              run: |
+                  find scripts -type f -name '*.sh' -exec shellcheck --severity=warning {} +
+                  shellcheck --severity=warning tests/stubs/gh
+              shell: bash
+
+    bats:
+        name: bats
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+            - name: Install bats
+              run: sudo apt-get update && sudo apt-get install -y bats
+            - name: Run tests
+              # jq is preinstalled on ubuntu-latest
+              run: bats tests/
               shell: bash
