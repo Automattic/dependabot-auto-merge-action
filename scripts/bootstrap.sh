@@ -31,7 +31,9 @@ Steps:
 
 Options:
   --required-check <name>  Check-run name to require on the default branch when
-                           no required status checks exist yet.
+                           no required status checks exist yet. Use the
+                           --required-check=<name> form for names that begin
+                           with a dash.
   --dry-run                Print every mutation (method, path, payload) without
                            executing anything. Read-only calls still run, so the
                            output matches what a real run would decide.
@@ -39,9 +41,12 @@ Options:
 
 Authentication:
   Uses the gh CLI's credentials (gh auth login, or the GH_TOKEN env var).
+  GH_TOKEN/GITHUB_TOKEN apply to github.com and ghe.com; for GitHub Enterprise
+  Server set GH_HOST and GH_ENTERPRISE_TOKEN (or GITHUB_ENTERPRISE_TOKEN).
   Settings mutations require an admin role on the target repo. A fine-grained
   PAT scoped to the repo needs:
     - Administration: Read & write   (auto-merge setting, rulesets, vulnerability alerts)
+    - Contents: Read & write         (reading merge-related settings such as allow_auto_merge)
     - Issues: Read & write           (labels — a 403 in the labels step means this is missing)
     - Metadata: Read                 (implied by the above)
 
@@ -49,7 +54,7 @@ Finding the exact check name:
   The required check must match the check-run name exactly as it appears on a
   PR's Checks tab (for GitHub Actions, the job's name). To list check names on
   a recent commit:
-    gh api repos/OWNER/REPO/commits/COMMIT_SHA/check-runs --jq '.check_runs[].name'
+    gh api --paginate repos/OWNER/REPO/commits/COMMIT_SHA/check-runs --jq '.check_runs[].name'
 EOF
 }
 
@@ -118,19 +123,33 @@ preflight() {
     gh auth status --hostname "${GH_HOST:-github.com}" >/dev/null 2>&1 ||
         die 2 "gh is not authenticated to ${GH_HOST:-github.com} — run 'gh auth login' or set GH_TOKEN"
 
-    local err
+    local err full_name
     if ! REPO_JSON=$(gh api "repos/$REPO" 2>&1); then
         err=$REPO_JSON
         die 2 "cannot read repos/$REPO: $(head -c 300 <<<"$err")"
     fi
-    DEFAULT_BRANCH=$(jq -r '.default_branch' <<<"$REPO_JSON")
 
-    # allow_auto_merge is only present in the response when the token has admin
-    # access; fine-grained PATs return no scope headers, so probing the response
-    # shape is the only reliable admin check before we start mutating.
+    # A renamed or transferred repo redirects, so the response can describe a
+    # different repository than the one named on the command line. Refuse to
+    # mutate anything unless they match (owner/repo names are case-insensitive).
+    full_name=$(jq -r '.full_name' <<<"$REPO_JSON")
+    # tr rather than ${var,,}: macOS ships bash 3.2, which lacks case expansion.
+    if [[ $(tr '[:upper:]' '[:lower:]' <<<"$full_name") != "$(tr '[:upper:]' '[:lower:]' <<<"$REPO")" ]]; then
+        die 2 "repos/$REPO resolved to '$full_name' (renamed or transferred?) — re-run with the canonical name"
+    fi
+
+    DEFAULT_BRANCH=$(jq -r '.default_branch' <<<"$REPO_JSON")
+    # Branch names may contain URL-significant characters ('#' starts a
+    # fragment); encode once for use as a path segment in branch endpoints.
+    ENC_BRANCH=$(jq -rn --arg s "$DEFAULT_BRANCH" '$s | @uri')
+
+    # allow_auto_merge is only present in the response when the token can view
+    # merge-related settings (Contents: Read & write on a fine-grained PAT);
+    # PATs return no scope headers, so probing the response shape is the only
+    # reliable capability check before we start mutating.
     if [[ $(jq 'has("allow_auto_merge")' <<<"$REPO_JSON") != true ]] ||
         [[ $(jq '.permissions.admin == true' <<<"$REPO_JSON") != true ]]; then
-        die 2 "token lacks admin access to $REPO — a fine-grained PAT needs Administration: Read & write (see --help)"
+        die 2 "token lacks admin access to $REPO — a fine-grained PAT needs Administration and Contents: Read & write (see --help)"
     fi
 }
 
@@ -149,26 +168,37 @@ step_ruleset() {
 
     # Aggregated rules from all *active* rulesets that apply to the default
     # branch (the rulesets list endpoint omits each ruleset's rules array).
-    if ! branch_rules=$(gh api "repos/$REPO/rules/branches/$DEFAULT_BRANCH" 2>&1); then
+    # --paginate: the endpoint returns 30 rules per page by default.
+    if ! branch_rules=$(gh api --paginate "repos/$REPO/rules/branches/$ENC_BRANCH" 2>&1); then
         fail "required checks: cannot read rules for branch '$DEFAULT_BRANCH': $(head -c 300 <<<"$branch_rules")"
         return 1
     fi
-    ruleset_checks=$(jq -r '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' <<<"$branch_rules")
+    # jq applies the filter to each page's array, so --paginate output parses as-is.
+    ruleset_checks=$(jq -r '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' <<<"$branch_rules") || {
+        fail "required checks: cannot parse rules for branch '$DEFAULT_BRANCH'"
+        return 1
+    }
 
     # Classic branch protection: 200 = required checks configured, 404 = branch not protected.
-    if classic_out=$(gh api "repos/$REPO/branches/$DEFAULT_BRANCH/protection/required_status_checks" 2>&1); then
-        classic_checks=$(jq -r '([.checks[]?.context] + (.contexts // [])) | unique | .[]' <<<"$classic_out")
+    if classic_out=$(gh api "repos/$REPO/branches/$ENC_BRANCH/protection/required_status_checks" 2>&1); then
+        classic_checks=$(jq -r '([.checks[]?.context] + (.contexts // [])) | unique | .[]' <<<"$classic_out") || {
+            fail "required checks: cannot parse classic branch protection"
+            return 1
+        }
     elif ! grep -q "HTTP 404" <<<"$classic_out"; then
         fail "required checks: cannot read classic branch protection: $(head -c 300 <<<"$classic_out")"
         return 1
     fi
 
-    existing=$(printf '%s\n%s\n' "$ruleset_checks" "$classic_checks" | sed '/^$/d' | sort -u)
+    existing=$(printf '%s\n%s\n' "$ruleset_checks" "$classic_checks" | sed '/^$/d' | sort -u) || {
+        fail "required checks: cannot merge check lists"
+        return 1
+    }
 
     if [[ -n $existing ]]; then
-        names=$(paste -sd, - <<<"$existing" | sed 's/,/, /g')
+        names=$(paste -sd, - <<<"$existing" | sed 's/,/, /g') || names=$existing
         ok "required checks: already present on '$DEFAULT_BRANCH' ($names) — leaving existing protection alone"
-        if [[ -n $REQUIRED_CHECK ]] && ! grep -Fxq "$REQUIRED_CHECK" <<<"$existing"; then
+        if [[ -n $REQUIRED_CHECK ]] && ! grep -Fxq -- "$REQUIRED_CHECK" <<<"$existing"; then
             note "named check '$REQUIRED_CHECK' is not among the existing required checks; existing protection was not modified"
         fi
         return 0
@@ -178,11 +208,13 @@ step_ruleset() {
     # enforcement: disabled — such rulesets don't appear in the branch rules
     # above). Creating another one with the same name would fail, so surface it.
     local existing_names
-    if ! existing_names=$(gh api --paginate "repos/$REPO/rulesets" --jq '.[].name' 2>&1); then
+    # includes_parents=false: org-level rulesets are listed by default and
+    # could shadow-match our repo-level ruleset name.
+    if ! existing_names=$(gh api --paginate "repos/$REPO/rulesets?includes_parents=false" --jq '.[].name' 2>&1); then
         fail "required checks: cannot list rulesets: $(head -c 300 <<<"$existing_names")"
         return 1
     fi
-    if grep -Fxq "$RULESET_NAME" <<<"$existing_names"; then
+    if grep -Fxq -- "$RULESET_NAME" <<<"$existing_names"; then
         note "ruleset '$RULESET_NAME' already exists but enforces no required checks on '$DEFAULT_BRANCH' — fix or delete it manually"
         return 0
     fi
@@ -208,7 +240,10 @@ step_ruleset() {
                 required_status_checks: [{ context: $ctx }]
             }
         }]
-    }')
+    }') || {
+        fail "required checks: cannot build ruleset payload"
+        return 1
+    }
     mutate "ruleset: create '$RULESET_NAME' requiring check '$REQUIRED_CHECK' on the default branch" \
         POST "repos/$REPO/rulesets" "$payload"
 }
@@ -217,19 +252,35 @@ step_labels() {
     local rc=0 entry name color desc enc cur cur_color cur_desc payload
     for entry in "${LABELS[@]}"; do
         IFS='|' read -r name color desc <<<"$entry"
-        enc=$(jq -rn --arg s "$name" '$s | @uri')
+        enc=$(jq -rn --arg s "$name" '$s | @uri') || {
+            fail "label '$name': cannot encode name"
+            rc=1
+            continue
+        }
         if cur=$(gh api "repos/$REPO/labels/$enc" 2>&1); then
-            cur_color=$(jq -r '.color // "" | ascii_downcase' <<<"$cur")
-            cur_desc=$(jq -r '.description // ""' <<<"$cur")
+            if ! cur_color=$(jq -r '.color // "" | ascii_downcase' <<<"$cur") ||
+                ! cur_desc=$(jq -r '.description // ""' <<<"$cur"); then
+                fail "label '$name': cannot parse existing label"
+                rc=1
+                continue
+            fi
             if [[ $cur_color == "$color" && $cur_desc == "$desc" ]]; then
                 ok "label '$name': already correct"
             else
-                payload=$(jq -n --arg color "$color" --arg desc "$desc" '{color: $color, description: $desc}')
+                payload=$(jq -n --arg color "$color" --arg desc "$desc" '{color: $color, description: $desc}') || {
+                    fail "label '$name': cannot build update payload"
+                    rc=1
+                    continue
+                }
                 mutate "label '$name': update color/description" PATCH "repos/$REPO/labels/$enc" "$payload" || rc=1
             fi
         elif grep -q "HTTP 404" <<<"$cur"; then
             payload=$(jq -n --arg name "$name" --arg color "$color" --arg desc "$desc" \
-                '{name: $name, color: $color, description: $desc}')
+                '{name: $name, color: $color, description: $desc}') || {
+                fail "label '$name': cannot build create payload"
+                rc=1
+                continue
+            }
             mutate "label '$name': create" POST "repos/$REPO/labels" "$payload" || rc=1
         else
             fail "label '$name': $(head -c 300 <<<"$cur")"
@@ -266,8 +317,16 @@ while [[ $# -gt 0 ]]; do
             ;;
         --required-check)
             [[ $# -ge 2 ]] || die_usage "--required-check needs a value"
+            # An option-like next token is almost always a forgotten value
+            # (e.g. --required-check --dry-run would silently disable dry-run).
+            [[ $2 != -* ]] || die_usage "--required-check needs a value, got option '$2' — use --required-check='$2' for a check name that begins with a dash"
             REQUIRED_CHECK=$2
             shift 2
+            ;;
+        --required-check=*)
+            REQUIRED_CHECK=${1#--required-check=}
+            [[ -n $REQUIRED_CHECK ]] || die_usage "--required-check needs a value"
+            shift
             ;;
         --dry-run)
             DRY_RUN=true
@@ -285,7 +344,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n $REPO ]] || die_usage "missing required argument: owner/repo"
-[[ $REPO =~ ^[^/]+/[^/]+$ ]] || die_usage "invalid repository '$REPO' — expected owner/repo"
+# Strict charsets so gh api can't expand a literal '{owner}/{repo}' (or other
+# placeholder text) into a different repository from GH_REPO/the current checkout.
+[[ $REPO =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$ ]] ||
+    die_usage "invalid repository '$REPO' — expected owner/repo"
 
 preflight
 
