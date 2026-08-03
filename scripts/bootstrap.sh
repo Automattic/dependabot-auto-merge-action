@@ -95,7 +95,14 @@ mutate() {
         would "$desc (dry-run)"
         printf '     gh api -X %s %s\n' "$method" "$path"
         if [[ -n $payload ]]; then
-            jq . <<<"$payload" | sed 's/^/     /'
+            # The formatter is cosmetic — its failure must not hide the payload
+            # (the whole point of dry-run), so fall back to the raw JSON.
+            local pretty
+            if pretty=$(jq . <<<"$payload" | sed 's/^/     /'); then
+                printf '%s\n' "$pretty"
+            else
+                printf '     %s\n' "$payload"
+            fi
         fi
         return 0
     fi
@@ -156,7 +163,14 @@ preflight() {
 # --- steps --------------------------------------------------------------------
 
 step_auto_merge() {
-    if [[ $(jq -r '.allow_auto_merge' <<<"$REPO_JSON") == true ]]; then
+    # Capture and guard: a failed jq must not fall through to the "disabled"
+    # branch and PATCH the repo on the strength of a parse error.
+    local enabled
+    if ! enabled=$(jq -r '.allow_auto_merge' <<<"$REPO_JSON"); then
+        fail "allow auto-merge: cannot parse repository settings"
+        return 1
+    fi
+    if [[ $enabled == true ]]; then
         ok "allow auto-merge: already enabled"
     else
         mutate "allow auto-merge: enable" PATCH "repos/$REPO" '{"allow_auto_merge":true}'

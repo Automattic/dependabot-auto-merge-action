@@ -48,6 +48,24 @@ mutation_count() {
     grep -cE -- '-X (POST|PATCH|PUT|DELETE)' "$GH_STUB_LOG" || true
 }
 
+# Install a jq wrapper that fails whenever it is invoked with the given
+# filter and delegates every other invocation to the real jq, so a single
+# parse step can be forced to fail without disturbing the rest of the script.
+break_jq_filter() {
+    local real_jq
+    real_jq=$(command -v jq)
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat >"$BATS_TEST_TMPDIR/bin/jq" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+    [[ \$arg == "$1" ]] && exit 1
+done
+exec "$real_jq" "\$@"
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/bin/jq"
+    PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+}
+
 # --- argument validation --------------------------------------------------
 
 @test "no arguments exits 2 with usage" {
@@ -111,6 +129,19 @@ mutation_count() {
     [ "$(mutation_count)" -eq 0 ]
 }
 
+@test "--dry-run falls back to the raw payload when the formatter fails" {
+    fresh_repo_fixtures
+    # mutate pretty-prints payloads with 'jq .'; its failure must not swallow
+    # the payload — the raw JSON is the dry-run's entire point.
+    break_jq_filter '.'
+    run "$SCRIPT" acme/widgets --dry-run
+    [ "$status" -eq 0 ]
+    # grep rather than [[ ]]: under macOS bash 3.2 a failed [[ ]] mid-test
+    # cannot fail a bats test (errexit/ERR fire only for simple commands).
+    grep -qF -- '{"allow_auto_merge":true}' <<<"$output"
+    [ "$(mutation_count)" -eq 0 ]
+}
+
 # --- real runs ------------------------------------------------------------
 
 @test "fully configured repo reports ok everywhere and mutates nothing" {
@@ -149,6 +180,23 @@ mutation_count() {
     [ "$status" -eq 1 ]
     [[ $output == *"Failed steps: labels"* ]]
     [[ $output == *"HTTP 500"* ]]
+    # The failure must not stop the remaining steps.
+    grep -q -- '-X PUT repos/acme/widgets/vulnerability-alerts' "$GH_STUB_LOG"
+}
+
+@test "auto-merge parse failure fails the step without patching the repo" {
+    fresh_repo_fixtures
+    fixture POST_repos_acme_widgets_labels </dev/null
+    fixture PUT_repos_acme_widgets_vulnerability_alerts </dev/null
+    # Force only step_auto_merge's jq invocation to fail: a parse error must
+    # not be mistaken for "auto-merge disabled" and trigger a repo PATCH.
+    break_jq_filter '.allow_auto_merge'
+    run "$SCRIPT" acme/widgets
+    [ "$status" -eq 1 ]
+    # grep rather than [[ ]]: see the formatter-fallback test above.
+    grep -qF -- 'allow auto-merge: cannot parse repository settings' <<<"$output"
+    grep -qF -- 'Failed steps: auto-merge' <<<"$output"
+    [ "$(grep -c -- '-X PATCH ' "$GH_STUB_LOG" || true)" -eq 0 ]
     # The failure must not stop the remaining steps.
     grep -q -- '-X PUT repos/acme/widgets/vulnerability-alerts' "$GH_STUB_LOG"
 }
