@@ -108,6 +108,12 @@ EOF
     [ ! -s "$GH_STUB_LOG" ]
 }
 
+@test "--required-check with an empty value exits 2" {
+    run "$SCRIPT" acme/widgets --required-check ""
+    [ "$status" -eq 2 ]
+    [[ $output == *"--required-check needs a value"* ]]
+}
+
 @test "--required-check=<name> form is accepted" {
     configured_repo_fixtures
     run "$SCRIPT" acme/widgets --required-check=ci

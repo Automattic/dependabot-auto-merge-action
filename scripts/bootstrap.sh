@@ -334,6 +334,7 @@ while [[ $# -gt 0 ]]; do
             # An option-like next token is almost always a forgotten value
             # (e.g. --required-check --dry-run would silently disable dry-run).
             [[ $2 != -* ]] || die_usage "--required-check needs a value, got option '$2' — use --required-check='$2' for a check name that begins with a dash"
+            [[ -n $2 ]] || die_usage "--required-check needs a value"
             REQUIRED_CHECK=$2
             shift 2
             ;;
