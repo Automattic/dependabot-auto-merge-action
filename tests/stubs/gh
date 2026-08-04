@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Test stub for the gh CLI, used by tests/bootstrap.bats.
+#
+# Every invocation is appended (shell-quoted, one line) to $GH_STUB_LOG so
+# tests can assert exactly which calls were made — in particular that
+# --dry-run never issues a non-GET request.
+#
+# `gh api` responses are served from fixture files in $GH_STUB_DIR, keyed by
+# "<METHOD>_<path with non-alphanumerics mapped to _>":
+#   <key>       body printed to stdout, exit 0 (empty file = bodiless success)
+#   <key>.err   contents printed to stderr, exit 1
+#   neither     "HTTP 404"-style error to stderr, exit 1 (matches how the
+#               bootstrap script distinguishes absent resources)
+set -euo pipefail
+
+: "${GH_STUB_DIR:?gh stub requires GH_STUB_DIR}"
+: "${GH_STUB_LOG:?gh stub requires GH_STUB_LOG}"
+
+printf '%q ' gh "$@" >>"$GH_STUB_LOG"
+printf '\n' >>"$GH_STUB_LOG"
+
+case ${1:-} in
+    auth)
+        exit 0
+        ;;
+    api) ;;
+    *)
+        printf 'gh-stub: unexpected command: %s\n' "$*" >&2
+        exit 64
+        ;;
+esac
+shift
+
+method=GET
+path=""
+jq_filter=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -X)
+            method=$2
+            shift 2
+            ;;
+        --jq)
+            jq_filter=$2
+            shift 2
+            ;;
+        --input)
+            shift 2
+            ;;
+        --paginate | -*)
+            shift
+            ;;
+        *)
+            path=$1
+            shift
+            ;;
+    esac
+done
+
+key="${method}_$(printf '%s' "$path" | tr -c 'A-Za-z0-9' '_')"
+
+if [[ -f $GH_STUB_DIR/$key ]]; then
+    if [[ -n $jq_filter ]]; then
+        jq -r "$jq_filter" <"$GH_STUB_DIR/$key"
+    else
+        cat "$GH_STUB_DIR/$key"
+    fi
+elif [[ -f $GH_STUB_DIR/$key.err ]]; then
+    cat "$GH_STUB_DIR/$key.err" >&2
+    exit 1
+else
+    printf 'gh-stub: HTTP 404: no fixture %s for %s %s\n' "$key" "$method" "$path" >&2
+    exit 1
+fi

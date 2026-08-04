@@ -83,7 +83,7 @@ jobs:
                           echo "OK: 'Allow auto-merge' is enabled on $GITHUB_REPOSITORY."
                           ;;
                       false)
-                          echo "::error::Preflight: 'Allow auto-merge' is disabled on $GITHUB_REPOSITORY, so gh pr merge --auto cannot work. Enable it under Settings → General → Pull Requests → Allow auto-merge. Setup docs: $DOCS (section '3. Enable auto-merge on the repo')."
+                          echo "::error::Preflight: 'Allow auto-merge' is disabled on $GITHUB_REPOSITORY, so gh pr merge --auto cannot work. Enable it under Settings → General → Pull Requests → Allow auto-merge. Setup docs: $DOCS (section '4. Enable auto-merge on the repo (manual alternative)')."
                           FAIL=1
                           ;;
                       *)
@@ -124,14 +124,14 @@ jobs:
                               if [ "$HAS_CHECKS" = "true" ]; then
                                   echo "OK: classic branch protection on '$DEFAULT_BRANCH' requires status checks."
                               else
-                                  echo "::error::Preflight: branch protection on '$DEFAULT_BRANCH' has no required status checks, so GitHub will never queue an auto-merge. Add at least one required status check via a ruleset (Settings → Rules → Rulesets) or the branch protection rule (Settings → Branches). Setup docs: $DOCS (section '4. Branch protection')."
+                                  echo "::error::Preflight: branch protection on '$DEFAULT_BRANCH' has no required status checks, so GitHub will never queue an auto-merge. Add at least one required status check via a ruleset (Settings → Rules → Rulesets) or the branch protection rule (Settings → Branches). Setup docs: $DOCS (section '5. Branch protection (manual alternative)')."
                                   FAIL=1
                               fi
                           else
                               echo "::warning::Preflight: '$DEFAULT_BRANCH' has classic branch protection, but this token cannot read its details (endpoint requires admin). Assuming required status checks are configured — auto-merge will fail later if they are not. Consider migrating to rulesets, which this check can verify."
                           fi
                       elif [ "$PROTECTED" = "false" ]; then
-                          echo "::error::Preflight: default branch '$DEFAULT_BRANCH' has no ruleset-based required status checks and no classic branch protection rule. gh pr merge --auto needs at least one required status check to queue against. Add one via a ruleset (Settings → Rules → Rulesets, recommended) or classic branch protection (Settings → Branches). Setup docs: $DOCS (section '4. Branch protection')."
+                          echo "::error::Preflight: default branch '$DEFAULT_BRANCH' has no ruleset-based required status checks and no classic branch protection rule. gh pr merge --auto needs at least one required status check to queue against. Add one via a ruleset (Settings → Rules → Rulesets, recommended) or classic branch protection (Settings → Branches). Setup docs: $DOCS (section '5. Branch protection (manual alternative)')."
                           FAIL=1
                       fi
                   fi
