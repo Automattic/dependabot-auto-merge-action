@@ -7,7 +7,7 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 | # | Gate | Default | Notes |
 |---|------|---------|-------|
 | 1 | Security advisory (GHSA ID) | required | PR must be a security fix, not a routine bump. Falls back to Dependabot Alerts API for indirect deps. |
-| 2 | CVSS severity | ≥ 7.0 | High or critical. Configurable via `cvss-threshold`. |
+| 2 | CVSS severity | ≥ 7.0 | High or critical. Configurable via `cvss-threshold`. A zero-like score means GitHub has no CVSS data, so the PR goes to human review instead. |
 | 3 | Compatibility score | ≥ 80% | Direct deps only; indirect deps skip this gate since fetch-metadata can't provide a score. |
 | 4 | Age gate | 7 days | Scheduled job merges passing PRs after `age-days` days. |
 
@@ -178,6 +178,16 @@ jobs:
 
 Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`.
 
+## Troubleshooting
+
+### A PR was routed for review with "advisory metadata (CVSS) was unavailable"
+
+GitHub sometimes returns `0.0` as the CVSS score for a matched advisory. That is not a severity rating — it means the advisory carries no CVSS v3 vector, usually because it was published recently and has not been scored yet. Branch rewrites can also rematch a PR against a newer, unscored advisory.
+
+The workflow treats every zero-like score — empty, `0`, `0.0`, `00`, `.00` — and any value it cannot parse as a number as missing metadata, and fails closed: the PR gets `review-label` and a comment naming the value GitHub reported. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one.
+
+What to do: check the advisory yourself. If it is a real high-severity fix, apply the `fast-track-label` to merge it; the workflow records who did so in an audit comment. If the advisory later gets a score, a new PR event re-runs the gates.
+
 ## How it works
 
 ### `preflight` job (runs first on both triggers)
@@ -200,9 +210,10 @@ Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
 
 1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately, post a one-time audit comment (label applier, UTC timestamp, workflow-run link), and exit. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it.
 2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID. If missing (indirect dep), fall back to the Dependabot Alerts API and match open security alerts against the updated packages.
-3. **Gate 2** — require CVSS ≥ `cvss-threshold`.
-4. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
-5. Apply `review-label` if any gate fails; apply `pending-label` if all pass.
+3. **Resolve the effective CVSS** — take the score from PR metadata, or from the alerts API if PR metadata has none. A score that is empty, non-numeric, or numerically zero (`0`, `0.0`, `00`, `.00`) is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`.
+4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
+5. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
+6. Apply `review-label` if any gate fails; apply `pending-label` if all pass.
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
