@@ -280,22 +280,44 @@ jobs:
                   steps.fast-track.conclusion == 'skipped' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
               run: |
-                  # Unusable: empty, non-numeric, or any spelling of numeric
-                  # zero — 0, 0.0, 00, .00. Anything unparseable fails closed.
+                  # A usable score is a plain decimal inside the CVSS range.
+                  # Empty, non-numeric, any spelling of zero (0, 0.0, 00, .00)
+                  # and anything above 10 all mean GitHub gave us no real
+                  # severity, so every one of them fails closed. Without the
+                  # range check an implausible score would fail *open* through
+                  # Gate 2 while a zero fails closed — opposite ways to be wrong.
                   is_unusable() {
                       [[ $1 =~ ^[0-9]*\.?[0-9]+$ ]] || return 0
-                      [[ $1 =~ ^0*\.?0*$ ]]
+                      [[ $1 =~ ^0*\.?0*$ ]] && return 0
+                      [ "$(echo "$1 > 10" | bc -l)" = "1" ]
                   }
+
+                  # Exactly one of these is ever populated: Gate 1 writes its
+                  # score only when it passes, and the fallback runs only when
+                  # Gate 1 fails. Keep whichever one GitHub actually reported,
+                  # so the review comment can name the value even when it is
+                  # too broken to gate on.
+                  REPORTED="${GATE1_CVSS:-$GATE1_FALLBACK_CVSS}"
 
                   CVSS="$GATE1_CVSS"
                   if is_unusable "$CVSS"; then
                       CVSS="$GATE1_FALLBACK_CVSS"
                   fi
-                  echo "value=$CVSS" >> "$GITHUB_OUTPUT"
+
+                  # Heredoc form: unusable values reach $GITHUB_OUTPUT verbatim,
+                  # and a bare key=value would break on one containing a newline.
+                  {
+                      echo "value<<__CVSS_EOF__"
+                      echo "$CVSS"
+                      echo "__CVSS_EOF__"
+                      echo "reported<<__CVSS_EOF__"
+                      echo "$REPORTED"
+                      echo "__CVSS_EOF__"
+                  } >> "$GITHUB_OUTPUT"
 
                   if is_unusable "$CVSS"; then
                       echo "available=false" >> "$GITHUB_OUTPUT"
-                      echo "Neither PR metadata nor the alerts API returned a usable CVSS (got '$CVSS') — failing closed."
+                      echo "Neither PR metadata nor the alerts API returned a usable CVSS (got '$REPORTED') — failing closed."
                   else
                       echo "available=true" >> "$GITHUB_OUTPUT"
                       echo "Effective CVSS: $CVSS"
@@ -353,8 +375,11 @@ jobs:
               run: |
                   if [ "$METADATA_AVAILABLE" == "false" ]; then
                       REASON="advisory metadata (CVSS) was unavailable — failing closed"
-                      if [ -n "$CVSS" ]; then
-                          REASON="$REASON (GitHub reported a CVSS of \`$CVSS\`, which carries no severity information)"
+                      # REPORTED_CVSS, not CVSS: an unusable score never
+                      # becomes the effective value, so only the reported one
+                      # can name what GitHub actually sent.
+                      if [ -n "$REPORTED_CVSS" ]; then
+                          REASON="$REASON (GitHub reported a CVSS of \`$REPORTED_CVSS\`, which carries no severity information)"
                       fi
                   elif [ "$GATE2_PASS" == "false" ]; then
                       REASON="CVSS score ($CVSS) is below the threshold of $THRESHOLD"
@@ -371,6 +396,7 @@ jobs:
                   METADATA_AVAILABLE: ${{ steps.cvss.outputs.available }}
                   GATE2_PASS: ${{ steps.gate2.outputs.pass }}
                   CVSS: ${{ steps.cvss.outputs.value }}
+                  REPORTED_CVSS: ${{ steps.cvss.outputs.reported }}
                   THRESHOLD: ${{ inputs.cvss-threshold }}
                   COMPAT_SCORE: ${{ steps.meta.outputs.compatibility-score }}
                   COMPAT_THRESHOLD: ${{ inputs.compatibility-threshold }}
