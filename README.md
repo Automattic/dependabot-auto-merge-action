@@ -34,7 +34,7 @@ permissions:
 
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1.5
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.5
         permissions:
             pull-requests: write
             contents: write
@@ -43,7 +43,11 @@ jobs:
             event-name: ${{ github.event_name }}
 ```
 
-Pin to a commit SHA, or to a release tag such as `@v1.5`. The `v1` tag is not maintained as a floating major — it still points at an early commit, so `@v1` will not pick up later fixes.
+Pin to the commit SHA a release tag points at, with the tag in a trailing comment — the same way this repo pins third-party actions. Tags name releases; they are not pinning targets, and none of them float. Resolve the SHA with:
+
+```bash
+gh api repos/Automattic/dependabot-auto-merge-action/git/ref/tags/v1.5 --jq .object.sha
+```
 
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
 
@@ -167,7 +171,7 @@ Some organisations restrict `GITHUB_TOKEN` so it cannot read security events, ev
 ```yaml
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1.5
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.5
         permissions:
             pull-requests: write
             contents: write
