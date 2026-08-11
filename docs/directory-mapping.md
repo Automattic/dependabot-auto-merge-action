@@ -156,6 +156,16 @@ All read-only, against real repos; expected vs actual pasted into the script PR.
 | pnpm monorepo + composer | WooCommerce/woocommerce | second data point for glob expansion |
 | Actions-only | this repo | `(github-actions, "/")` idempotent no-op |
 
+### Field notes from the first matrix run
+
+Three things the real repos taught us that the draft did not anticipate:
+
+- **jetpack and wp-calypso came out as designed.** jetpack yields `composer: /projects/plugins/*` (the glob rule doing exactly what §5 predicts) plus `composer: /`, `npm: /` and `github-actions: /`. wp-calypso yields `npm: /`, `composer: /` and `github-actions: /`. Neither tree truncated, so the clone fallback stayed unexercised.
+- **Per-directory findings have to be aggregated.** A jetpack run produced 270 individual "manifest without lockfile" lines. A wall of text that long reports nothing, so findings of that kind now print as a count plus the first five paths and an "… and N more" tail. Reported, never silent, and still readable.
+- **"Cannot parse" and "declares nothing" are different facts.** WooCommerce's `pnpm-workspace.yaml` declares `packages:` on line 72, and every YAML parser rejects the file over a tab character on line 4. Reporting that as "declares no `packages:`" sends the reader hunting for a key that is right there.
+
+WooCommerce also exposes the limits of the exclusion list as approved. It maps `/packages/php/email-editor/vendor-prefixed` and `/plugins/woocommerce/bin/composer/*` — vendored and tooling directories that hold a real `composer.json` and `composer.lock` but should never receive PRs. `--include` only re-admits soft-excluded names; there is no way to exclude a path the list does not already name. Worth settling before the write path lands: either extend the soft-exclude list (`vendor-prefixed` is the obvious first entry) or add an `--exclude <dir>` counterpart.
+
 ## 10. Resolved questions
 
 | # | Question | Resolution |
