@@ -1,0 +1,7 @@
+version: 2
+updates:
+  - package-ecosystem: "composer"
+    directories:
+      - "/projects/plugins/*"
+    schedule:
+      interval: "weekly"
