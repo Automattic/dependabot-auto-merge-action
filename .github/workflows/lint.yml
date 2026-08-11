@@ -36,10 +36,11 @@ jobs:
             - name: Check shell scripts
               # shellcheck is preinstalled on ubuntu-latest. find keeps the
               # coverage recursive to match the scripts/** trigger paths;
-              # -exec {} + propagates shellcheck's exit status.
+              # -exec {} + propagates shellcheck's exit status. Stubs are swept
+              # as a directory so a newly added one cannot go unlinted.
               run: |
                   find scripts -type f -name '*.sh' -exec shellcheck --severity=warning {} +
-                  shellcheck --severity=warning tests/stubs/gh
+                  find tests/stubs -type f -exec shellcheck --severity=warning {} +
               shell: bash
 
     bats:
