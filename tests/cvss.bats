@@ -3,10 +3,12 @@
 # step's script is pulled out of the YAML and run as-is, so these tests
 # exercise the shipped code rather than a copy that can drift from it.
 
-setup() {
+# Extraction is per-file, not per-test: the script under test only changes
+# when the YAML does.
+setup_file() {
     REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
     WORKFLOW="$REPO_ROOT/.github/workflows/dependabot-auto-merge.yml"
-    STEP="$BATS_TEST_TMPDIR/resolve-cvss.sh"
+    export STEP="$BATS_FILE_TMPDIR/resolve-cvss.sh"
     extract_run cvss >"$STEP"
     # Guard the extractor: an empty or half-dedented script would pass every
     # assertion below. The dedent width comes from the first body line, so a
@@ -16,10 +18,16 @@ setup() {
     bash -n "$STEP"
     grep -q 'is_unusable()' "$STEP"
     grep -q 'GATE1_FALLBACK_CVSS' "$STEP"
+}
+
+setup() {
     export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/github-output"
 }
 
 # Print the `run:` block of the step whose id is $1, dedented to column 0.
+# Extraction, rather than a sourced scripts/ file, because caller repos never
+# check this repo out — the workflow YAML is the only artifact they consume,
+# so the shipped scripts have to live inline in it.
 extract_run() {
     awk -v id="$1" '
         $0 ~ "^ +id: " id "$" { found = 1; next }
@@ -40,10 +48,12 @@ extract_run() {
 }
 
 # Run the step with $1 as the Gate 1 CVSS and $2 as the Gate 1 fallback CVSS.
-# The flags match the shell GitHub Actions uses for `run:` blocks.
+# The flags match what the step's `shell: bash` expands to in Actions:
+# bash --noprofile --norc -eo pipefail.
 resolve() {
     : >"$GITHUB_OUTPUT"
-    GATE1_CVSS="$1" GATE1_FALLBACK_CVSS="$2" bash -e -o pipefail "$STEP"
+    GATE1_CVSS="$1" GATE1_FALLBACK_CVSS="$2" \
+        bash --noprofile --norc -e -o pipefail "$STEP"
 }
 
 # Print the value the step wrote to $GITHUB_OUTPUT under key $1. Handles both
@@ -148,6 +158,16 @@ out() {
 @test "a non-numeric score with no fallback still reports what GitHub sent" {
     resolve 'N/A' ''
     [ "$(out reported)" = "N/A" ]
+    [ "$(out available)" = "false" ]
+}
+
+@test "a value spelling a heredoc delimiter cannot corrupt the output" {
+    # With a fixed delimiter, this value closed the reported block early and
+    # left a stray line the Actions runner rejects — failing the very step
+    # that exists to fail closed. The generated delimiter makes it inert;
+    # the round-trip below is empty under the old code.
+    resolve '__CVSS_EOF__' ''
+    [ "$(out reported)" = "__CVSS_EOF__" ]
     [ "$(out available)" = "false" ]
 }
 

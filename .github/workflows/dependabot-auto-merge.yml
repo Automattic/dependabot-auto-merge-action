@@ -279,6 +279,10 @@ jobs:
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
+              # Explicit so the step runs under `-e -o pipefail` (the bare
+              # default is `bash -e` only) and the bats suite can drive the
+              # extracted script with exactly these flags.
+              shell: bash
               run: |
                   # A usable score is a plain decimal inside the CVSS range.
                   # Empty, non-numeric, any spelling of zero (0, 0.0, 00, .00)
@@ -306,13 +310,18 @@ jobs:
 
                   # Heredoc form: unusable values reach $GITHUB_OUTPUT verbatim,
                   # and a bare key=value would break on one containing a newline.
+                  # The delimiter is generated per run — a value holding a fixed
+                  # delimiter as a literal line would close the block early and
+                  # leave output the runner rejects, failing the very step that
+                  # exists to fail closed.
+                  DELIM="EOF_$(openssl rand -hex 8)"
                   {
-                      echo "value<<__CVSS_EOF__"
+                      echo "value<<$DELIM"
                       echo "$CVSS"
-                      echo "__CVSS_EOF__"
-                      echo "reported<<__CVSS_EOF__"
+                      echo "$DELIM"
+                      echo "reported<<$DELIM"
                       echo "$REPORTED"
-                      echo "__CVSS_EOF__"
+                      echo "$DELIM"
                   } >> "$GITHUB_OUTPUT"
 
                   if is_unusable "$CVSS"; then

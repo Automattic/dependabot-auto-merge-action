@@ -46,7 +46,7 @@ jobs:
 Pin to the commit SHA a release tag points at, with the tag in a trailing comment — the same way this repo pins third-party actions. Tags name releases; they are not pinning targets, and none of them float. Resolve the SHA with:
 
 ```bash
-gh api repos/Automattic/dependabot-auto-merge-action/git/ref/tags/v1.5 --jq .object.sha
+gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.5 --jq .sha
 ```
 
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
@@ -190,7 +190,7 @@ Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TO
 
 GitHub sometimes returns `0.0` as the CVSS score for a matched advisory. That is not a severity rating — it means the advisory carries no CVSS v3 vector, usually because it was published recently and has not been scored yet. Branch rewrites can also rematch a PR against a newer, unscored advisory.
 
-The workflow treats as missing metadata every zero-like score — empty, `0`, `0.0`, `00`, `.00` — every value it cannot parse as a number, and anything above `10`. All of them fail closed: the PR gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one.
+The workflow treats as missing metadata every zero-like score — empty, `0`, `0.0`, `00`, `.00` — every value it cannot parse as a number, and anything above `10`. All of them fail closed: the PR gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one. This behaviour ships from v1.5; callers pinned at the v1.4 SHA or earlier still see an unscored advisory described as below-threshold.
 
 What to do: check the advisory yourself. If it is a real high-severity fix, apply the `fast-track-label` to merge it; the workflow records who did so in an audit comment. Nothing re-evaluates a PR when an advisory is scored later — the gates only re-run on a new PR event, so a stalled PR needs either the fast-track label or a push.
 
