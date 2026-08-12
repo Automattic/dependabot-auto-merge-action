@@ -7,7 +7,7 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 | # | Gate | Default | Notes |
 |---|------|---------|-------|
 | 1 | Security advisory (GHSA ID) | required | PR must be a security fix, not a routine bump. Falls back to Dependabot Alerts API for indirect deps. |
-| 2 | CVSS severity | ≥ 7.0 | High or critical. Configurable via `cvss-threshold`. |
+| 2 | CVSS severity | ≥ 7.0 | High or critical. Configurable via `cvss-threshold`. A zero-like or out-of-range score means GitHub has no usable CVSS data, so the PR goes to human review instead. |
 | 3 | Compatibility score | ≥ 80% | Direct deps only; indirect deps skip this gate since fetch-metadata can't provide a score. |
 | 4 | Age gate | 7 days | Scheduled job merges passing PRs after `age-days` days. |
 
@@ -34,13 +34,19 @@ permissions:
 
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.5
         permissions:
             pull-requests: write
             contents: write
             security-events: read
         with:
             event-name: ${{ github.event_name }}
+```
+
+Pin to the commit SHA a release tag points at, with the tag in a trailing comment — the same way this repo pins third-party actions. Tags name releases; they are not pinning targets, and none of them float. Resolve the SHA with:
+
+```bash
+gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.5 --jq .sha
 ```
 
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
@@ -165,7 +171,7 @@ Some organisations restrict `GITHUB_TOKEN` so it cannot read security events, ev
 ```yaml
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@v1
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.5
         permissions:
             pull-requests: write
             contents: write
@@ -177,6 +183,16 @@ jobs:
 ```
 
 Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`.
+
+## Troubleshooting
+
+### A PR was routed for review with "advisory metadata (CVSS) was unavailable"
+
+GitHub sometimes returns `0.0` as the CVSS score for a matched advisory. That is not a severity rating — it means the advisory carries no CVSS v3 vector, usually because it was published recently and has not been scored yet. Branch rewrites can also rematch a PR against a newer, unscored advisory.
+
+The workflow treats as missing metadata every zero-like score — empty, `0`, `0.0`, `00`, `.00` — every value it cannot parse as a number, and anything above `10`. All of them fail closed: the PR gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one. This behaviour ships from v1.5; callers pinned at the v1.4 SHA or earlier still see an unscored advisory described as below-threshold.
+
+What to do: check the advisory yourself. If it is a real high-severity fix, apply the `fast-track-label` to merge it; the workflow records who did so in an audit comment. Nothing re-evaluates a PR when an advisory is scored later — the gates only re-run on a new PR event, so a stalled PR needs either the fast-track label or a push.
 
 ## How it works
 
@@ -200,9 +216,10 @@ Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
 
 1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately, post a one-time audit comment (label applier, UTC timestamp, workflow-run link), and exit. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it.
 2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID. If missing (indirect dep), fall back to the Dependabot Alerts API and match open security alerts against the updated packages.
-3. **Gate 2** — require CVSS ≥ `cvss-threshold`.
-4. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
-5. Apply `review-label` if any gate fails; apply `pending-label` if all pass.
+3. **Resolve the effective CVSS** — take the score from whichever of the two Gate 1 paths ran. A score that is empty, non-numeric, numerically zero (`0`, `0.0`, `00`, `.00`), or above `10` is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`, and the comment names the score GitHub reported.
+4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
+5. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
+6. Apply `review-label` if any gate fails; apply `pending-label` if all pass.
 
 ### `scheduled-merge` job (triggers on `schedule`)
 

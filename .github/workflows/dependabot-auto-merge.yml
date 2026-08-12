@@ -269,42 +269,78 @@ jobs:
                   DEPENDENCY_NAMES: ${{ steps.meta.outputs.dependency-names }}
                   GH_TOKEN: ${{ secrets.token || github.token }}
 
-            # Resolve the effective CVSS from whichever source succeeded.
+            # Resolve the effective CVSS from whichever source succeeded, and
+            # decide in the same place whether that score is usable at all.
+            # GitHub reports 0.0 for advisories that carry no CVSS v3 vector,
+            # so a zero-like score means "no metadata", not "harmless" — fail
+            # closed instead of letting Gate 2 call it a below-threshold score.
             - name: Resolve effective CVSS
               id: cvss
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
+              # Explicit so the step runs under `-e -o pipefail` (the bare
+              # default is `bash -e` only) and the bats suite can drive the
+              # extracted script with exactly these flags.
+              shell: bash
               run: |
+                  # A usable score is a plain decimal inside the CVSS range.
+                  # Empty, non-numeric, any spelling of zero (0, 0.0, 00, .00)
+                  # and anything above 10 all mean GitHub gave us no real
+                  # severity, so every one of them fails closed. Without the
+                  # range check an implausible score would fail *open* through
+                  # Gate 2 while a zero fails closed — opposite ways to be wrong.
+                  is_unusable() {
+                      [[ $1 =~ ^[0-9]*\.?[0-9]+$ ]] || return 0
+                      [[ $1 =~ ^0*\.?0*$ ]] && return 0
+                      [ "$(echo "$1 > 10" | bc -l)" = "1" ]
+                  }
+
+                  # Exactly one of these is ever populated: Gate 1 writes its
+                  # score only when it passes, and the fallback runs only when
+                  # Gate 1 fails. Keep whichever one GitHub actually reported,
+                  # so the review comment can name the value even when it is
+                  # too broken to gate on.
+                  REPORTED="${GATE1_CVSS:-$GATE1_FALLBACK_CVSS}"
+
                   CVSS="$GATE1_CVSS"
-                  [ -z "$CVSS" ] || [ "$CVSS" = "0" ] && CVSS="$GATE1_FALLBACK_CVSS"
-                  echo "value=$CVSS" >> "$GITHUB_OUTPUT"
+                  if is_unusable "$CVSS"; then
+                      CVSS="$GATE1_FALLBACK_CVSS"
+                  fi
+
+                  # Heredoc form: unusable values reach $GITHUB_OUTPUT verbatim,
+                  # and a bare key=value would break on one containing a newline.
+                  # The delimiter is generated per run — a value holding a fixed
+                  # delimiter as a literal line would close the block early and
+                  # leave output the runner rejects, failing the very step that
+                  # exists to fail closed.
+                  DELIM="EOF_$(openssl rand -hex 8)"
+                  {
+                      echo "value<<$DELIM"
+                      echo "$CVSS"
+                      echo "$DELIM"
+                      echo "reported<<$DELIM"
+                      echo "$REPORTED"
+                      echo "$DELIM"
+                  } >> "$GITHUB_OUTPUT"
+
+                  if is_unusable "$CVSS"; then
+                      echo "available=false" >> "$GITHUB_OUTPUT"
+                      echo "Neither PR metadata nor the alerts API returned a usable CVSS (got '$REPORTED') — failing closed."
+                  else
+                      echo "available=true" >> "$GITHUB_OUTPUT"
+                      echo "Effective CVSS: $CVSS"
+                  fi
               env:
                   GATE1_CVSS: ${{ steps.gate1.outputs.cvss }}
                   GATE1_FALLBACK_CVSS: ${{ steps.gate1-fallback.outputs.cvss }}
-
-            # Metadata check: fail closed if CVSS is still unavailable after both sources.
-            - name: Verify advisory metadata is available
-              id: metadata-check
-              if: |
-                  steps.fast-track.conclusion == 'skipped' &&
-                  (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
-              run: |
-                  if [ -z "$CVSS" ] || [ "$CVSS" = "0" ]; then
-                      echo "available=false" >> "$GITHUB_OUTPUT"
-                      echo "CVSS unavailable — failing closed."
-                  else
-                      echo "available=true" >> "$GITHUB_OUTPUT"
-                  fi
-              env:
-                  CVSS: ${{ steps.cvss.outputs.value }}
 
             # Gate 2: high or critical severity.
             - name: Gate 2 — severity check (CVSS ≥ ${{ inputs.cvss-threshold }})
               id: gate2
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
-                  steps.metadata-check.outputs.available == 'true'
+                  steps.cvss.outputs.available == 'true'
               run: |
                   if (( $(echo "$CVSS >= $THRESHOLD" | bc -l) )); then
                       echo "pass=true" >> "$GITHUB_OUTPUT"
@@ -342,12 +378,18 @@ jobs:
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true') &&
-                  (steps.metadata-check.outputs.available == 'false' ||
+                  (steps.cvss.outputs.available == 'false' ||
                    steps.gate2.outputs.pass == 'false' ||
                    steps.gate3.outputs.pass == 'false')
               run: |
                   if [ "$METADATA_AVAILABLE" == "false" ]; then
                       REASON="advisory metadata (CVSS) was unavailable — failing closed"
+                      # REPORTED_CVSS, not CVSS: an unusable score never
+                      # becomes the effective value, so only the reported one
+                      # can name what GitHub actually sent.
+                      if [ -n "$REPORTED_CVSS" ]; then
+                          REASON="$REASON (GitHub reported a CVSS of \`$REPORTED_CVSS\`, which carries no severity information)"
+                      fi
                   elif [ "$GATE2_PASS" == "false" ]; then
                       REASON="CVSS score ($CVSS) is below the threshold of $THRESHOLD"
                   else
@@ -360,9 +402,10 @@ jobs:
                   gh pr edit "$PR_URL" --add-label "$REVIEW_LABEL"
                   gh pr comment "$PR_URL" --body "This PR has been routed to the security-review path: $REASON.$TEAM_MENTION"
               env:
-                  METADATA_AVAILABLE: ${{ steps.metadata-check.outputs.available }}
+                  METADATA_AVAILABLE: ${{ steps.cvss.outputs.available }}
                   GATE2_PASS: ${{ steps.gate2.outputs.pass }}
                   CVSS: ${{ steps.cvss.outputs.value }}
+                  REPORTED_CVSS: ${{ steps.cvss.outputs.reported }}
                   THRESHOLD: ${{ inputs.cvss-threshold }}
                   COMPAT_SCORE: ${{ steps.meta.outputs.compatibility-score }}
                   COMPAT_THRESHOLD: ${{ inputs.compatibility-threshold }}
