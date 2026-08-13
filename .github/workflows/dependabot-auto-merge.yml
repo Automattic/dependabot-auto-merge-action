@@ -373,8 +373,11 @@ jobs:
                   SCORE: ${{ steps.meta.outputs.compatibility-score }}
                   THRESHOLD: ${{ inputs.compatibility-threshold }}
 
-            # Metadata unavailable or gates 2/3 failed — label for human review.
+            # Metadata unavailable or gates 2/3 failed — label for human
+            # review. The review and pending labels are mutually exclusive
+            # states, so taking one always sheds the other.
             - name: Label — ${{ inputs.review-label }}
+              id: label-review
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true') &&
@@ -399,7 +402,7 @@ jobs:
                   if [ -n "$REVIEW_TEAM" ]; then
                       TEAM_MENTION=" cc @$REVIEW_TEAM"
                   fi
-                  gh pr edit "$PR_URL" --add-label "$REVIEW_LABEL"
+                  gh pr edit "$PR_URL" --add-label "$REVIEW_LABEL" --remove-label "$PENDING_LABEL"
                   gh pr comment "$PR_URL" --body "This PR has been routed to the security-review path: $REASON.$TEAM_MENTION"
               env:
                   METADATA_AVAILABLE: ${{ steps.cvss.outputs.available }}
@@ -411,20 +414,28 @@ jobs:
                   COMPAT_THRESHOLD: ${{ inputs.compatibility-threshold }}
                   REVIEW_TEAM: ${{ inputs.review-team }}
                   REVIEW_LABEL: ${{ inputs.review-label }}
+                  PENDING_LABEL: ${{ inputs.pending-label }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            # All gates cleared — label as pending for the scheduled age-gate check.
+            # All gates cleared — label as pending for the scheduled age-gate
+            # check, shedding any review label from an earlier failing run.
+            # The step also runs when the pending label is already present but
+            # the review label still lingers: skipping there would strand the
+            # exact both-labels state this step exists to clear.
             - name: Label — ${{ inputs.pending-label }} (awaiting age gate)
+              id: label-pending
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
                   steps.gate2.outputs.pass == 'true' &&
                   (steps.gate3.conclusion == 'skipped' || steps.gate3.outputs.pass == 'true') &&
-                  !contains(github.event.pull_request.labels.*.name, inputs.pending-label)
+                  (!contains(github.event.pull_request.labels.*.name, inputs.pending-label) ||
+                   contains(github.event.pull_request.labels.*.name, inputs.review-label))
               run: |
-                  gh pr edit "$PR_URL" --add-label "$PENDING_LABEL"
+                  gh pr edit "$PR_URL" --add-label "$PENDING_LABEL" --remove-label "$REVIEW_LABEL"
               env:
                   PENDING_LABEL: ${{ inputs.pending-label }}
+                  REVIEW_LABEL: ${{ inputs.review-label }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
