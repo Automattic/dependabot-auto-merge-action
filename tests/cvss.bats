@@ -3,6 +3,8 @@
 # step's script is pulled out of the YAML and run as-is, so these tests
 # exercise the shipped code rather than a copy that can drift from it.
 
+load helpers
+
 # Extraction is per-file, not per-test: the script under test only changes
 # when the YAML does.
 setup_file() {
@@ -22,29 +24,6 @@ setup_file() {
 
 setup() {
     export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/github-output"
-}
-
-# Print the `run:` block of the step whose id is $1, dedented to column 0.
-# Extraction, rather than a sourced scripts/ file, because caller repos never
-# check this repo out — the workflow YAML is the only artifact they consume,
-# so the shipped scripts have to live inline in it.
-extract_run() {
-    awk -v id="$1" '
-        $0 ~ "^ +id: " id "$" { found = 1; next }
-        found && !inrun && $0 ~ /^ +run: \|$/ {
-            inrun = 1
-            match($0, /^ +/)
-            base = RLENGTH
-            next
-        }
-        inrun {
-            if ($0 ~ /^[[:space:]]*$/) { print ""; next }
-            match($0, /^ +/)
-            if (RLENGTH <= base) exit
-            if (!ind) ind = RLENGTH
-            print substr($0, ind + 1)
-        }
-    ' "$WORKFLOW"
 }
 
 # Run the step with $1 as the Gate 1 CVSS and $2 as the Gate 1 fallback CVSS.
