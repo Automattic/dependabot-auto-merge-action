@@ -448,7 +448,9 @@ jobs:
                   PR_URL: ${{ github.event.pull_request.html_url }}
 
     # Runs daily. Finds PRs labelled with the pending label that have cleared
-    # the age gate and enables auto-merge on them.
+    # the age gate and enables auto-merge on them. PRs also carrying the
+    # review label are excluded: a stale pending label from before a PR was
+    # routed to review must never keep it in the merge set.
     scheduled-merge:
         name: Scheduled merge of eligible PRs
         runs-on: ubuntu-latest
@@ -456,18 +458,26 @@ jobs:
         if: inputs.event-name == 'schedule'
         steps:
             - name: Merge PRs past age gate
+              id: scheduled-merge
               run: |
                   # Collect PR numbers first, then iterate in the main shell: a
                   # piped `while read` runs in a subshell, where FAILED would be
                   # lost and every merge failure silently reported as success.
+                  # The review-label exclusion is a jq post-filter rather than
+                  # a `--search "-label:..."` qualifier: search rides an
+                  # eventually-consistent index, and a PR labelled for review
+                  # minutes before the cron fires must not slip through.
                   PR_NUMS=$(gh pr list \
                       --repo "$GITHUB_REPOSITORY" \
                       --author "app/dependabot" \
                       --label "$PENDING_LABEL" \
                       --state open \
-                      --json number,createdAt \
-                  | jq -r --argjson age "$AGE_DAYS" \
-                      '.[] | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age) | .number')
+                      --json number,createdAt,labels \
+                  | jq -r --argjson age "$AGE_DAYS" --arg review "$REVIEW_LABEL" \
+                      '.[]
+                       | select([.labels[].name] | index($review) | not)
+                       | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age)
+                       | .number')
 
                   FAILED=0
                   for PR_NUM in $PR_NUMS; do
@@ -480,6 +490,7 @@ jobs:
                   exit $FAILED
               env:
                   PENDING_LABEL: ${{ inputs.pending-label }}
+                  REVIEW_LABEL: ${{ inputs.review-label }}
                   AGE_DAYS: ${{ inputs.age-days }}
                   MERGE_METHOD: ${{ inputs.merge-method }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

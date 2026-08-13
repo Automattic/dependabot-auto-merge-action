@@ -14,8 +14,10 @@ setup_file() {
     WORKFLOW="$REPO_ROOT/.github/workflows/dependabot-auto-merge.yml"
     export REVIEW_STEP="$BATS_FILE_TMPDIR/label-review.sh"
     export PENDING_STEP="$BATS_FILE_TMPDIR/label-pending.sh"
+    export MERGE_STEP="$BATS_FILE_TMPDIR/scheduled-merge.sh"
     extract_run label-review >"$REVIEW_STEP"
     extract_run label-pending >"$PENDING_STEP"
+    extract_run scheduled-merge >"$MERGE_STEP"
     # Guard the extractor: an empty or half-dedented script would pass every
     # assertion below — parse each script and check for a landmark.
     for step in "$REVIEW_STEP" "$PENDING_STEP"; do
@@ -24,6 +26,9 @@ setup_file() {
         grep -q -- '--remove-label' "$step"
     done
     grep -q 'pr comment' "$REVIEW_STEP"
+    [ -s "$MERGE_STEP" ]
+    bash -n "$MERGE_STEP"
+    grep -q 'fromdateiso8601' "$MERGE_STEP"
 }
 
 setup() {
@@ -70,4 +75,56 @@ run_step() {
     REVIEW_LABEL=needs-security-review PENDING_LABEL=dependabot-approved \
         run_step "$PENDING_STEP"
     [ "$(log_count '--add-label dependabot-approved --remove-label needs-security-review')" -eq 1 ]
+}
+
+# --- scheduled merge ------------------------------------------------------
+
+# Env the merge step reads. The pr_list fixture uses fixed 2020 dates for
+# PRs meant to be past the age gate and `date -u` now for the one that
+# isn't — no date arithmetic, which does not spell the same on BSD and GNU.
+merge_env() {
+    export GITHUB_REPOSITORY=acme/widgets
+    export PENDING_LABEL=auto-merge-pending
+    export REVIEW_LABEL=sirt-review-required
+    export AGE_DAYS=7
+    export MERGE_METHOD=squash
+}
+
+mixed_pr_list_fixture() {
+    NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    cat >"$GH_STUB_DIR/pr_list" <<EOF
+[
+  {"number": 101, "createdAt": "2020-01-01T00:00:00Z",
+   "labels": [{"name": "auto-merge-pending"}]},
+  {"number": 102, "createdAt": "2020-01-01T00:00:00Z",
+   "labels": [{"name": "auto-merge-pending"}, {"name": "sirt-review-required"}]},
+  {"number": 103, "createdAt": "$NOW",
+   "labels": [{"name": "auto-merge-pending"}]}
+]
+EOF
+}
+
+@test "scheduled merge skips PRs that also carry the review label" {
+    merge_env
+    mixed_pr_list_fixture
+    run_step "$MERGE_STEP"
+    # 101 (pending only, old) merges; 102 is the ticket case — past the age
+    # gate and still carrying a stale pending label, but routed to review —
+    # and 103 is too young.
+    [ "$(log_count 'pr merge 101')" -eq 1 ]
+    [ "$(log_count 'pr merge 102')" -eq 0 ]
+    [ "$(log_count 'pr merge 103')" -eq 0 ]
+    [ "$(log_count 'pr merge')" -eq 1 ]
+    [ "$(log_count '--label auto-merge-pending')" -eq 1 ]
+}
+
+@test "a merge failure still fails the step" {
+    merge_env
+    mixed_pr_list_fixture
+    echo "GraphQL: Pull request is in clean status" >"$GH_STUB_DIR/pr_merge.err"
+    run bash --noprofile --norc -e "$MERGE_STEP"
+    [ "$status" -eq 1 ]
+    # grep rather than [[ ]]: under macOS bash 3.2 a failed [[ ]] mid-test
+    # cannot fail a bats test (errexit/ERR fire only for simple commands).
+    grep -qF '::error::Failed to enable auto-merge on PR #101' <<<"$output"
 }
