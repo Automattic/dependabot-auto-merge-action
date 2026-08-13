@@ -49,6 +49,8 @@ Authentication:
     - Contents: Read & write         (reading merge-related settings such as allow_auto_merge)
     - Issues: Read & write           (labels — a 403 in the labels step means this is missing)
     - Metadata: Read                 (implied by the above)
+  A GitHub App installation token (GH_TOKEN=ghs_...) works too, minted from an
+  app granted the same repository permissions.
 
 Finding the exact check name:
   The required check must match the check-run name exactly as it appears on a
@@ -154,9 +156,23 @@ preflight() {
     # merge-related settings (Contents: Read & write on a fine-grained PAT);
     # PATs return no scope headers, so probing the response shape is the only
     # reliable capability check before we start mutating.
-    if [[ $(jq 'has("allow_auto_merge")' <<<"$REPO_JSON") != true ]] ||
-        [[ $(jq '.permissions.admin == true' <<<"$REPO_JSON") != true ]]; then
-        die 2 "token lacks admin access to $REPO — a fine-grained PAT needs Administration and Contents: Read & write (see --help)"
+    if [[ $(jq 'has("allow_auto_merge")' <<<"$REPO_JSON") != true ]]; then
+        die 2 "token cannot view merge settings on $REPO — it needs Contents: Read & write (see --help)"
+    fi
+
+    # .permissions reports the token owner's repo role, which only user tokens
+    # have: a GitHub App installation token gets the map rendered all-false
+    # even when the app holds Administration: write. When the role probe
+    # fails, prove administration access directly against an endpoint gated on
+    # Administration read — vulnerability-alerts answers 204/404 to tokens
+    # that hold it and 403 to everything else. A token that slips past this
+    # gate still fails per-step with a clear message.
+    if [[ $(jq '.permissions.admin == true' <<<"$REPO_JSON") != true ]]; then
+        local alerts_probe
+        if ! alerts_probe=$(gh api "repos/$REPO/vulnerability-alerts" 2>&1) &&
+            ! grep -q "HTTP 404" <<<"$alerts_probe"; then
+            die 2 "token lacks admin access to $REPO — a fine-grained PAT needs Administration: Read & write, a GitHub App installation token an app with the same permission (see --help)"
+        fi
     fi
 }
 

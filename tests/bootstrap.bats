@@ -207,6 +207,56 @@ EOF
     grep -q -- '-X PUT repos/acme/widgets/vulnerability-alerts' "$GH_STUB_LOG"
 }
 
+# --- preflight capability probes -------------------------------------------
+
+# GitHub App installation tokens have no repo role: GET /repos renders the
+# permissions map all-false even when the app holds Administration: write
+# (observed live against api.github.com), so preflight falls back to the
+# admin-read probe on the vulnerability-alerts endpoint.
+app_token_repo_json() {
+    fixture GET_repos_acme_widgets <<EOF
+{"full_name":"acme/widgets","default_branch":"main","allow_auto_merge":$1,"permissions":{"admin":false,"maintain":false,"push":false,"triage":false,"pull":false}}
+EOF
+}
+
+@test "app installation token passes preflight via the alerts probe (204)" {
+    configured_repo_fixtures
+    app_token_repo_json true
+    run "$SCRIPT" acme/widgets --required-check ci
+    [ "$status" -eq 0 ]
+    [[ $output == *"0 failed"* ]]
+    [ "$(mutation_count)" -eq 0 ]
+}
+
+@test "app installation token passes preflight when the alerts probe 404s" {
+    # 404 = alerts disabled but the token proved Administration read; the
+    # vuln-alerts step must then still offer to enable them.
+    fresh_repo_fixtures
+    app_token_repo_json false
+    run "$SCRIPT" acme/widgets --dry-run
+    [ "$status" -eq 0 ]
+    [[ $output == *"dependabot vulnerability alerts: enable (dry-run)"* ]]
+    [ "$(mutation_count)" -eq 0 ]
+}
+
+@test "token without administration access is refused before any mutation" {
+    fresh_repo_fixtures
+    app_token_repo_json false
+    fixture GET_repos_acme_widgets_vulnerability_alerts.err <<<'HTTP 403: Resource not accessible by integration'
+    run "$SCRIPT" acme/widgets
+    [ "$status" -eq 2 ]
+    [[ $output == *"token lacks admin access"* ]]
+    [ "$(mutation_count)" -eq 0 ]
+}
+
+@test "token that cannot view merge settings is refused" {
+    fixture GET_repos_acme_widgets <<<'{"full_name":"acme/widgets","default_branch":"main","permissions":{"admin":true}}'
+    run "$SCRIPT" acme/widgets
+    [ "$status" -eq 2 ]
+    [[ $output == *"cannot view merge settings"* ]]
+    [ "$(mutation_count)" -eq 0 ]
+}
+
 @test "renamed repo is refused before any mutation" {
     fixture GET_repos_acme_old_name <<<'{"full_name":"acme/widgets","default_branch":"main","allow_auto_merge":false,"permissions":{"admin":true}}'
     run "$SCRIPT" acme/old-name

@@ -71,6 +71,8 @@ The script uses the gh CLI's credentials (`gh auth login` or `GH_TOKEN`). `GH_TO
 | Issues | Read & write | Labels |
 | Metadata | Read | Implied by the above |
 
+A GitHub App installation token (`GH_TOKEN=ghs_...`) works too, minted from an app granted the same repository permissions.
+
 `--required-check` must match the check-run name exactly as it appears on a PR's Checks tab (for GitHub Actions, the job's name). To list check names on a recent commit: `gh api --paginate repos/OWNER/REPO/commits/COMMIT_SHA/check-runs --jq '.check_runs[].name'`. If the default branch already has required status checks (ruleset or classic branch protection), the script leaves them alone.
 
 If you use custom label names (see the inputs below), create those labels manually instead — the script only manages the default set. The manual equivalents of each step follow.
