@@ -35,22 +35,6 @@ resolve() {
         bash --noprofile --norc -e -o pipefail "$STEP"
 }
 
-# Print the value the step wrote to $GITHUB_OUTPUT under key $1. Handles both
-# forms Actions accepts: bare `key=value` and the `key<<DELIM` heredoc the step
-# uses for values that might contain a newline.
-out() {
-    awk -v k="$1" '
-        !inblock && index($0, k "<<") == 1 {
-            delim = substr($0, length(k) + 3)
-            inblock = 1
-            next
-        }
-        inblock && $0 == delim { inblock = 0; next }
-        inblock { print; next }
-        !inblock && index($0, k "=") == 1 { print substr($0, length(k) + 2) }
-    ' "$GITHUB_OUTPUT"
-}
-
 # --- a usable score comes through untouched -------------------------------
 
 @test "a real score from PR metadata is used as-is" {
@@ -67,9 +51,10 @@ out() {
 
 @test "PR metadata wins when both sources have a usable score" {
     # Guards the precedence: every other usable-score case passes an empty
-    # fallback, so swapping the two sources would slip past them. Like the
-    # zero-like pair cases below, this state is defence in depth — the
-    # workflow only ever populates one source.
+    # fallback, so swapping the two sources would slip past them. Two usable
+    # scores still cannot coexist — the fallback only runs when Gate 1's
+    # score is unusable — so this state is defence in depth: if that wiring
+    # ever changes, Gate 1 must keep winning.
     resolve 8.8 9.1
     [ "$(out value)" = "8.8" ]
     [ "$(out available)" = "true" ]
@@ -85,11 +70,11 @@ out() {
 
 # --- zero-like values are unavailable metadata, not low scores ------------
 
-# The next three cases populate both sources at once. The workflow cannot
-# actually produce that: gate1 writes its `cvss` output only when it passes,
-# and gate1-fallback runs only when gate1 fails, so exactly one is ever set.
-# They are kept as defence in depth — if that wiring ever changes, precedence
-# and fallback should still behave — not as claims about real inputs.
+# The next cases populate both sources at once. Since DEVPROD-1207 that is a
+# real state, not defence in depth: the fallback also runs when Gate 1 passes
+# with an unusable score. A zero-like Gate 1 value plus a real fallback score
+# is exactly the recovery path, and zero-like values from both sources are a
+# recovery attempt that found nothing better.
 
 @test "CVSS 0.0 from PR metadata falls back to the alerts API score" {
     resolve 0.0 7.5
@@ -121,10 +106,12 @@ out() {
     [ "$(out available)" = "false" ]
 }
 
-# The direct-dependency shape, and the one the ticket was filed about: Gate 1
-# matched an advisory but GitHub scored it 0.0, so there is no fallback to fall
-# back to. The score must not survive as the effective value — but it must
-# survive as `reported`, or the review comment cannot name what GitHub sent.
+# The direct-dependency shape the original ticket was filed about: Gate 1
+# matched an advisory but GitHub scored it 0.0, and the alerts-API recovery
+# found nothing better (no matching alert, or the call failed and degraded to
+# an empty score). The zero must not survive as the effective value — but it
+# must survive as `reported`, or the review comment cannot name what GitHub
+# sent.
 @test "a zero-like score with no fallback still reports what GitHub sent" {
     for score in 0 0.0 00 .00; do
         resolve "$score" ''
