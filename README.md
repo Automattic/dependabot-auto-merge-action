@@ -13,6 +13,8 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 
 PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A `security-fast-track` label on any PR bypasses all gates immediately. When a PR is fast-tracked, a one-time audit comment is posted recording who applied the label, when, and a link to the workflow run.
 
+`sirt-review-required` and `auto-merge-pending` are mutually exclusive workflow states: every evaluation applies one and removes the other, so a re-evaluated PR — say after Dependabot rewrites the branch — never carries both.
+
 ## Usage
 
 ### 1. Create the caller workflow in your repo
@@ -34,7 +36,7 @@ permissions:
 
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.5
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.6
         permissions:
             pull-requests: write
             contents: write
@@ -46,7 +48,7 @@ jobs:
 Pin to the commit SHA a release tag points at, with the tag in a trailing comment — the same way this repo pins third-party actions. Tags name releases; they are not pinning targets, and none of them float. Resolve the SHA with:
 
 ```bash
-gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.5 --jq .sha
+gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.6 --jq .sha
 ```
 
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
@@ -184,7 +186,7 @@ Some organisations restrict `GITHUB_TOKEN` so it cannot read security events, ev
 ```yaml
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.5
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.6
         permissions:
             pull-requests: write
             contents: write
@@ -206,6 +208,10 @@ GitHub sometimes returns `0.0` as the CVSS score for a matched advisory. That is
 The workflow treats as missing metadata every zero-like score — empty, `0`, `0.0`, `00`, `.00` — every value it cannot parse as a number, and anything above `10`. All of them fail closed: the PR gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one. This behaviour ships from v1.5; callers pinned at the v1.4 SHA or earlier still see an unscored advisory described as below-threshold.
 
 What to do: check the advisory yourself. If it is a real high-severity fix, apply the `fast-track-label` to merge it; the workflow records who did so in an audit comment. Nothing re-evaluates a PR when an advisory is scored later — the gates only re-run on a new PR event, so a stalled PR needs either the fast-track label or a push.
+
+### A PR carries both `auto-merge-pending` and `sirt-review-required`
+
+The labels are mutually exclusive states, and from v1.6 the workflow enforces that: routing to review removes the pending label, marking pending removes the review label, and the scheduled merge skips any PR carrying the review label even if a stale pending label survives. Callers pinned at the v1.5 SHA or earlier get none of this — a PR that passed the gates and later failed them (a branch rewrite rematching different advisories, typically) keeps both labels, and their scheduled job treats it as an auto-merge candidate. Remove the stale pending label by hand and re-pin.
 
 ## How it works
 
@@ -232,11 +238,11 @@ Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
 3. **Resolve the effective CVSS** — take the score from whichever of the two Gate 1 paths ran. A score that is empty, non-numeric, numerically zero (`0`, `0.0`, `00`, `.00`), or above `10` is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`, and the comment names the score GitHub reported.
 4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
 5. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
-6. Apply `review-label` if any gate fails; apply `pending-label` if all pass.
+6. Apply `review-label` and remove `pending-label` if any gate fails; apply `pending-label` and remove `review-label` if all pass. The two labels are mutually exclusive states — a re-evaluated PR always ends up with exactly one.
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
-Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each.
+Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set.
 
 ## Security notes
 
