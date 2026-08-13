@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test stub for the gh CLI, used by tests/bootstrap.bats.
+# Test stub for the gh CLI, used by the bats suites.
 #
 # Every invocation is appended (shell-quoted, one line) to $GH_STUB_LOG so
 # tests can assert exactly which calls were made — in particular that
@@ -11,6 +11,12 @@
 #   <key>.err   contents printed to stderr, exit 1
 #   neither     "HTTP 404"-style error to stderr, exit 1 (matches how the
 #               bootstrap script distinguishes absent resources)
+#
+# `gh pr <sub>` responses use the same scheme keyed "pr_<sub>". Without a
+# fixture, the mutating subcommands (edit/comment/merge) succeed bodiless —
+# most tests only assert on the log — but `pr list` fails: its callers feed
+# the body to jq, so a silent empty response would green-light a test that
+# never exercised the filter.
 set -euo pipefail
 
 : "${GH_STUB_DIR:?gh stub requires GH_STUB_DIR}"
@@ -24,6 +30,26 @@ case ${1:-} in
         exit 0
         ;;
     api) ;;
+    pr)
+        key="pr_${2:-}"
+        if [[ -f $GH_STUB_DIR/$key.err ]]; then
+            cat "$GH_STUB_DIR/$key.err" >&2
+            exit 1
+        fi
+        if [[ -f $GH_STUB_DIR/$key ]]; then
+            cat "$GH_STUB_DIR/$key"
+            exit 0
+        fi
+        case ${2:-} in
+            edit | comment | merge)
+                exit 0
+                ;;
+            *)
+                printf 'gh-stub: no fixture %s for gh pr %s\n' "$key" "${2:-}" >&2
+                exit 1
+                ;;
+        esac
+        ;;
     *)
         printf 'gh-stub: unexpected command: %s\n' "$*" >&2
         exit 64
