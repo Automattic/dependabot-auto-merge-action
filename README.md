@@ -62,7 +62,9 @@ That's it. All inputs have defaults that match the original P2 configuration, so
 
 Start with `--dry-run` — it prints every mutation (method, path, payload) without executing anything.
 
-The script uses the gh CLI's credentials (`gh auth login` or `GH_TOKEN`). `GH_TOKEN`/`GITHUB_TOKEN` apply to github.com and ghe.com; for GitHub Enterprise Server set `GH_HOST` and `GH_ENTERPRISE_TOKEN` (or `GITHUB_ENTERPRISE_TOKEN`). Settings mutations need an **admin** role on the target repo; a fine-grained PAT scoped to the repo needs:
+The script uses the gh CLI's credentials (`gh auth login` or `GH_TOKEN`). `GH_TOKEN`/`GITHUB_TOKEN` apply to github.com and ghe.com; for GitHub Enterprise Server set `GH_HOST` and `GH_ENTERPRISE_TOKEN` (or `GITHUB_ENTERPRISE_TOKEN`). Settings mutations need administrative access to the target repo. Two token types work.
+
+A fine-grained PAT needs the repo role **admin**, plus:
 
 | Permission | Level | Used for |
 |------------|-------|----------|
@@ -71,7 +73,14 @@ The script uses the gh CLI's credentials (`gh auth login` or `GH_TOKEN`). `GH_TO
 | Issues | Read & write | Labels |
 | Metadata | Read | Implied by the above |
 
-A GitHub App installation token (`GH_TOKEN=ghs_...`) works too, minted from an app granted the same repository permissions.
+A GitHub App installation token (`GH_TOKEN=ghs_...`) carries no repo role — GitHub reports `permissions.admin: false` even for a fully capable app, so preflight checks administration access directly instead of the role. Grant the app:
+
+| Permission | Level | Used for |
+|------------|-------|----------|
+| Administration | Read & write | Auto-merge setting, rulesets, vulnerability alerts |
+| Contents | Read & write | Reading merge-related settings such as `allow_auto_merge` |
+| Pull requests | Read & write | Labels — confirmed sufficient in production; Issues was not granted |
+| Metadata | Read | Implied by the above |
 
 `--required-check` must match the check-run name exactly as it appears on a PR's Checks tab (for GitHub Actions, the job's name). To list check names on a recent commit: `gh api --paginate repos/OWNER/REPO/commits/COMMIT_SHA/check-runs --jq '.check_runs[].name'`. If the default branch already has required status checks (ruleset or classic branch protection), the script leaves them alone.
 

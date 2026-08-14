@@ -43,14 +43,24 @@ Authentication:
   Uses the gh CLI's credentials (gh auth login, or the GH_TOKEN env var).
   GH_TOKEN/GITHUB_TOKEN apply to github.com and ghe.com; for GitHub Enterprise
   Server set GH_HOST and GH_ENTERPRISE_TOKEN (or GITHUB_ENTERPRISE_TOKEN).
-  Settings mutations require an admin role on the target repo. A fine-grained
-  PAT scoped to the repo needs:
-    - Administration: Read & write   (auto-merge setting, rulesets, vulnerability alerts)
-    - Contents: Read & write         (reading merge-related settings such as allow_auto_merge)
-    - Issues: Read & write           (labels — a 403 in the labels step means this is missing)
-    - Metadata: Read                 (implied by the above)
-  A GitHub App installation token (GH_TOKEN=ghs_...) works too, minted from an
-  app granted the same repository permissions.
+  Settings mutations need administrative access to the target repo. Two token
+  types work:
+
+  - A fine-grained PAT with the repo role admin, and:
+      - Administration: Read & write   (auto-merge setting, rulesets, vulnerability alerts)
+      - Contents: Read & write         (reading merge-related settings such as allow_auto_merge)
+      - Issues: Read & write           (labels — a 403 in the labels step means this is missing)
+      - Metadata: Read                 (implied by the above)
+
+  - A GitHub App installation token (GH_TOKEN=ghs_...). App tokens carry no
+    repo role — GitHub reports permissions.admin: false even for a fully
+    capable app, so preflight checks administration access directly instead
+    (see the source). Grant the app:
+      - Administration: Read & write
+      - Contents: Read & write
+      - Pull requests: Read & write    (confirmed sufficient for labels in
+                                         production; Issues was not granted)
+      - Metadata: Read
 
 Finding the exact check name:
   The required check must match the check-run name exactly as it appears on a
