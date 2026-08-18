@@ -1,0 +1,11 @@
+Scanning acme/widgets
+
+!  found Gemfile.lock (bundler is deferred to v1.1) — those directories are not mapped
+!  found go.sum (gomod is deferred to v1.1) — those directories are not mapped
+!  found Cargo.lock (cargo is deferred to v1.1) — those directories are not mapped
+!  found poetry.lock (pip is deferred to v1.1) — those directories are not mapped
+!  found uv.lock (pip is deferred to v1.1) — those directories are not mapped
+Detected mappings:
+   composer: /
+
+Summary: 0 ok, 0 would change, 5 notes, 0 failed

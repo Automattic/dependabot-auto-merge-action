@@ -1,0 +1,33 @@
+Scanning acme/widgets
+
+Detected mappings:
+   composer: /projects/plugins/* (glob)
+
+!  composer: '/projects/plugins/*' would overlap 1 entry already in the file — adding the 2 unmapped directories singly instead
+→  map composer -> /projects/plugins/b
+→  map composer -> /projects/plugins/c
+
+--- a/.github/dependabot.yml
++++ b/.github/dependabot.yml
+@@ -6,3 +6,19 @@
+     directory: "/projects/plugins/a"
+     schedule:
+       interval: "weekly"
++  - package-ecosystem: "composer"
++    directory: "/projects/plugins/b"
++    schedule:
++      interval: "weekly"
++      day: "monday"
++    open-pull-requests-limit: 0
++    cooldown:
++      default-days: 7
++  - package-ecosystem: "composer"
++    directory: "/projects/plugins/c"
++    schedule:
++      interval: "weekly"
++      day: "monday"
++    open-pull-requests-limit: 0
++    cooldown:
++      default-days: 7
+
+Summary: 0 ok, 2 would change, 1 notes, 0 failed
