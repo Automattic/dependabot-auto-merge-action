@@ -1,0 +1,8 @@
+# Managed by the platform team. Do not reorder these entries.
+version: 2
+updates:
+  # the first plugin only
+  - package-ecosystem: "composer"
+    directory: "/projects/plugins/a"
+    schedule:
+      interval: "weekly"
