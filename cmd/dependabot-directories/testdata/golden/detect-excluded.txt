@@ -1,0 +1,7 @@
+Scanning acme/widgets
+
+!  skipped 2 path(s) under a soft-excluded directory (dist, examples, fixtures, ...) — use --include <dir> to keep one
+Detected mappings:
+   composer: /
+
+Summary: 0 ok, 0 would change, 1 notes, 0 failed

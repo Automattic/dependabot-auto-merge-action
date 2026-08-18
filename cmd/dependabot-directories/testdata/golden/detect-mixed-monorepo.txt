@@ -1,0 +1,8 @@
+Scanning acme/widgets
+
+Detected mappings:
+   composer: /projects/plugins/* (glob)
+   github-actions: /
+   npm: /
+
+Summary: 0 ok, 0 would change, 0 notes, 0 failed
