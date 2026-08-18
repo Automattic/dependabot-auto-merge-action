@@ -36,6 +36,69 @@ func assertExit(t *testing.T, got, want int, output string) {
 	}
 }
 
+// detect mirrors the bats helper of the same name: run the tool over a tree
+// fixture in --detect-only mode.
+func detectFixture(t *testing.T, fixture string, extra ...string) (int, string) {
+	t.Helper()
+	args := append([]string{"acme/widgets", "--paths-from-file", "testdata/trees/" + fixture + ".paths", "--detect-only"}, extra...)
+	return execute(t, args...)
+}
+
+// mappings extracts the "Detected mappings:" block, one "<eco>: <dir>" per
+// line, exactly as the bats sed/grep pipeline did.
+func mappings(output string) []string {
+	var out []string
+	in := false
+	for _, line := range strings.Split(output, "\n") {
+		switch {
+		case line == "Detected mappings:":
+			in = true
+		case in && line == "":
+			return out
+		case in && strings.HasPrefix(line, "   "):
+			out = append(out, strings.TrimPrefix(line, "   "))
+		}
+	}
+	return out
+}
+
+func assertMapping(t *testing.T, output, want string) {
+	t.Helper()
+	for _, m := range mappings(output) {
+		if m == want {
+			return
+		}
+	}
+	t.Errorf("mapping %q not found in %v\noutput:\n%s", want, mappings(output), output)
+}
+
+func refuteMapping(t *testing.T, output, fragment string) {
+	t.Helper()
+	for _, m := range mappings(output) {
+		if strings.Contains(m, fragment) {
+			t.Errorf("mapping %q must not appear (matched %q)\noutput:\n%s", fragment, m, output)
+		}
+	}
+}
+
+// assertNoted checks for a note-group example line, which carries a 5-space
+// indent; refuteNoted is its negation.
+func assertNoted(t *testing.T, output, item string) {
+	t.Helper()
+	if !strings.Contains(output, "\n     "+item+"\n") {
+		t.Errorf("example line for %q not found\noutput:\n%s", item, output)
+	}
+}
+
+func refuteNoted(t *testing.T, output, item string) {
+	t.Helper()
+	if strings.Contains(output, "\n     "+item+"\n") {
+		t.Errorf("example line for %q must not appear\noutput:\n%s", item, output)
+	}
+}
+
+func mappingCount(output string) int { return len(mappings(output)) }
+
 // --- argument validation ----------------------------------------------------
 
 func TestNoArgumentsExits2WithUsage(t *testing.T) {
