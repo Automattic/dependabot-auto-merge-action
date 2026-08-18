@@ -1,13 +1,16 @@
-// Package report prints the tool's line-item vocabulary and keeps the
-// counters behind the final summary. The prefixes and spacing are a contract:
-// the offline test suite asserts on exact lines, and operators grep run
-// output, so nothing here is free to drift.
-package report
+package main
 
 import (
 	"fmt"
 	"io"
 )
+
+// --- report -----------------------------------------------------------------
+//
+// The line-item vocabulary and the counters behind the final summary. The
+// prefixes and spacing are a contract: the offline test suite asserts on
+// exact lines, and operators grep run output, so nothing here is free to
+// drift.
 
 // noteSample bounds the examples printed under a grouped note. Real monorepos
 // produce findings by the hundred — a jetpack run emitted 270 "manifest
@@ -28,7 +31,7 @@ type Reporter struct {
 	FailCount    int
 }
 
-func New(out, errOut io.Writer) *Reporter {
+func newReporter(out, errOut io.Writer) *Reporter {
 	return &Reporter{out: out, errOut: errOut}
 }
 

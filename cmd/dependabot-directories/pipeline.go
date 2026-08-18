@@ -3,11 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-
-	"github.com/Automattic/dependabot-auto-merge-action/internal/dependabotyml"
-	"github.com/Automattic/dependabot-auto-merge-action/internal/detect"
-	"github.com/Automattic/dependabot-auto-merge-action/internal/report"
-	"github.com/Automattic/dependabot-auto-merge-action/internal/source"
 )
 
 // maxPairs caps the mappings a single run may emit. A repo yielding more is
@@ -19,19 +14,19 @@ const maxPairs = 50
 // list paths, exclude, detect, group, report, and (outside --detect-only)
 // plan the config change. Returns the process exit code.
 func runPipeline(opts options, stdout, stderr io.Writer) int {
-	rep := report.New(stdout, stderr)
+	rep := newReporter(stdout, stderr)
 
 	// Pick the sources once; nothing downstream knows which mode this is.
 	// --paths-from-file swaps in the fixture tree and, without
 	// --existing-config, an absent config — offline runs never touch the
 	// network. Real mode verifies gh and resolves the repository before
 	// anything else, the same order the bash script checked in.
-	var tree source.TreeSource
-	var cfgSrc source.ConfigSource
+	var tree TreeSource
+	var cfgSrc ConfigSource
 	if opts.pathsFromFile != "" {
-		tree = source.FixtureTree{PathsFile: opts.pathsFromFile}
+		tree = FixtureTree{PathsFile: opts.pathsFromFile}
 	} else {
-		gh := &source.GH{Repo: opts.repo, X: source.RealExec{}}
+		gh := &GH{Repo: opts.repo, X: RealExec{}}
 		if err := gh.Check(); err != nil {
 			fmt.Fprintf(stderr, "error: %s\n", err)
 			return 2
@@ -44,7 +39,7 @@ func runPipeline(opts options, stdout, stderr io.Writer) int {
 		cfgSrc = gh
 	}
 	if opts.existingConfigFile != "" {
-		cfgSrc = source.FixtureConfig{Path: opts.existingConfigFile}
+		cfgSrc = FixtureConfig{Path: opts.existingConfigFile}
 	}
 
 	fmt.Fprintf(stdout, "Scanning %s\n\n", opts.repo)
@@ -57,20 +52,20 @@ func runPipeline(opts options, stdout, stderr io.Writer) int {
 
 	// Guard 2 compares candidate globs against these UNFILTERED manifest
 	// lists: the glob GitHub expands knows nothing about our exclusions.
-	rawNpm := detect.DirsOf(detect.WithBasenames(paths, "package.json"))
-	rawComposer := detect.DirsOf(detect.WithBasenames(paths, "composer.json"))
+	rawNpm := DirsOf(WithBasenames(paths, "package.json"))
+	rawComposer := DirsOf(WithBasenames(paths, "composer.json"))
 
-	kept, soft := detect.SplitExclusions(paths, opts.include)
+	kept, soft := SplitExclusions(paths, opts.include)
 	if len(soft) > 0 {
 		rep.Note(fmt.Sprintf("skipped %d path(s) under a soft-excluded directory (dist, examples, fixtures, ...) — use --include <dir> to keep one", len(soft)))
 	}
 
-	pairs := detect.Npm(kept, tree, rep)
-	pairs = append(pairs, detect.Composer(kept, rep)...)
-	pairs = append(pairs, detect.Actions(kept)...)
-	detect.Deferred(kept, rep)
+	pairs := Npm(kept, tree, rep)
+	pairs = append(pairs, Composer(kept, rep)...)
+	pairs = append(pairs, Actions(kept)...)
+	Deferred(kept, rep)
 
-	blocks := detect.Group(pairs, rawNpm, rawComposer, rep)
+	blocks := Group(pairs, rawNpm, rawComposer, rep)
 
 	if len(blocks) == 0 {
 		rep.Note(fmt.Sprintf("no npm, composer or github-actions manifests detected in %s", opts.repo))
@@ -118,32 +113,32 @@ func runPipeline(opts options, stdout, stderr io.Writer) int {
 	}
 
 	item, child := "  ", "    "
-	var entries []dependabotyml.CoverageEntry
+	var entries []CoverageEntry
 	if present {
-		if err := dependabotyml.CheckShape(raw); err != nil {
+		if err := CheckShape(raw); err != nil {
 			rep.Fail(err.Error())
 			return 1
 		}
-		item, child = dependabotyml.DetectIndentation(raw)
+		item, child = DetectIndentation(raw)
 		var err error
-		entries, err = dependabotyml.ParseCoverage(raw)
+		entries, err = ParseCoverage(raw)
 		if err != nil {
 			rep.Fail(err.Error())
 			return 1
 		}
 	}
 
-	missing := dependabotyml.PlanMissing(blocks, entries, rep)
-	for _, note := range dependabotyml.StaleNotes(entries, pairs) {
+	missing := PlanMissing(blocks, entries, rep)
+	for _, note := range StaleNotes(entries, pairs) {
 		rep.Note(note)
 	}
 
 	if len(missing) == 0 {
-		rep.OK(dependabotyml.Path + " already covers every detected directory")
+		rep.OK(configPath + " already covers every detected directory")
 	} else {
-		current, proposed := dependabotyml.BuildProposal(raw, present, missing, item, child, opts.enableVersionUpdates, rep)
+		current, proposed := BuildProposal(raw, present, missing, item, child, opts.enableVersionUpdates, rep)
 		fmt.Fprintln(stdout)
-		dependabotyml.UnifiedDiff(current, proposed, stdout, stderr)
+		UnifiedDiff(current, proposed, stdout, stderr)
 	}
 
 	fmt.Fprintln(stdout)

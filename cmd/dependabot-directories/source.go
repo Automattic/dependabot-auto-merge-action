@@ -1,14 +1,148 @@
-package source
+package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 )
+
+// --- repository sources -------------------------------------------------------
+//
+// Where the pipeline's inputs come from: the file list, blob contents, and
+// the existing dependabot.yml. One implementation reads fixtures from disk
+// (--paths-from-file and --existing-config), the other execs gh. Detection
+// never knows which one it is talking to — that seam is what lets the
+// heuristics run offline against synthetic repositories.
+
+// TreeSource lists a repository's file paths and reads individual blobs.
+type TreeSource interface {
+	// ListPaths returns every blob path, cleaned, deduplicated and sorted
+	// byte-wise.
+	ListPaths() ([]string, error)
+	// ReadBlob returns one file's contents by repo-relative path. Any error
+	// means "treat the file as absent".
+	ReadBlob(path string) ([]byte, error)
+}
+
+// ConfigSource reads the existing .github/dependabot.yml.
+type ConfigSource interface {
+	// ReadConfig returns the raw file and whether it exists at all. A
+	// non-nil error is fatal to the run — it marks a state that must stop
+	// the merge, not a missing file.
+	ReadConfig() (raw string, present bool, err error)
+}
+
+// Execer runs one external command from an argv slice — never a shell, so no
+// repository content can ever be interpreted. Its two methods are the two
+// capture shapes every bash call site used: Output is `cmd 2>/dev/null`,
+// Combined is `cmd 2>&1`. The write-path follow-up counts calls through this
+// seam to prove --dry-run issues no writes.
+type Execer interface {
+	// Output returns stdout, discarding stderr.
+	Output(name string, args ...string) ([]byte, error)
+	// Combined returns stdout and stderr interleaved in one stream.
+	Combined(name string, args ...string) ([]byte, error)
+}
+
+// RealExec runs commands for real.
+type RealExec struct{}
+
+func (RealExec) Output(name string, args ...string) ([]byte, error) {
+	var out bytes.Buffer
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = &out
+	cmd.Stderr = io.Discard
+	err := cmd.Run()
+	return out.Bytes(), err
+}
+
+func (RealExec) Combined(name string, args ...string) ([]byte, error) {
+	// The same value on both streams matters: os/exec only shares one pipe
+	// (and so preserves interleaving without a data race) when Stderr is
+	// interface-equal to Stdout.
+	var buf bytes.Buffer
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	return buf.Bytes(), err
+}
+
+// FixtureTree is the offline TreeSource behind --paths-from-file: the file
+// list comes from a text file, one path per line, and blob contents from the
+// sibling <file-without-extension>.blobs/ directory.
+type FixtureTree struct {
+	PathsFile string
+}
+
+// BlobDir mirrors the bash derivation ${f%.*}.blobs — everything after the
+// last dot anywhere in the path counts as the extension.
+func (f FixtureTree) BlobDir() string {
+	base := f.PathsFile
+	if i := strings.LastIndex(base, "."); i >= 0 {
+		base = base[:i]
+	}
+	return base + ".blobs"
+}
+
+// ListPaths accepts hand-written fixtures as they are: ./x and /x spellings
+// are normalized, blank lines dropped, and the result sorted byte-wise.
+func (f FixtureTree) ListPaths() ([]string, error) {
+	raw, err := os.ReadFile(f.PathsFile)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimPrefix(line, "./")
+		line = strings.TrimPrefix(line, "/")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		paths = append(paths, line)
+	}
+	sort.Strings(paths)
+	out := paths[:0]
+	for i, p := range paths {
+		if i == 0 || p != paths[i-1] {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+func (f FixtureTree) ReadBlob(path string) ([]byte, error) {
+	body, err := os.ReadFile(filepath.Join(f.BlobDir(), path))
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// FixtureConfig is the offline ConfigSource behind --existing-config. A
+// missing file means "the repository has no dependabot.yml yet", not an
+// error.
+type FixtureConfig struct {
+	Path string
+}
+
+func (f FixtureConfig) ReadConfig() (string, bool, error) {
+	raw, err := os.ReadFile(f.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return string(raw), true, nil
+}
 
 // GH reads the repository through the gh CLI, which owns the whole
 // authentication story: gh auth login, GH_TOKEN, and the GH_HOST /
