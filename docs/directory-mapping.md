@@ -114,23 +114,23 @@ The branch ref is never force-updated — reviewer commits on it would be destro
 
 Every write is a non-GET `gh api` call routed through `bootstrap.sh`'s `mutate` funnel, including the PR itself (the pulls REST API, not `gh pr create`). That keeps "`--dry-run` issues no non-GET call" provable by counting stub invocations, exactly as [tests/bootstrap.bats](../tests/bootstrap.bats) does today.
 
-## 8. Script sketch
+## 8. Command sketch
 
 ```
-scripts/dependabot-directories.sh <owner/repo> [--dry-run] [--detect-only] [--include <dir>]... [--enable-version-updates] [--paths-from-file <f>]
+go run ./cmd/dependabot-directories <owner/repo> [--dry-run] [--detect-only] [--include <dir>]... [--enable-version-updates] [--paths-from-file <f>]
 ```
 
-Standalone script, later invoked as one idempotent step of `scripts/bootstrap.sh` (QAO-640); adopts its conventions (`mutate` wrapper for every write, `CHANGED`/`OK`/`WARN`/`PROBLEM` line items, exit 0 clean / 1 problems / 2 usage). Pipeline: resolve branch → fetch tree (truncation fallback) → filter/exclude → per-ecosystem detection → desired pairs → read existing config → coverage diff → render blocks → dry-run diff or branch + PR → summary.
+Standalone Go command — small internal packages (`detect`, `dependabotyml`, `source`, `report`) wired up in `cmd/dependabot-directories`, run with `go run` from the checkout so nothing compiled is ever committed — later invoked as one idempotent step of `scripts/bootstrap.sh` (QAO-640); adopts its conventions (`mutate` funnel for every write, `CHANGED`/`OK`/`WARN`/`PROBLEM` line items, exit 0 clean / 1 problems / 2 usage). Pipeline: resolve branch → fetch tree (truncation fallback) → filter/exclude → per-ecosystem detection → desired pairs → read existing config → coverage diff → render blocks → dry-run diff or branch + PR → summary.
 
-Testability rests on one seam: detection never calls `gh` itself, it calls through a variable holding a function name. `--paths-from-file` swaps in a local reader, so the whole heuristic runs offline against synthetic fixtures with no API calls. `--detect-only` prints the report and exits before any API call at all.
+Testability rests on one seam: detection reads the repository through a small source interface (path list plus blob reads). `--paths-from-file` swaps in a fixture-backed implementation, so the whole heuristic runs offline against synthetic repositories with no API calls. `--detect-only` prints the report and stops before the config stages.
 
-YAML→JSON runs through a shim that probes candidates **by execution**, not by presence — `python3` is commonly on `PATH` without PyYAML, and mikefarah's `yq` and python-`yq` share a binary name with incompatible CLIs. Order: `yq -o=json` (mikefarah), `yq -j` (python-yq), `ruby -ryaml -rjson`, `python3` + PyYAML. `yq` is the expected backend; the Ruby path is the zero-install fallback on stock macOS and every GitHub runner.
+YAML (`pnpm-workspace.yaml`, the existing config) is parsed with `gopkg.in/yaml.v3`; the dependencies are yaml.v3 and urfave/cli, nothing else. The structural shape checks stay text-level on purpose — the append-only splice edits bytes, so its guards must reason about bytes, never a parse.
 
 ## 9. Verification
 
 ### Offline fixtures
 
-Synthetic path lists under `tests/fixtures/trees/`, run through `--paths-from-file --detect-only` with no API calls: baseline root npm; yarn workspaces (array and v1 object form); shadowed lockfile; negated workspace globs; `**` including the zero-segment case; pnpm with and without a `packages:` key; composer siblings (glob emitted); composer siblings with a lockless fourth (Guard 2 trips); two top-level siblings (Guard 1); exclusions and `--include`; deferred-ecosystem lockfiles; paths with spaces, `+`, `[` and unicode; a jetpack-shaped mixed monorepo.
+Synthetic path lists under `cmd/dependabot-directories/testdata/trees/`, driven through `go test` via the same `--paths-from-file --detect-only` flags an operator would use, with no API calls: baseline root npm; yarn workspaces (array and v1 object form); shadowed lockfile; negated workspace globs; `**` including the zero-segment case; pnpm with and without a `packages:` key; composer siblings (glob emitted); composer siblings with a lockless fourth (Guard 2 trips); two top-level siblings (Guard 1); exclusions and `--include`; deferred-ecosystem lockfiles; paths with spaces, `+`, `[` and unicode; a jetpack-shaped mixed monorepo.
 
 ### Sandbox repos
 
@@ -170,7 +170,7 @@ WooCommerce also exposes the limits of the exclusion list as approved. It maps `
 
 | # | Question | Resolution |
 |---|---|---|
-| 1 | `yq` as a new dependency? | Yes — as the expected backend, behind a probe-based shim with a zero-install Ruby fallback (§8) |
+| 1 | `yq` as a new dependency? | ~~Yes — as the expected backend, behind a probe-based shim with a zero-install Ruby fallback~~ Superseded (2026-08): the tool was rewritten in Go for reviewability; YAML is read with `gopkg.in/yaml.v3` and no external YAML tool is probed or required (§8) |
 | 2 | Singular `directory` vs `directories:` + globs? | **Hybrid** (mahangu): glob when ≥2 same-ecosystem siblings share a parent, singular otherwise (§5) |
 | 3 | Manifests without lockfiles | `WARN`-only, no entry |
 | 4 | Workspace-covered package with its own lockfile | `WARN`-only — hoisted installs ignore it |
@@ -185,11 +185,12 @@ jamel.reid signed off on §2, §4 and every default above, and asked for the san
 
 ## 11. Implementation constraints
 
-macOS ships bash 3.2, which the script must run on. Three consequences worth writing down, because each fails quietly rather than loudly:
+The tool is Go (originally bash; rewritten for reviewability after review on the detection PR). The constraints worth writing down:
 
-- **No associative arrays and no `globstar`.** Sets are sorted files operated on with `comm` and `grep -f`; workspace globs are translated to anchored regular expressions rather than expanded by the shell. There is no working tree to glob against in any case — only a path list from the tree API.
-- **`grep -Ev -f` with an empty pattern file prints nothing**, not everything. Guard the negation branch explicitly; getting this wrong empties the covered set and produces exactly the per-package entry spam §4 exists to prevent.
-- **`comm` requires the same collation as the `sort` that fed it.** Set `LC_ALL=C` once, at the top. Otherwise the set math is wrong on some machines and right on others.
+- **Toolchain floor lives in `go.mod`** (go 1.26); operators need `go` and `gh`, nothing else. Dependencies are `gopkg.in/yaml.v3` and `urfave/cli` — no jq, no yq/ruby/PyYAML probing.
+- **The GitHub API is reached by exec'ing the authenticated `gh` CLI** (argv slices, never a shell), and diffs by exec'ing `diff -u` — the same auth and rendering story the bash script had. The exec seam is also what keeps "`--dry-run` issues no writes" provable for the follow-up write path: a recording fake counts every call.
+- **Sets are maps and slices, sorted byte-wise.** Go string ordering equals the `LC_ALL=C` collation the script forced on `sort` and `comm`, so report ordering is machine-independent by construction. Workspace globs are still translated to anchored regular expressions — there is no working tree to glob against, only a path list.
+- **Behaviour is pinned by transcripts.** Golden transcripts captured from the bash script before its deletion live beside the fixtures; the Go binary reproduces them byte for byte, so the port (and any future reimplementation) is testable against exactly what ran before.
 
 Entry counts are capped: a repo yielding more than ~50 pairs is a heuristic failure, not a real configuration, and stops with a `PROBLEM` unless overridden.
 
