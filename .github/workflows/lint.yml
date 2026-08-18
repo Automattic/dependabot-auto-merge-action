@@ -7,11 +7,19 @@ on:
             - '.github/workflows/**'
             - 'scripts/**'
             - 'tests/**'
+            - 'cmd/**'
+            - 'internal/**'
+            - 'go.mod'
+            - 'go.sum'
     pull_request:
         paths:
             - '.github/workflows/**'
             - 'scripts/**'
             - 'tests/**'
+            - 'cmd/**'
+            - 'internal/**'
+            - 'go.mod'
+            - 'go.sum'
 
 jobs:
     actionlint:
@@ -54,3 +62,25 @@ jobs:
               # jq is preinstalled on ubuntu-latest
               run: bats tests/
               shell: bash
+
+    go:
+        name: go
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+            - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+              with:
+                  # The floor declared in go.mod, not whatever is newest —
+                  # CI proves the version operators are told they need.
+                  go-version-file: go.mod
+            - name: gofmt
+              # gofmt -l . walks every Go file in the module, so a package
+              # added later is covered without editing this list.
+              run: |
+                  unformatted=$(gofmt -l .)
+                  [ -z "$unformatted" ] || { printf 'gofmt needed on:\n%s\n' "$unformatted"; exit 1; }
+              shell: bash
+            - name: go vet
+              run: go vet ./...
+            - name: go test
+              run: go test ./...
