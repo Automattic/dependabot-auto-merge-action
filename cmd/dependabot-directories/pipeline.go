@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/Automattic/dependabot-auto-merge-action/internal/dependabotyml"
 	"github.com/Automattic/dependabot-auto-merge-action/internal/detect"
 	"github.com/Automattic/dependabot-auto-merge-action/internal/report"
 	"github.com/Automattic/dependabot-auto-merge-action/internal/source"
@@ -77,8 +78,59 @@ func runPipeline(opts options, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout)
 
-	// The merge planning for --dry-run lands in a later commit; until then
-	// both modes stop at the detection report.
+	if opts.detectOnly {
+		rep.Summary()
+		if rep.FailCount > 0 {
+			return 1
+		}
+		return 0
+	}
+
+	// --dry-run from here: read the existing config, plan the gap, print
+	// the diff. A structural refusal stops the run without a summary, the
+	// same hard stop the bash script made.
+	raw, present := "", false
+	if opts.existingConfigFile != "" {
+		var err error
+		raw, present, err = source.FixtureConfig{Path: opts.existingConfigFile}.ReadConfig()
+		if err != nil {
+			rep.Fail(err.Error())
+			return 1
+		}
+	}
+	// Offline runs without --existing-config treat the config as absent;
+	// the gh-backed read lands in a later commit.
+
+	item, child := "  ", "    "
+	var entries []dependabotyml.CoverageEntry
+	if present {
+		if err := dependabotyml.CheckShape(raw); err != nil {
+			rep.Fail(err.Error())
+			return 1
+		}
+		item, child = dependabotyml.DetectIndentation(raw)
+		var err error
+		entries, err = dependabotyml.ParseCoverage(raw)
+		if err != nil {
+			rep.Fail(err.Error())
+			return 1
+		}
+	}
+
+	missing := dependabotyml.PlanMissing(blocks, entries, rep)
+	for _, note := range dependabotyml.StaleNotes(entries, pairs) {
+		rep.Note(note)
+	}
+
+	if len(missing) == 0 {
+		rep.OK(dependabotyml.Path + " already covers every detected directory")
+	} else {
+		current, proposed := dependabotyml.BuildProposal(raw, present, missing, item, child, opts.enableVersionUpdates, rep)
+		fmt.Fprintln(stdout)
+		dependabotyml.UnifiedDiff(current, proposed, stdout, stderr)
+	}
+
+	fmt.Fprintln(stdout)
 	rep.Summary()
 	if rep.FailCount > 0 {
 		return 1
