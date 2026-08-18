@@ -1,9 +1,0 @@
-package.json
-pnpm-lock.yaml
-pnpm-workspace.yaml
-projects/js-packages/a/package.json
-projects/plugins/x/composer.json
-projects/plugins/x/composer.lock
-projects/plugins/y/composer.json
-projects/plugins/y/composer.lock
-.github/workflows/build.yml

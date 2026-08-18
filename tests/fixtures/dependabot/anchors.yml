@@ -1,7 +1,0 @@
-version: 2
-defaults: &weekly
-  interval: "weekly"
-updates:
-  - package-ecosystem: "composer"
-    directory: "/somewhere/else"
-    schedule: *weekly

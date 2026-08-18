@@ -1,5 +1,0 @@
-package.json
-pnpm-lock.yaml
-apps/web/package.json
-apps/deep/nested/web/package.json
-other/thing/package.json
