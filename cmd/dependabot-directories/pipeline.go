@@ -21,13 +21,31 @@ const maxPairs = 50
 func runPipeline(opts options, stdout, stderr io.Writer) int {
 	rep := report.New(stdout, stderr)
 
-	// The gh-backed source lands in a later commit; until then the offline
-	// seam is the only tree.
-	if opts.pathsFromFile == "" {
-		fmt.Fprintf(stderr, "error: remote detection is not wired up yet — run with --paths-from-file for now\n")
-		return 2
+	// Pick the sources once; nothing downstream knows which mode this is.
+	// --paths-from-file swaps in the fixture tree and, without
+	// --existing-config, an absent config — offline runs never touch the
+	// network. Real mode verifies gh and resolves the repository before
+	// anything else, the same order the bash script checked in.
+	var tree source.TreeSource
+	var cfgSrc source.ConfigSource
+	if opts.pathsFromFile != "" {
+		tree = source.FixtureTree{PathsFile: opts.pathsFromFile}
+	} else {
+		gh := &source.GH{Repo: opts.repo, X: source.RealExec{}}
+		if err := gh.Check(); err != nil {
+			fmt.Fprintf(stderr, "error: %s\n", err)
+			return 2
+		}
+		if err := gh.Resolve(); err != nil {
+			fmt.Fprintf(stderr, "error: %s\n", err)
+			return 2
+		}
+		tree = gh
+		cfgSrc = gh
 	}
-	tree := source.FixtureTree{PathsFile: opts.pathsFromFile}
+	if opts.existingConfigFile != "" {
+		cfgSrc = source.FixtureConfig{Path: opts.existingConfigFile}
+	}
 
 	fmt.Fprintf(stdout, "Scanning %s\n\n", opts.repo)
 
@@ -90,16 +108,14 @@ func runPipeline(opts options, stdout, stderr io.Writer) int {
 	// the diff. A structural refusal stops the run without a summary, the
 	// same hard stop the bash script made.
 	raw, present := "", false
-	if opts.existingConfigFile != "" {
+	if cfgSrc != nil {
 		var err error
-		raw, present, err = source.FixtureConfig{Path: opts.existingConfigFile}.ReadConfig()
+		raw, present, err = cfgSrc.ReadConfig()
 		if err != nil {
 			rep.Fail(err.Error())
 			return 1
 		}
 	}
-	// Offline runs without --existing-config treat the config as absent;
-	// the gh-backed read lands in a later commit.
 
 	item, child := "  ", "    "
 	var entries []dependabotyml.CoverageEntry
