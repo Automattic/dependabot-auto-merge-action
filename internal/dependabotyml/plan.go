@@ -5,7 +5,87 @@ import (
 	"strings"
 
 	"github.com/Automattic/dependabot-auto-merge-action/internal/detect"
+	"github.com/Automattic/dependabot-auto-merge-action/internal/report"
 )
+
+// PlanMissing decides what is missing, one detected block at a time. A glob
+// whose members are only PARTLY mapped already is degraded to singular
+// entries for the unmapped members: emitting the glob would overlap the
+// existing entry, and overlapping entries are exactly what makes Dependabot
+// reject a config file outright.
+func PlanMissing(blocks []detect.Block, entries []CoverageEntry, rep *report.Reporter) []detect.Block {
+	var missing []detect.Block
+	for _, b := range blocks {
+		if Covers(entries, b.Eco, b.Dir) {
+			rep.OK(fmt.Sprintf("%s %s: already mapped", b.Eco, b.Dir))
+			continue
+		}
+		if !b.IsGlob {
+			missing = append(missing, b)
+			continue
+		}
+
+		coveredN := 0
+		var uncovered []string
+		for _, m := range b.Members {
+			if Covers(entries, b.Eco, m) {
+				coveredN++
+			} else {
+				uncovered = append(uncovered, m)
+			}
+		}
+		switch {
+		case len(uncovered) == 0:
+			rep.OK(fmt.Sprintf("%s %s: already mapped", b.Eco, b.Dir))
+		case coveredN == 0:
+			missing = append(missing, b)
+		default:
+			rep.Note(fmt.Sprintf("%s: '%s' would overlap %d %s already in the file — adding the %d unmapped %s singly instead",
+				b.Eco, b.Dir, coveredN, report.Plural(coveredN, "entry", "entries"),
+				len(uncovered), report.Plural(len(uncovered), "directory", "directories")))
+			for _, m := range uncovered {
+				missing = append(missing, detect.Block{Eco: b.Eco, Dir: m})
+			}
+		}
+	}
+	return missing
+}
+
+// BuildProposal renders the missing blocks, reports each as a would-change,
+// and splices them into the existing file after the last line of the
+// updates: block. The returned current is nil when no file exists — the
+// diff's "a" side is /dev/null then. Normalization mirrors the bash
+// $(cat)/printf pair: all trailing newlines collapse to exactly one, and
+// nothing else changes — CR bytes included.
+func BuildProposal(raw string, present bool, missing []detect.Block, item, child string, versionUpdates bool, rep *report.Reporter) (current *string, proposed string) {
+	var rendered strings.Builder
+	for _, b := range missing {
+		rendered.WriteString(RenderBlock(b, item, child, versionUpdates))
+		rep.Would(fmt.Sprintf("map %s -> %s", b.Eco, b.Dir))
+	}
+
+	if !present {
+		return nil, "version: 2\nupdates:\n" + rendered.String()
+	}
+
+	normalized := strings.TrimRight(raw, "\n") + "\n"
+	// Split on \n alone, never a \r-trimming scanner: CRLF files must come
+	// through the splice byte-identical outside the appended region.
+	lines := strings.Split(normalized, "\n")
+	insert := InsertionLine(lines)
+
+	var out strings.Builder
+	for i := 0; i < insert; i++ {
+		out.WriteString(lines[i])
+		out.WriteString("\n")
+	}
+	out.WriteString(rendered.String())
+	for i := insert; i < len(lines)-1; i++ { // len-1 skips the final split artifact
+		out.WriteString(lines[i])
+		out.WriteString("\n")
+	}
+	return &normalized, out.String()
+}
 
 // InsertionLine returns the 1-based number of the last line of the updates:
 // block — the line new entries are appended after. Blank lines do not extend
