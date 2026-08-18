@@ -1,4 +1,4 @@
-package report
+package main
 
 import (
 	"bytes"
@@ -12,7 +12,7 @@ import (
 
 func TestLinePrefixesAndCounters(t *testing.T) {
 	var out, errOut bytes.Buffer
-	r := New(&out, &errOut)
+	r := newReporter(&out, &errOut)
 
 	r.OK("a")
 	r.Would("b")
@@ -34,7 +34,7 @@ func TestLinePrefixesAndCounters(t *testing.T) {
 
 func TestFailWritesToStderrAndCounts(t *testing.T) {
 	var out, errOut bytes.Buffer
-	r := New(&out, &errOut)
+	r := newReporter(&out, &errOut)
 
 	r.Fail("boom")
 
@@ -51,7 +51,7 @@ func TestFailWritesToStderrAndCounts(t *testing.T) {
 
 func TestDetectedIsNotCounted(t *testing.T) {
 	var out bytes.Buffer
-	r := New(&out, &out)
+	r := newReporter(&out, &out)
 	r.Detected("x")
 	if r.OKCount+r.ChangedCount+r.NoteCount+r.FailCount != 0 {
 		t.Error("Detected must not move any counter")
@@ -60,7 +60,7 @@ func TestDetectedIsNotCounted(t *testing.T) {
 
 func TestNoteGroupEmpty(t *testing.T) {
 	var out bytes.Buffer
-	r := New(&out, &out)
+	r := newReporter(&out, &out)
 	r.NoteGroup(nil, "irrelevant:")
 	if out.Len() != 0 || r.NoteCount != 0 {
 		t.Errorf("empty group must print nothing, got %q", out.String())
@@ -69,7 +69,7 @@ func TestNoteGroupEmpty(t *testing.T) {
 
 func TestNoteGroupSingular(t *testing.T) {
 	var out bytes.Buffer
-	r := New(&out, &out)
+	r := newReporter(&out, &out)
 	r.NoteGroup([]string{"/a"}, "with a problem:")
 	want := "!  1 directory with a problem:\n     /a\n"
 	if out.String() != want {
@@ -82,7 +82,7 @@ func TestNoteGroupSingular(t *testing.T) {
 
 func TestNoteGroupAtTheSampleBoundary(t *testing.T) {
 	var out bytes.Buffer
-	r := New(&out, &out)
+	r := newReporter(&out, &out)
 	r.NoteGroup([]string{"/a", "/b", "/c", "/d", "/e"}, "found:")
 	got := out.String()
 	if strings.Contains(got, "more") {
@@ -100,7 +100,7 @@ func TestNoteGroupAtTheSampleBoundary(t *testing.T) {
 
 func TestNoteGroupPastTheSampleBoundary(t *testing.T) {
 	var out bytes.Buffer
-	r := New(&out, &out)
+	r := newReporter(&out, &out)
 	r.NoteGroup([]string{"/a", "/b", "/c", "/d", "/e", "/f", "/g"}, "found:")
 	got := out.String()
 	if !strings.Contains(got, "!  7 directories found:\n") {
@@ -130,7 +130,7 @@ func TestSummaryHasNoLeadingBlankLine(t *testing.T) {
 	// The blank line before the summary belongs to the call sites: the
 	// detect-only path prints none, every other path prints one.
 	var out bytes.Buffer
-	r := New(&out, &out)
+	r := newReporter(&out, &out)
 	r.OK("a")
 	r.Fail("b")
 	out.Reset()
