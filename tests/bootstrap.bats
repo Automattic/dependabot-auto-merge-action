@@ -209,10 +209,10 @@ EOF
 
 # --- preflight capability probes -------------------------------------------
 
-# GitHub App installation tokens have no repo role: GET /repos renders the
+# GitHub App installation tokens have no repo role. GET /repos renders the
 # permissions map all-false even when the app holds Administration: write
 # (observed live against api.github.com). Preflight no longer tries to prove
-# Administration access from this — it only gates on allow_auto_merge being
+# Administration access from this. It only gates on allow_auto_merge being
 # visible at all, and leaves proving write access to each step's own call.
 app_token_repo_json() {
     fixture GET_repos_acme_widgets <<EOF
@@ -243,24 +243,26 @@ EOF
     grep -q -- '-X POST repos/acme/widgets/rulesets' "$GH_STUB_LOG"
 }
 
-# The scenario the removed probe got wrong: a token that can see merge
+# The scenario the removed probe got wrong. A token that can see merge
 # settings (has "allow_auto_merge") but isn't actually admin. A repo the
 # token doesn't administer 404s on vulnerability-alerts exactly like a
-# genuinely disabled one does (confirmed live: gh api repos/cli/cli reports
+# genuinely disabled one does. Confirmed live, gh api repos/cli/cli reports
 # permissions.admin false, and -i .../vulnerability-alerts returns a plain
-# 404, indistinguishable from "disabled"), so the removed probe would have
+# 404, indistinguishable from "disabled", so the removed probe would have
 # waved this token through. Refusal now happens at the real mutating call.
 @test "a token that can view merge settings but lacks Administration write fails at the first admin-scoped step, not preflight" {
     fresh_repo_fixtures
     fixture GET_repos_acme_widgets <<<'{"full_name":"acme/widgets","default_branch":"main","allow_auto_merge":false,"permissions":{"admin":false,"push":true,"maintain":false,"triage":false,"pull":true}}'
-    fixture PATCH_repos_acme_widgets.err <<<'HTTP 403: Resource not accessible by integration'
+    # A PAT with push and no admin gets this exact error on the real PATCH
+    # (reproduced live: gh api -X PATCH repos/cli/cli --input - <<< '{}').
+    fixture PATCH_repos_acme_widgets.err <<<'gh: Not Found (HTTP 404)'
     fixture POST_repos_acme_widgets_labels </dev/null
     fixture PUT_repos_acme_widgets_vulnerability_alerts </dev/null
     run "$SCRIPT" acme/widgets
     [ "$status" -eq 1 ]
     [[ $output == *"Failed steps: auto-merge"* ]]
-    [[ $output == *"HTTP 403"* ]]
-    # Preflight didn't refuse outright — later steps still ran.
+    [[ $output == *"HTTP 404"* ]]
+    # Preflight didn't refuse outright. Later steps still ran.
     [ "$(grep -c -- '-X POST repos/acme/widgets/labels' "$GH_STUB_LOG")" -eq 3 ]
     grep -q -- '-X PUT repos/acme/widgets/vulnerability-alerts' "$GH_STUB_LOG"
 }
