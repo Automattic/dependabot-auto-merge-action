@@ -60,6 +60,7 @@ to the repo needs:
 // 2 usage or environment errors. main is the only caller that turns the code
 // into os.Exit; tests call run directly with in-memory writers.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	exitCode := 0
 	cmd := &cli.Command{
 		Name:            "dependabot-directories",
 		Usage:           "map dependency manifests and lockfiles into .github/dependabot.yml",
@@ -112,14 +113,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			if err != nil {
 				return err
 			}
-			_ = opts // the detection pipeline lands in the next commits
+			exitCode = runPipeline(opts, stdout, stderr)
 			return nil
 		},
 	}
 
 	err := cmd.Run(ctx, append([]string{cmd.Name}, args...))
 	if err == nil {
-		return 0
+		return exitCode
 	}
 	var ue usageError
 	if errors.As(err, &ue) {

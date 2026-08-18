@@ -103,6 +103,44 @@ func SortedUnique(items []string) []string {
 	return slicesCompact(out)
 }
 
+// Intersect returns the items present in both sorted lists — comm -12.
+func Intersect(a, b []string) []string {
+	var out []string
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] < b[j]:
+			i++
+		case a[i] > b[j]:
+			j++
+		default:
+			out = append(out, a[i])
+			i++
+			j++
+		}
+	}
+	return out
+}
+
+// Subtract returns the items of sorted a that are not in sorted b — comm -23.
+func Subtract(a, b []string) []string {
+	var out []string
+	i, j := 0, 0
+	for i < len(a) {
+		switch {
+		case j >= len(b) || a[i] < b[j]:
+			out = append(out, a[i])
+			i++
+		case a[i] > b[j]:
+			j++
+		default:
+			i++
+			j++
+		}
+	}
+	return out
+}
+
 // slicesCompact removes adjacent duplicates in place.
 func slicesCompact(sorted []string) []string {
 	if len(sorted) == 0 {
