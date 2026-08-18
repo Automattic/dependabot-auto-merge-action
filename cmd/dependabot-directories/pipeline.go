@@ -36,12 +36,10 @@ func runPipeline(opts options, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Guard 2 later compares candidate globs against these UNFILTERED
-	// manifest lists: the glob GitHub expands knows nothing about our
-	// exclusions.
+	// Guard 2 compares candidate globs against these UNFILTERED manifest
+	// lists: the glob GitHub expands knows nothing about our exclusions.
 	rawNpm := detect.DirsOf(detect.WithBasenames(paths, "package.json"))
 	rawComposer := detect.DirsOf(detect.WithBasenames(paths, "composer.json"))
-	_, _ = rawNpm, rawComposer // consumed when grouping lands
 
 	kept, soft := detect.SplitExclusions(paths, opts.include)
 	if len(soft) > 0 {
@@ -53,7 +51,7 @@ func runPipeline(opts options, stdout, stderr io.Writer) int {
 	pairs = append(pairs, detect.Actions(kept)...)
 	detect.Deferred(kept, rep)
 
-	blocks := detect.Group(pairs)
+	blocks := detect.Group(pairs, rawNpm, rawComposer, rep)
 
 	if len(blocks) == 0 {
 		rep.Note(fmt.Sprintf("no npm, composer or github-actions manifests detected in %s", opts.repo))
