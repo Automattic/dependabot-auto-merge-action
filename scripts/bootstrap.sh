@@ -43,12 +43,28 @@ Authentication:
   Uses the gh CLI's credentials (gh auth login, or the GH_TOKEN env var).
   GH_TOKEN/GITHUB_TOKEN apply to github.com and ghe.com; for GitHub Enterprise
   Server set GH_HOST and GH_ENTERPRISE_TOKEN (or GITHUB_ENTERPRISE_TOKEN).
-  Settings mutations require an admin role on the target repo. A fine-grained
-  PAT scoped to the repo needs:
-    - Administration: Read & write   (auto-merge setting, rulesets, vulnerability alerts)
-    - Contents: Read & write         (reading merge-related settings such as allow_auto_merge)
-    - Issues: Read & write           (labels — a 403 in the labels step means this is missing)
-    - Metadata: Read                 (implied by the above)
+  Settings mutations need administrative access to the target repo. Two token
+  types work:
+
+  - A fine-grained PAT with the repo role admin, and:
+      - Administration: Read & write   (auto-merge setting, rulesets, vulnerability alerts)
+      - Contents: Read & write         (reading merge-related settings such as allow_auto_merge)
+      - Issues: Read & write           (labels; a 403 in the labels step means this is missing)
+      - Metadata: Read                 (implied by the above)
+
+  - A GitHub App installation token (GH_TOKEN=ghs_...). App tokens carry no
+    repo role. GitHub reports permissions.admin: false even for a fully
+    capable app. Grant the app:
+      - Administration: Read & write
+      - Contents: Read & write
+      - Pull requests: Read & write    (confirmed sufficient for labels in
+                                         production; Issues was not granted)
+      - Metadata: Read
+
+  Preflight can only confirm a token can view repo settings, not that it can
+  write them. See the README's Authentication section for why no read-only
+  check can prove Administration: write. A token that lacks it fails at the
+  first admin-scoped step with a clear 403, not at preflight.
 
 Finding the exact check name:
   The required check must match the check-run name exactly as it appears on a
@@ -154,10 +170,14 @@ preflight() {
     # merge-related settings (Contents: Read & write on a fine-grained PAT);
     # PATs return no scope headers, so probing the response shape is the only
     # reliable capability check before we start mutating.
-    if [[ $(jq 'has("allow_auto_merge")' <<<"$REPO_JSON") != true ]] ||
-        [[ $(jq '.permissions.admin == true' <<<"$REPO_JSON") != true ]]; then
-        die 2 "token lacks admin access to $REPO — a fine-grained PAT needs Administration and Contents: Read & write (see --help)"
+    if [[ $(jq 'has("allow_auto_merge")' <<<"$REPO_JSON") != true ]]; then
+        die 2 "token cannot view merge settings on $REPO, it needs Contents: Read & write (see --help)"
     fi
+
+    # No read-only endpoint proves Administration: write for either token
+    # type (see the README's Authentication section for why). Preflight
+    # stops at confirming repo visibility. Each step's own mutating call
+    # does the refusing, with its real error surfaced.
 }
 
 # --- steps --------------------------------------------------------------------

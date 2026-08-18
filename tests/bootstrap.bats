@@ -207,6 +207,74 @@ EOF
     grep -q -- '-X PUT repos/acme/widgets/vulnerability-alerts' "$GH_STUB_LOG"
 }
 
+# --- preflight capability probes -------------------------------------------
+
+# GitHub App installation tokens have no repo role. GET /repos renders the
+# permissions map all-false even when the app holds Administration: write
+# (observed live against api.github.com). Preflight no longer tries to prove
+# Administration access from this. It only gates on allow_auto_merge being
+# visible at all, and leaves proving write access to each step's own call.
+app_token_repo_json() {
+    fixture GET_repos_acme_widgets <<EOF
+{"full_name":"acme/widgets","default_branch":"main","allow_auto_merge":$1,"permissions":{"admin":false,"maintain":false,"push":false,"triage":false,"pull":false}}
+EOF
+}
+
+@test "app installation token with permissions.admin false still bootstraps successfully" {
+    configured_repo_fixtures
+    app_token_repo_json true
+    run "$SCRIPT" acme/widgets --required-check ci
+    [ "$status" -eq 0 ]
+    [[ $output == *"0 failed"* ]]
+    [ "$(mutation_count)" -eq 0 ]
+}
+
+@test "app installation token performs admin-scoped mutations despite permissions.admin false" {
+    fresh_repo_fixtures
+    app_token_repo_json false
+    fixture PATCH_repos_acme_widgets </dev/null
+    fixture POST_repos_acme_widgets_rulesets </dev/null
+    fixture POST_repos_acme_widgets_labels </dev/null
+    fixture PUT_repos_acme_widgets_vulnerability_alerts </dev/null
+    run "$SCRIPT" acme/widgets --required-check ci
+    [ "$status" -eq 0 ]
+    [[ $output == *"0 failed"* ]]
+    grep -q -- '-X PATCH repos/acme/widgets ' "$GH_STUB_LOG"
+    grep -q -- '-X POST repos/acme/widgets/rulesets' "$GH_STUB_LOG"
+}
+
+# The scenario the removed probe got wrong. A token that can see merge
+# settings (has "allow_auto_merge") but isn't actually admin. A repo the
+# token doesn't administer 404s on vulnerability-alerts exactly like a
+# genuinely disabled one does. Confirmed live, gh api repos/cli/cli reports
+# permissions.admin false, and -i .../vulnerability-alerts returns a plain
+# 404, indistinguishable from "disabled", so the removed probe would have
+# waved this token through. Refusal now happens at the real mutating call.
+@test "a token that can view merge settings but lacks Administration write fails at the first admin-scoped step, not preflight" {
+    fresh_repo_fixtures
+    fixture GET_repos_acme_widgets <<<'{"full_name":"acme/widgets","default_branch":"main","allow_auto_merge":false,"permissions":{"admin":false,"push":true,"maintain":false,"triage":false,"pull":true}}'
+    # A PAT with push and no admin gets this exact error on the real PATCH
+    # (reproduced live: gh api -X PATCH repos/cli/cli --input - <<< '{}').
+    fixture PATCH_repos_acme_widgets.err <<<'gh: Not Found (HTTP 404)'
+    fixture POST_repos_acme_widgets_labels </dev/null
+    fixture PUT_repos_acme_widgets_vulnerability_alerts </dev/null
+    run "$SCRIPT" acme/widgets
+    [ "$status" -eq 1 ]
+    [[ $output == *"Failed steps: auto-merge"* ]]
+    [[ $output == *"HTTP 404"* ]]
+    # Preflight didn't refuse outright. Later steps still ran.
+    [ "$(grep -c -- '-X POST repos/acme/widgets/labels' "$GH_STUB_LOG")" -eq 3 ]
+    grep -q -- '-X PUT repos/acme/widgets/vulnerability-alerts' "$GH_STUB_LOG"
+}
+
+@test "token that cannot view merge settings is refused" {
+    fixture GET_repos_acme_widgets <<<'{"full_name":"acme/widgets","default_branch":"main","permissions":{"admin":true}}'
+    run "$SCRIPT" acme/widgets
+    [ "$status" -eq 2 ]
+    [[ $output == *"cannot view merge settings"* ]]
+    [ "$(mutation_count)" -eq 0 ]
+}
+
 @test "renamed repo is refused before any mutation" {
     fixture GET_repos_acme_old_name <<<'{"full_name":"acme/widgets","default_branch":"main","allow_auto_merge":false,"permissions":{"admin":true}}'
     run "$SCRIPT" acme/old-name
