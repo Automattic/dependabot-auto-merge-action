@@ -54,13 +54,17 @@ Authentication:
 
   - A GitHub App installation token (GH_TOKEN=ghs_...). App tokens carry no
     repo role — GitHub reports permissions.admin: false even for a fully
-    capable app, so preflight checks administration access directly instead
-    (see the source). Grant the app:
+    capable app. Grant the app:
       - Administration: Read & write
       - Contents: Read & write
       - Pull requests: Read & write    (confirmed sufficient for labels in
                                          production; Issues was not granted)
       - Metadata: Read
+
+  Preflight can only confirm a token can view repo settings, not that it can
+  write them — no read-only check reliably proves Administration: write for
+  either token type. A token that lacks it fails at the first admin-scoped
+  step with a clear 403, not at preflight.
 
 Finding the exact check name:
   The required check must match the check-run name exactly as it appears on a
@@ -170,20 +174,18 @@ preflight() {
         die 2 "token cannot view merge settings on $REPO — it needs Contents: Read & write (see --help)"
     fi
 
-    # .permissions reports the token owner's repo role, which only user tokens
-    # have: a GitHub App installation token gets the map rendered all-false
-    # even when the app holds Administration: write. When the role probe
-    # fails, prove administration access directly against an endpoint gated on
-    # Administration read — vulnerability-alerts answers 204/404 to tokens
-    # that hold it and 403 to everything else. A token that slips past this
-    # gate still fails per-step with a clear message.
-    if [[ $(jq '.permissions.admin == true' <<<"$REPO_JSON") != true ]]; then
-        local alerts_probe
-        if ! alerts_probe=$(gh api "repos/$REPO/vulnerability-alerts" 2>&1) &&
-            ! grep -q "HTTP 404" <<<"$alerts_probe"; then
-            die 2 "token lacks admin access to $REPO — a fine-grained PAT needs Administration: Read & write, a GitHub App installation token an app with the same permission (see --help)"
-        fi
-    fi
+    # No read-only endpoint reliably proves Administration: write, for either
+    # token type. .permissions.admin reports a repo role that GitHub App
+    # installation tokens don't have at all (rendered false regardless of the
+    # app's actual grant). A vulnerability-alerts probe doesn't distinguish
+    # either: it 404s both when alerts are genuinely off and when the token
+    # simply lacks access — confirmed live against a repo we can't administer
+    # — and on GHE Server instances where Dependabot isn't enabled yet, it
+    # 404s for every token regardless of role. So preflight stops at "can this
+    # token see repo settings at all" and leaves proving write access to each
+    # step's own mutating call, which fails on a real 403 when it's missing —
+    # the same approach gh CLI, terraform-provider-github, and
+    # create-pull-request take, since none of them found a better one either.
 }
 
 # --- steps --------------------------------------------------------------------

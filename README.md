@@ -73,7 +73,7 @@ A fine-grained PAT needs the repo role **admin**, plus:
 | Issues | Read & write | Labels |
 | Metadata | Read | Implied by the above |
 
-A GitHub App installation token (`GH_TOKEN=ghs_...`) carries no repo role — GitHub reports `permissions.admin: false` even for a fully capable app, so preflight checks administration access directly instead of the role. Grant the app:
+A GitHub App installation token (`GH_TOKEN=ghs_...`) carries no repo role — GitHub reports `permissions.admin: false` even for a fully capable app. Grant the app:
 
 | Permission | Level | Used for |
 |------------|-------|----------|
@@ -81,6 +81,8 @@ A GitHub App installation token (`GH_TOKEN=ghs_...`) carries no repo role — Gi
 | Contents | Read & write | Reading merge-related settings such as `allow_auto_merge` |
 | Pull requests | Read & write | Labels — confirmed sufficient in production; Issues was not granted |
 | Metadata | Read | Implied by the above |
+
+Preflight can only confirm a token can view repo settings, not that it can write them — no read-only check reliably proves Administration: write for either token type. A token that lacks it fails at the first admin-scoped step with a clear 403, not at preflight.
 
 `--required-check` must match the check-run name exactly as it appears on a PR's Checks tab (for GitHub Actions, the job's name). To list check names on a recent commit: `gh api --paginate repos/OWNER/REPO/commits/COMMIT_SHA/check-runs --jq '.check_runs[].name'`. If the default branch already has required status checks (ruleset or classic branch protection), the script leaves them alone.
 
