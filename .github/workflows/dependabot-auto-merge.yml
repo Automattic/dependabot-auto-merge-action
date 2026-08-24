@@ -402,8 +402,18 @@ jobs:
                   if [ -n "$REVIEW_TEAM" ]; then
                       TEAM_MENTION=" cc @$REVIEW_TEAM"
                   fi
-                  gh pr edit "$PR_URL" --add-label "$REVIEW_LABEL" --remove-label "$PENDING_LABEL"
+                  # Comment before labelling. Under `bash -e` a failed edit
+                  # aborts the step, and the reviewer notification is the part
+                  # a human still needs when that happens.
                   gh pr comment "$PR_URL" --body "This PR has been routed to the security-review path: $REASON.$TEAM_MENTION"
+                  # One `gh pr edit` rather than two calls, though not one
+                  # atomic call. gh sends the add and the remove as two
+                  # concurrent mutations with no rollback, so a failure on the
+                  # remove half can still leave both labels on. The invariant
+                  # survives that. The cron excludes any PR carrying the review
+                  # label, and the next evaluation to reach a verdict clears
+                  # the both-labels state.
+                  gh pr edit "$PR_URL" --add-label "$REVIEW_LABEL" --remove-label "$PENDING_LABEL"
               env:
                   METADATA_AVAILABLE: ${{ steps.cvss.outputs.available }}
                   GATE2_PASS: ${{ steps.gate2.outputs.pass }}

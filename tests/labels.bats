@@ -4,6 +4,10 @@
 # remove the other in a single `gh pr edit`. The step scripts are pulled out
 # of the YAML and run as-is against the gh stub, so these tests exercise the
 # shipped code rather than a copy that can drift from it.
+#
+# One edit is not the same as one atomic call. gh sends the add and the
+# remove as two concurrent mutations with no rollback, so these tests assert
+# the shape of the call, not that both labels always land together.
 
 load helpers
 
@@ -53,11 +57,25 @@ run_step() {
     METADATA_AVAILABLE=false REPORTED_CVSS='' REVIEW_TEAM='' \
         REVIEW_LABEL=sirt-review-required PENDING_LABEL=auto-merge-pending \
         run_step "$REVIEW_STEP"
-    # One edit carrying both flags: two separate calls would leave the PR in
-    # the both-labels state whenever the second one failed.
+    # One edit carrying both flags. gh is not atomic about it, but two
+    # separate calls widen the window in which a failure on the second leaves
+    # the PR in the both-labels state.
     [ "$(log_count 'pr edit')" -eq 1 ]
     [ "$(log_count "pr edit $PR_URL --add-label sirt-review-required --remove-label auto-merge-pending")" -eq 1 ]
     [ "$(log_count 'pr comment')" -eq 1 ]
+}
+
+@test "the review notification posts even when the edit fails" {
+    echo "GraphQL: Resource not accessible by integration" >"$GH_STUB_DIR/pr_edit.err"
+    METADATA_AVAILABLE=false REPORTED_CVSS='' REVIEW_TEAM=security \
+        REVIEW_LABEL=sirt-review-required PENDING_LABEL=auto-merge-pending \
+        run bash --noprofile --norc -e "$REVIEW_STEP"
+    # The step still fails so the labelling failure is not swallowed, but
+    # the comment goes out first, so a human sees the PR was routed to review
+    # even when the label never lands.
+    [ "$status" -eq 1 ]
+    [ "$(log_count 'pr comment')" -eq 1 ]
+    [ "$(log_count 'routed to the security-review path')" -eq 1 ]
 }
 
 # --- review -> pass -------------------------------------------------------
