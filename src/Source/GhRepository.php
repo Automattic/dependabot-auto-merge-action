@@ -8,6 +8,7 @@ use Automattic\DependabotDirectories\Config\ConfigFile;
 use Automattic\DependabotDirectories\Detection\Paths;
 use Automattic\DependabotDirectories\Exception\FatalException;
 use Automattic\DependabotDirectories\Exception\TruncatedTreeException;
+use Automattic\DependabotDirectories\Report\Reporter;
 
 /**
  * Reads the repository through the gh CLI, which owns the whole
@@ -102,6 +103,14 @@ final class GhRepository implements TreeSource, ConfigSource
     }
 
     /**
+     * The default branch percent-encoded for use in a URL path.
+     */
+    public function encodedBranch(): string
+    {
+        return $this->encodedBranch;
+    }
+
+    /**
      * Every blob path on the default branch, via the git trees API.
      */
     public function listPaths(): array
@@ -138,6 +147,111 @@ final class GhRepository implements TreeSource, ConfigSource
         }
 
         return Paths::sortedUnique($paths);
+    }
+
+    /**
+     * The fallback for repositories big enough to truncate the git trees
+     * API: a blobless shallow clone, listed with `git ls-tree`.
+     *
+     * `gh repo clone` rather than a raw `git clone`, so the token never lands
+     * in argv or in a remote URL.
+     *
+     * A server without `uploadpack.allowFilter` refuses the filter. Falling
+     * back to a full clone silently would mean cloning, in full, exactly the
+     * repositories large enough to truncate the tree API in the first place,
+     * so that path is gated behind $allowFullClone.
+     *
+     * @return list<string>
+     *
+     * @throws \RuntimeException
+     */
+    public function listPathsByClone(bool $allowFullClone, Reporter $reporter): array
+    {
+        if ($this->exec->output(['git', '--version'])->notFound()) {
+            throw new \RuntimeException('git not found, and the tree API truncated — install git or run against a smaller repository');
+        }
+
+        $destination = sys_get_temp_dir().'/dependabot-directories-clone-'.bin2hex(random_bytes(8));
+
+        try {
+            $this->clone($destination, $allowFullClone, $reporter);
+
+            $listing = $this->exec->output(['git', '-C', $destination, 'ls-tree', '-r', '--name-only', 'HEAD']);
+            if (!$listing->succeeded()) {
+                throw new \RuntimeException(sprintf('cannot list files in the clone of %s', $this->repository));
+            }
+
+            $paths = [];
+            foreach (explode("\n", $listing->output) as $line) {
+                if ('' !== $line) {
+                    $paths[] = $line;
+                }
+            }
+
+            $paths = Paths::sortedUnique($paths);
+            if ([] === $paths) {
+                throw new \RuntimeException(sprintf('the clone of %s produced an empty file list', $this->repository));
+            }
+
+            return $paths;
+        } finally {
+            $this->removeTree($destination);
+        }
+    }
+
+    private function clone(string $destination, bool $allowFullClone, Reporter $reporter): void
+    {
+        $blobless = $this->exec->combined([
+            'gh', 'repo', 'clone', $this->repository, $destination, '--',
+            '--depth', '1', '--filter=blob:none', '--no-checkout',
+            '--single-branch', '--branch', $this->defaultBranch,
+        ]);
+        if ($blobless->succeeded()) {
+            return;
+        }
+
+        if (!$allowFullClone) {
+            throw new \RuntimeException(sprintf(
+                'blobless clone of %s failed and --allow-full-clone was not given: %s',
+                $this->repository,
+                $blobless->truncatedOutput(),
+            ));
+        }
+
+        $reporter->note('blobless clone refused — falling back to a full clone as requested');
+
+        $full = $this->exec->combined([
+            'gh', 'repo', 'clone', $this->repository, $destination, '--',
+            '--depth', '1', '--no-checkout', '--single-branch', '--branch', $this->defaultBranch,
+        ]);
+        if (!$full->succeeded()) {
+            throw new \RuntimeException(sprintf(
+                'cannot clone %s: %s',
+                $this->repository,
+                $full->truncatedOutput(),
+            ));
+        }
+    }
+
+    private function removeTree(string $path): void
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+
+        $entries = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        );
+        foreach ($entries as $entry) {
+            /** @var \SplFileInfo $entry */
+            if ($entry->isDir()) {
+                @rmdir($entry->getPathname());
+            } else {
+                @unlink($entry->getPathname());
+            }
+        }
+        @rmdir($path);
     }
 
     /**
