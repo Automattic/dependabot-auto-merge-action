@@ -75,8 +75,14 @@ run_step() {
     # the comment goes out first, so a human sees the PR was routed to review
     # even when the label never lands.
     [ "$status" -eq 1 ]
+    # Space-free needles. The stub logs shell-quoted, and how `printf %q`
+    # spells a value with spaces depends on the bash version and on what else
+    # the value contains: backslash-escaped spaces under bash 5, a $'...'
+    # string that keeps them literal under the bash 3.2 on macOS. A
+    # multi-word needle matches under one and not the other.
     [ "$(log_count 'pr comment')" -eq 1 ]
-    log_has_call 'pr comment' 'routed to the security-review path' 'cc @security'
+    [ "$(log_count 'security-review')" -eq 1 ]
+    [ "$(log_count '@security')" -eq 1 ]
 }
 
 # --- review -> pass -------------------------------------------------------

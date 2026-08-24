@@ -36,6 +36,9 @@ log_count() {
 # Succeed if one logged gh call contains every fixed string in $@. Each
 # needle is matched independently, so an assertion stays true when flags are
 # reordered in the YAML, which changes nothing about what the call does.
+# Keep needles to flags and other unquoted words. The log is shell-quoted,
+# and `printf %q` spells whitespace inside a value differently across bash
+# versions, so a needle reaching into one matches on some platforms only.
 log_has_call() {
     local lines needle
     lines=$(cat "$GH_STUB_LOG")
