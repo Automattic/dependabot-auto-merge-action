@@ -302,12 +302,12 @@ jobs:
                   elif [ "$GATE1_PASS" = "true" ]; then
                       # cvss stays empty, never 0 — the review comment names
                       # the reported value, and nothing was reported here.
-                      echo "::warning::Gate 1 fallback: Dependabot alerts API call failed — no better score available. $(echo "$API_RESPONSE" | head -c 300)"
+                      echo "::warning::Gate 1 fallback: Dependabot alerts API call failed — no better score available. $(echo "$API_RESPONSE" | head -c 300 | tr '\n' ' ')"
                       echo "pass=false" >> "$GITHUB_OUTPUT"
                       echo "cvss=" >> "$GITHUB_OUTPUT"
                       exit 0
                   else
-                      echo "::error::Gate 1 fallback: Dependabot alerts API call failed — $(echo "$API_RESPONSE" | head -c 300)"
+                      echo "::error::Gate 1 fallback: Dependabot alerts API call failed — $(echo "$API_RESPONSE" | head -c 300 | tr '\n' ' ')"
                       exit 1
                   fi
 

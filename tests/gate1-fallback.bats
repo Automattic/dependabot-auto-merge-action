@@ -71,9 +71,14 @@ alert() {
         "$2" "$3" "$1"
 }
 
+# A real `gh` 403 spans two lines. The annotations have to fold it onto one:
+# the runner reads any following line starting with `::` as a workflow
+# command, and the rest of the message would be lost from the annotation.
 api_403() {
-    echo 'gh: HTTP 403: Resource not accessible by integration (https://api.github.com/repos/acme/widgets/dependabot/alerts)' \
-        >"$GH_STUB_DIR/$ALERTS_KEY.err"
+    cat >"$GH_STUB_DIR/$ALERTS_KEY.err" <<'EOF'
+gh: HTTP 403: Resource not accessible by integration (https://api.github.com/repos/acme/widgets/dependabot/alerts)
+Learn more at https://docs.github.com/rest/dependabot/alerts
+EOF
 }
 
 # Run the step with $1 as GATE1_PASS, $2 as the dependency-names list and
@@ -93,6 +98,16 @@ fallback() {
     [ "$status" -eq 1 ]
     grep -qF '::error::' <<<"$output"
     [ ! -s "$GITHUB_OUTPUT" ]
+}
+
+@test "a multi-line API error stays on one annotation line" {
+    for gate1_pass in true false; do
+        : >"$GITHUB_OUTPUT"
+        api_403
+        run fallback "$gate1_pass" lodash
+        [ "$(grep -c . <<<"$output")" -eq 1 ]
+        grep -qF 'Learn more at' <<<"$output"
+    done
 }
 
 @test "indirect: a matching scored alert passes with its score" {
