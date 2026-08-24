@@ -467,6 +467,11 @@ jobs:
                   # a `--search "-label:..."` qualifier: search rides an
                   # eventually-consistent index, and a PR labelled for review
                   # minutes before the cron fires must not slip through.
+                  # The comparison is case-insensitive, as every other label
+                  # comparison in the chain is. Actions `contains()`, `gh pr
+                  # edit` and `gh pr list --label` all ignore case, so a
+                  # caller whose `review-label` input differs in case from the
+                  # repository label still gets the PR excluded here.
                   PR_NUMS=$(gh pr list \
                       --repo "$GITHUB_REPOSITORY" \
                       --author "app/dependabot" \
@@ -475,7 +480,8 @@ jobs:
                       --json number,createdAt,labels \
                   | jq -r --argjson age "$AGE_DAYS" --arg review "$REVIEW_LABEL" \
                       '.[]
-                       | select([.labels[].name] | index($review) | not)
+                       | select([.labels[].name | ascii_downcase]
+                                | index($review | ascii_downcase) | not)
                        | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age)
                        | .number')
 

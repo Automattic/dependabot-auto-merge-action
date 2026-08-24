@@ -118,6 +118,34 @@ EOF
     [ "$(log_count '--label auto-merge-pending')" -eq 1 ]
 }
 
+# One old, pending-labelled PR that also carries $1 as its review label.
+review_labelled_pr_fixture() {
+    jq -n --arg review "$1" \
+        '[{number: 201, createdAt: "2020-01-01T00:00:00Z",
+           labels: [{name: "auto-merge-pending"}, {name: $review}]}]' \
+        >"$GH_STUB_DIR/pr_list"
+}
+
+# Every other label comparison in the chain ignores case, so a caller whose
+# `review-label` input differs in case from the repository label must not
+# find the cron merging a PR that was routed to review. Both directions,
+# because either half of the comparison can be the one carrying the casing.
+
+@test "scheduled merge skips a review label whose casing differs on the PR" {
+    merge_env
+    review_labelled_pr_fixture SIRT-Review-Required
+    run_step "$MERGE_STEP"
+    [ "$(log_count 'pr merge')" -eq 0 ]
+}
+
+@test "scheduled merge skips a review label whose casing differs in the input" {
+    merge_env
+    export REVIEW_LABEL=SIRT-Review-Required
+    review_labelled_pr_fixture sirt-review-required
+    run_step "$MERGE_STEP"
+    [ "$(log_count 'pr merge')" -eq 0 ]
+}
+
 @test "a merge failure still fails the step" {
     merge_env
     mixed_pr_list_fixture

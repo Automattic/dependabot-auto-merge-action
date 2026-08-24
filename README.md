@@ -242,7 +242,7 @@ Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
-Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set.
+Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set. That exclusion ignores case, matching how Actions, `gh pr edit` and `gh pr list --label` compare labels, so a `review-label` input whose casing differs from the repository label still excludes the PR.
 
 ## Security notes
 
