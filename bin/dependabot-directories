@@ -1,0 +1,29 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Automattic\DependabotDirectories\Console\Application;
+
+$autoloaders = [
+    // Running from a checkout.
+    __DIR__.'/../vendor/autoload.php',
+    // Installed as a dependency of another project.
+    __DIR__.'/../../../autoload.php',
+];
+
+$loaded = false;
+foreach ($autoloaders as $autoloader) {
+    if (is_file($autoloader)) {
+        require $autoloader;
+        $loaded = true;
+        break;
+    }
+}
+
+if (!$loaded) {
+    fwrite(STDERR, "error: dependencies are not installed — run 'composer install' from the checkout\n");
+    exit(2);
+}
+
+exit(Application::execute(array_slice($argv, 1), STDOUT, STDERR));

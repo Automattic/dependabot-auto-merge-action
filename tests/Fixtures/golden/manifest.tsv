@@ -1,0 +1,14 @@
+# Golden transcripts of scripts/dependabot-directories.sh, captured before the rewrite.
+# Each row: transcript file, exit code, arguments after "acme/widgets".
+# Output is stdout and stderr merged, exactly as a terminal shows it.
+detect-root-npm.txt	0	--paths-from-file tests/Fixtures/trees/root-npm.paths --detect-only
+detect-yarn-workspaces.txt	0	--paths-from-file tests/Fixtures/trees/yarn-workspaces.paths --detect-only
+detect-pnpm.txt	0	--paths-from-file tests/Fixtures/trees/pnpm.paths --detect-only
+detect-mixed-monorepo.txt	0	--paths-from-file tests/Fixtures/trees/mixed-monorepo.paths --detect-only
+detect-composer-siblings-lockless.txt	0	--paths-from-file tests/Fixtures/trees/composer-siblings-lockless.paths --detect-only
+detect-top-level-siblings.txt	0	--paths-from-file tests/Fixtures/trees/top-level-siblings.paths --detect-only
+detect-excluded.txt	0	--paths-from-file tests/Fixtures/trees/excluded.paths --detect-only
+detect-deferred-ecosystems.txt	0	--paths-from-file tests/Fixtures/trees/deferred-ecosystems.paths --detect-only
+merge-composer-siblings-partial-commented.txt	0	--paths-from-file tests/Fixtures/trees/composer-siblings.paths --existing-config tests/Fixtures/dependabot/partial-commented.yml --dry-run
+merge-composer-single-four-space-indent.txt	0	--paths-from-file tests/Fixtures/trees/composer-single.paths --existing-config tests/Fixtures/dependabot/four-space-indent.yml --dry-run
+merge-composer-single-empty-updates-version-updates.txt	0	--paths-from-file tests/Fixtures/trees/composer-single.paths --existing-config tests/Fixtures/dependabot/empty-updates.yml --dry-run --enable-version-updates
