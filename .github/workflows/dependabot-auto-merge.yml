@@ -252,10 +252,15 @@ jobs:
             # dependencies (fetch-metadata cannot embed advisory data for
             # them) and for direct dependencies whose advisory arrived with an
             # unusable CVSS — the API may hold a real score for the same
-            # advisory. The two paths fail differently: for indirect deps the
-            # API is the only advisory source, so an API error fails the job;
-            # for direct deps it is a best-effort enrichment, so an error (a
-            # 403 when org policy strips security-events from GITHUB_TOKEN,
+            # advisory. On the direct-dep path the match is narrowed to that
+            # advisory as well. A package can carry several open alerts, and a
+            # score borrowed from a vulnerability this PR does not fix would
+            # pass Gate 2 on the wrong evidence.
+            #
+            # The two paths also fail differently. For indirect deps the API
+            # is the only advisory source, so an API error fails the job. For
+            # direct deps it is a best-effort enrichment, so an error (a 403
+            # when org policy strips security-events from GITHUB_TOKEN,
             # typically) degrades to "no better score available" and the
             # resolver fails closed to review routing, as it did before this
             # call existed.
@@ -270,12 +275,21 @@ jobs:
               run: |
                   PKGS="$DEPENDENCY_NAMES"
 
+                  # $ghsa is empty for indirect deps — fetch-metadata knows
+                  # no advisory for them, so any open alert on the package is
+                  # the only evidence there is and the filter stays open. For
+                  # direct deps it pins the match to the advisory the PR fixes,
+                  # leaving `sort_by` to pick the best-scored record of that
+                  # one advisory across manifests.
+                  #
                   # Split API call and jq into separate stages so each failure
                   # mode surfaces as a named warning rather than a silent exit-1.
                   if API_RESPONSE=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/dependabot/alerts?state=open&per_page=100" 2>&1); then
                       RESULT=$(echo "$API_RESPONSE" | jq \
                           --arg pkgs "$PKGS" \
+                          --arg ghsa "$GHSA_ID" \
                           '[.[][] | select(.security_advisory.ghsa_id != null)
+                           | select($ghsa == "" or .security_advisory.ghsa_id == $ghsa)
                            | select(.dependency.package.name as $n |
                                ($pkgs | split(", ") | index($n)) != null)]
                            | sort_by(-(.security_advisory.cvss.score // 0)) | first
@@ -314,6 +328,7 @@ jobs:
                   fi
               env:
                   DEPENDENCY_NAMES: ${{ steps.meta.outputs.dependency-names }}
+                  GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
                   GATE1_PASS: ${{ steps.gate1.outputs.pass }}
                   GH_TOKEN: ${{ secrets.token || github.token }}
 
