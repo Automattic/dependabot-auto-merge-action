@@ -61,7 +61,8 @@ run_step() {
     # separate calls widen the window in which a failure on the second leaves
     # the PR in the both-labels state.
     [ "$(log_count 'pr edit')" -eq 1 ]
-    [ "$(log_count "pr edit $PR_URL --add-label sirt-review-required --remove-label auto-merge-pending")" -eq 1 ]
+    log_has_call 'pr edit' "$PR_URL" \
+        '--add-label sirt-review-required' '--remove-label auto-merge-pending'
     [ "$(log_count 'pr comment')" -eq 1 ]
 }
 
@@ -75,7 +76,7 @@ run_step() {
     # even when the label never lands.
     [ "$status" -eq 1 ]
     [ "$(log_count 'pr comment')" -eq 1 ]
-    [ "$(log_count 'routed to the security-review path')" -eq 1 ]
+    log_has_call 'pr comment' 'routed to the security-review path' 'cc @security'
 }
 
 # --- review -> pass -------------------------------------------------------
@@ -84,7 +85,8 @@ run_step() {
     REVIEW_LABEL=sirt-review-required PENDING_LABEL=auto-merge-pending \
         run_step "$PENDING_STEP"
     [ "$(log_count 'pr edit')" -eq 1 ]
-    [ "$(log_count "pr edit $PR_URL --add-label auto-merge-pending --remove-label sirt-review-required")" -eq 1 ]
+    log_has_call 'pr edit' "$PR_URL" \
+        '--add-label auto-merge-pending' '--remove-label sirt-review-required'
 }
 
 # --- custom label names ---------------------------------------------------
@@ -92,7 +94,8 @@ run_step() {
 @test "custom label names pass through to the edit" {
     REVIEW_LABEL=needs-security-review PENDING_LABEL=dependabot-approved \
         run_step "$PENDING_STEP"
-    [ "$(log_count '--add-label dependabot-approved --remove-label needs-security-review')" -eq 1 ]
+    log_has_call 'pr edit' '--add-label dependabot-approved' \
+        '--remove-label needs-security-review'
 }
 
 # --- scheduled merge ------------------------------------------------------

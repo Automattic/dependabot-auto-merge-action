@@ -32,3 +32,15 @@ extract_run() {
 log_count() {
     grep -cF -- "$1" "$GH_STUB_LOG" || true
 }
+
+# Succeed if one logged gh call contains every fixed string in $@. Each
+# needle is matched independently, so an assertion stays true when flags are
+# reordered in the YAML, which changes nothing about what the call does.
+log_has_call() {
+    local lines needle
+    lines=$(cat "$GH_STUB_LOG")
+    for needle in "$@"; do
+        lines=$(grep -F -- "$needle" <<<"$lines") || return 1
+    done
+    [ -n "$lines" ]
+}
