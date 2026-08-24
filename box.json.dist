@@ -1,0 +1,16 @@
+{
+    "banner": "dependabot-directories — map dependency manifests and lockfiles into .github/dependabot.yml.\nSee https://github.com/Automattic/dependabot-auto-merge-action",
+    "compression": "GZ",
+    "directories": ["src"],
+    "finder": [
+        {
+            "name": "*.php",
+            "exclude": ["tests", "Tests", "test", "docs"],
+            "in": "vendor"
+        },
+        {
+            "name": "*.json",
+            "in": "vendor/composer"
+        }
+    ]
+}

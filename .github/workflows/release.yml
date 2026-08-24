@@ -1,0 +1,55 @@
+name: Release
+
+# The tool ships as a PHAR attached to the release, so an operator needs php
+# and gh and nothing else — no Composer step, and nothing compiled in the
+# repository. Built here rather than committed for the same reason.
+on:
+    push:
+        tags:
+            - 'v*'
+
+permissions:
+    contents: write
+
+jobs:
+    phar:
+        name: Build and attach the PHAR
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+            - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
+              with:
+                  # The floor from composer.json. Building on the oldest
+                  # supported runtime keeps the PHAR runnable on it.
+                  php-version: '8.2'
+                  extensions: json, mbstring, phar
+                  coverage: none
+                  ini-values: phar.readonly=0
+            - name: Install dependencies
+              run: composer install --no-interaction --no-progress --prefer-dist
+
+            - name: Build the PHAR
+              run: vendor/bin/box compile
+
+            - name: Check the PHAR reproduces a golden transcript
+              # Never attach an artefact that has not been run.
+              run: |
+                  ./bin/dependabot-directories.phar acme/widgets \
+                      --paths-from-file tests/Fixtures/trees/mixed-monorepo.paths \
+                      --detect-only \
+                      | diff - tests/Fixtures/golden/detect-mixed-monorepo.txt
+              shell: bash
+
+            - name: Checksum
+              run: sha256sum bin/dependabot-directories.phar > bin/dependabot-directories.phar.sha256
+              shell: bash
+
+            - name: Attach to the release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh release upload "${GITHUB_REF_NAME}" \
+                      bin/dependabot-directories.phar \
+                      bin/dependabot-directories.phar.sha256 \
+                      --clobber
+              shell: bash
