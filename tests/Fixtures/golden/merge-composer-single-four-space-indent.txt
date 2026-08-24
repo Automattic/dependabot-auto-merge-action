@@ -21,4 +21,5 @@ Detected mappings:
 +      cooldown:
 +        default-days: 7
 
-Summary: 0 ok, 1 would change, 1 notes, 0 failed
+
+Summary: 0 ok, 0 would change, 1 notes, 0 failed

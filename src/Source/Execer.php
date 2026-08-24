@@ -27,4 +27,13 @@ interface Execer
      * @param list<string> $argv
      */
     public function combined(array $argv): ExecResult;
+
+    /**
+     * Feed stdin to a command and return stderr alone, discarding stdout —
+     * the `2>&1 >/dev/null` shape the mutation funnel captures its error
+     * bodies with.
+     *
+     * @param list<string> $argv
+     */
+    public function runInput(array $argv, string $stdin): ExecResult;
 }

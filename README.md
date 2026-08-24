@@ -88,7 +88,61 @@ Preflight only confirms a token can view repo settings. It can't confirm Adminis
 
 If you use custom label names (see the inputs below), create those labels manually instead — the script only manages the default set. The manual equivalents of each step follow.
 
-### 3. Create the required labels (manual alternative)
+### 3. Map Dependabot to your lockfiles
+
+Dependabot only updates a lockfile it has been pointed at. Where a lockfile is not at the default path — npm/yarn/pnpm workspaces, composer monorepos, anything outside the repository root — `.github/dependabot.yml` needs an explicit `directory` mapping. Without one the repo passes every check above, and then its security PRs ship without the lockfile update, CI stays red, and auto-merge never fires.
+
+`dependabot-directories` works out where the manifests and lockfiles actually are and proposes the mapping as a pull request. The default branch is never written to directly. It needs `php` (8.2 or newer) and `gh`.
+
+Run it from a checkout of this repo:
+
+```bash
+composer install
+php bin/dependabot-directories owner/repo --dry-run
+php bin/dependabot-directories owner/repo
+```
+
+From the next tagged release onward it is also attached to the [release](https://github.com/Automattic/dependabot-auto-merge-action/releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
+
+```bash
+gh release download v1.6 --pattern 'dependabot-directories.phar*'
+shasum -a 256 -c dependabot-directories.phar.sha256
+chmod +x dependabot-directories.phar
+./dependabot-directories.phar owner/repo --dry-run
+```
+
+v1.5 predates the tool and carries no such asset.
+
+Start with `--dry-run`: it prints the detected mappings, a unified diff of the proposed `.github/dependabot.yml`, and every call a real run would make — without making any of them. `--detect-only` is shorter still, stopping after the report.
+
+Detection is remote. It reads the file list from the git trees API plus a handful of file contents for workspace declarations, falling back to a blobless shallow clone on the repositories big enough to truncate that API.
+
+| Option | Effect |
+|--------|--------|
+| `--dry-run` | Report and diff, write nothing |
+| `--detect-only` | Report the mappings and stop |
+| `--include <dir>` | Treat a soft-excluded directory name (`examples`, `dist`, `fixtures`, …) as real. Repeatable |
+| `--enable-version-updates` | Emit the full house template instead of the security-only default |
+| `--allow-full-clone` | Permit a full clone when the server refuses a blobless one |
+| `--force` | Proceed past the sanity cap of 50 mappings |
+
+Generated entries carry `open-pull-requests-limit: 0` by default. That gives Dependabot's **security** updates the directory mapping they need while raising no scheduled version-update PRs — the mapping is the point, the noise is not. `--enable-version-updates` opts in to the full template.
+
+The tool only ever appends. Existing update blocks are never modified or removed, the file's own indentation and comments are preserved, and an entry that already covers a detected directory (including via a `directories:` glob) is left alone. Re-running a mapped repo reports `already covers every detected directory` and writes nothing.
+
+A fine-grained PAT scoped to the repo needs:
+
+| Permission | Level | Used for |
+|------------|-------|----------|
+| Contents | Read & write | File list, file contents, creating the branch and commit |
+| Pull requests | Read & write | Opening and updating the pull request |
+| Metadata | Read | Implied by the above |
+
+`--dry-run` needs only the read halves.
+
+See [docs/directory-mapping.md](docs/directory-mapping.md) for the detection rules, the workspace algorithm, and what the tool deliberately refuses to touch.
+
+### 4. Create the required labels (manual alternative)
 
 The workflow needs three labels to exist in your repo. Create them once:
 
@@ -98,7 +152,7 @@ gh label create "auto-merge-pending"  --color "e4e669" --description "Passed all
 gh label create "sirt-review-required" --color "d93f0b" --description "Requires human security review"
 ```
 
-### 4. Enable auto-merge on the repo (manual alternative)
+### 5. Enable auto-merge on the repo (manual alternative)
 
 Auto-merge must be allowed in your repo settings:
 
@@ -106,7 +160,7 @@ Auto-merge must be allowed in your repo settings:
 
 The workflow's preflight job verifies this at runtime and fails with an error pointing back here if it's disabled.
 
-### 5. Branch protection (manual alternative)
+### 6. Branch protection (manual alternative)
 
 Your default branch needs a branch protection rule (or ruleset) with at least one required status check. Without it, GitHub won't queue an auto-merge.
 

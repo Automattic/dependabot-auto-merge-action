@@ -59,12 +59,35 @@ final class Reporter
     }
 
     /**
-     * Mark a change this run would make.
+     * Mark a change this run would make, but did not.
+     *
+     * Counts toward the tally: under --dry-run the summary is the count of
+     * writes a real run would issue.
      */
     public function would(string $message): void
     {
         fwrite($this->out, "→  {$message}\n");
         ++$this->changedCount;
+    }
+
+    /**
+     * Mark a mutation this run made.
+     */
+    public function changed(string $message): void
+    {
+        fwrite($this->out, "+  {$message}\n");
+        ++$this->changedCount;
+    }
+
+    /**
+     * Print what the run intends to map.
+     *
+     * Part of the report, not a mutation. Counting these made a second run
+     * that wrote nothing still say "2 changed".
+     */
+    public function planned(string $message): void
+    {
+        fwrite($this->out, "→  {$message}\n");
     }
 
     /**
@@ -136,16 +159,18 @@ final class Reporter
     /**
      * Print the closing tally.
      *
-     * The blank line usually seen above it belongs to the call sites: the
-     * detect-only path prints none, because the mappings block just ended
-     * with one.
+     * $label names the middle counter — "would change" for the read-only
+     * paths, "changed" for a run that wrote. The blank line usually seen
+     * above it belongs to the call sites: the detect-only path prints none,
+     * because the mappings block just ended with one.
      */
-    public function summary(): void
+    public function summary(string $label): void
     {
         fwrite($this->out, sprintf(
-            "Summary: %d ok, %d would change, %d notes, %d failed\n",
+            "Summary: %d ok, %d %s, %d notes, %d failed\n",
             $this->okCount,
             $this->changedCount,
+            $label,
             $this->noteCount,
             $this->failCount,
         ));

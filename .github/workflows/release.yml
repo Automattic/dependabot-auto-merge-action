@@ -47,7 +47,14 @@ jobs:
             - name: Attach to the release
               env:
                   GH_TOKEN: ${{ github.token }}
+              # A tag can be pushed before its release exists, and
+              # `gh release upload` fails against a release that is not there.
+              # Create it first when needed, so pushing a tag is the whole
+              # release ritual.
               run: |
+                  if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+                      gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag
+                  fi
                   gh release upload "${GITHUB_REF_NAME}" \
                       bin/dependabot-directories.phar \
                       bin/dependabot-directories.phar.sha256 \

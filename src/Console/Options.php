@@ -20,6 +20,7 @@ final readonly class Options
         public bool $detectOnly = false,
         public bool $enableVersionUpdates = false,
         public bool $force = false,
+        public bool $allowFullClone = false,
         public array $include = [],
         public ?string $pathsFromFile = null,
         public ?string $existingConfigFile = null,

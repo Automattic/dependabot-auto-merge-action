@@ -134,7 +134,7 @@ Synthetic path lists under `tests/Fixtures/trees/`, driven through Pest via the 
 
 ### Sandbox repos
 
-Six purpose-built repos, per jamel.reid's review. Offline fixtures prove the logic; these prove GitHub's APIs and Dependabot's own behaviour.
+Seven purpose-built repos, per jamel.reid's review. Offline fixtures prove the logic; these prove GitHub's APIs and Dependabot's own behaviour.
 
 | Repo | Layout | Exercises |
 |---|---|---|
@@ -142,8 +142,24 @@ Six purpose-built repos, per jamel.reid's review. Offline fixtures prove the log
 | `qao641-fixture-yarn-ws` | yarn workspaces, one shadowed lock | no per-package spam, WARN fires |
 | `qao641-fixture-pnpm-composer` | pnpm root + `projects/plugins/{a,b,c}` | **Dependabot actually resolving `/projects/plugins/*`** — the one thing offline fixtures cannot prove |
 | `qao641-fixture-glob-guard` | as above + a lockless fourth sibling | Guard 2 against a real tree |
+| `qao641-fixture-npm-glob` | `projects/plugins/{a,b,c}`, no workspace root | the same glob for npm, and a second ecosystem for the live run |
 | `qao641-fixture-existing-config` | hand-written commented config, partial coverage, 4-space indent | append-only merge preserves comments in a real PR diff |
 | `qao641-fixture-rerun` | run twice | second run all `OK`, zero mutations |
+
+### Live Dependabot run
+
+The six original fixtures prove our code. They prove nothing about Dependabot, which is the half that matters — so three of them were given a genuinely vulnerable dependency in each mapped directory (`guzzlehttp/psr7 1.8.2`, `lodash 4.17.19`, real resolved lockfiles), the mapping PR was merged, and alerts were switched on.
+
+| Fixture | On `main` | Dependabot's response |
+|---|---|---|
+| `qao641-fixture-npm-glob` | `directories: ["/projects/plugins/*"]` | PR in `/projects/plugins/b`, then `/a` once that merged — each changing `package.json` **and** `package-lock.json` |
+| `qao641-fixture-pnpm-composer` | same glob, composer | PR in `/projects/plugins/c`, changing `composer.json` **and** `composer.lock` |
+| `qao641-fixture-glob-guard` | three singular entries, `a` `b` `c` | PR in `/projects/plugins/c`; nothing against `d` |
+
+- **The glob resolves, and the lockfile comes with it.** Dependabot expands `directories: ["/projects/plugins/*"]` and raises the security PR *inside* the mapped subdirectory with the lockfile updated. Until this run that was an assumption, and it is the assumption the whole ticket rests on.
+- **`open-pull-requests-limit: 0` does not suppress security updates** (Q5). Version-update noise off, security PRs unaffected.
+- **Guard 2 held against a real tree, twice.** `glob-guard`'s fourth plugin carries a manifest and no lockfile, so the script declined the glob and wrote three singular entries — and Dependabot then opened nothing against `d`. A leaking guard would have re-admitted exactly the directory the exclusion warned about.
+- **Dependabot paces one security PR per repo at a time.** Three directories, three alerts, one PR; merging it produced the next. Nothing to fix, but a monorepo with thirty mapped directories drains serially rather than in one flood, which the seven-day age gate suits.
 
 ### Dry-run matrix
 
@@ -158,11 +174,19 @@ All read-only, against real repos; expected vs actual pasted into the script PR.
 
 ### Field notes from the first matrix run
 
-Three things the real repos taught us that the draft did not anticipate:
+Three things the dry-run matrix taught us that the draft did not anticipate:
 
 - **jetpack and wp-calypso came out as designed.** jetpack yields `composer: /projects/plugins/*` (the glob rule doing exactly what §5 predicts) plus `composer: /`, `npm: /` and `github-actions: /`. wp-calypso yields `npm: /`, `composer: /` and `github-actions: /`. Neither tree truncated, so the clone fallback stayed unexercised.
 - **Per-directory findings have to be aggregated.** A jetpack run produced 270 individual "manifest without lockfile" lines. A wall of text that long reports nothing, so findings of that kind now print as a count plus the first five paths and an "… and N more" tail. Reported, never silent, and still readable.
 - **"Cannot parse" and "declares nothing" are different facts.** WooCommerce's `pnpm-workspace.yaml` declares `packages:` on line 72, and every YAML parser rejects the file over a tab character on line 4. Reporting that as "declares no `packages:`" sends the reader hunting for a key that is right there.
+
+### Field note from the live run: a stub lockfile silences the whole repo
+
+`qao641-fixture-pnpm-composer` raised no alerts for forty minutes while `qao641-fixture-glob-guard` — same dependency, same composer files, alerts enabled in the same minute — had twenty-four inside sixty seconds. The dependency graph on the silent repo was correct: the SBOM listed `guzzlehttp/psr7 1.8.2`.
+
+The only difference was a two-line stub `pnpm-lock.yaml` at the root, left over from hand-building the fixture, of a shape no real `pnpm install` emits. A control repo (`qao641-canary-stub-lockfile`) reproduced it exactly — a valid vulnerable composer directory under that stub, zero alerts for sixteen minutes — and replacing the stub with a real resolution, changing nothing else, produced six alerts within two minutes.
+
+So an implausible lockfile anywhere in the tree can suppress Dependabot alerting for directories that are themselves perfectly valid, while every surface we would normally check looks healthy. This script cannot detect it — parsing lockfile *contents* is well outside its remit — but it is worth knowing during the rollout, because it presents as "Dependabot is enabled and quiet", which is indistinguishable from "nothing to report".
 
 WooCommerce also exposes the limits of the exclusion list as approved. It maps `/packages/php/email-editor/vendor-prefixed` and `/plugins/woocommerce/bin/composer/*` — vendored and tooling directories that hold a real `composer.json` and `composer.lock` but should never receive PRs. `--include` only re-admits soft-excluded names; there is no way to exclude a path the list does not already name. Worth settling before the write path lands: either extend the soft-exclude list (`vendor-prefixed` is the obvious first entry) or add an `--exclude <dir>` counterpart.
 
@@ -187,7 +211,7 @@ jamel.reid signed off on §2, §4 and every default above, and asked for the san
 
 The tool is PHP (originally bash, then Go; rewritten twice for reviewability after review on the detection PR, and PHP is where it landed because it is the language the fleet's maintainers actually read). The constraints worth writing down:
 
-- **Toolchain floor lives in `composer.json`** (php ^8.2, tested on 8.2 and 8.4); operators need `php` and `gh`, nothing else, because the tool ships as a PHAR and there is no Composer step to run it. Dependencies are `symfony/console`, `symfony/yaml` and `symfony/process` — no jq, no yq/ruby/PyYAML probing.
+- **Toolchain floor lives in `composer.json`** (php ^8.2, tested on 8.2 and 8.4); operators need `php` and `gh`, plus one `composer install` when running from a checkout. From the next tagged release the PHAR is attached to the release and that step goes away. Dependencies are `symfony/console`, `symfony/yaml` and `symfony/process` — no jq, no yq/ruby/PyYAML probing.
 - **The GitHub API is reached by exec'ing the authenticated `gh` CLI** (argv slices, never a shell), and diffs by exec'ing `diff -u` — the same auth and rendering story the bash script had. The exec seam is also what keeps "`--dry-run` issues no writes" provable for the follow-up write path: a recording fake counts every call.
 - **Sets are arrays, sorted byte-wise through `strcmp`.** That collation equals the `LC_ALL=C` ordering the script forced on `sort` and `comm`, so report ordering is machine-independent by construction. PHP's bare `sort()` is not a substitute: it defaults to `SORT_REGULAR` and would order `['10', '9']` numerically. Workspace globs are still translated to anchored regular expressions — there is no working tree to glob against, only a path list — and those patterns carry no `u` modifier, so a path git holds that is not valid UTF-8 cannot turn a match into a silent `false`.
 - **Behaviour is pinned by transcripts.** Golden transcripts captured from the bash script before its deletion live beside the fixtures; every implementation since reproduces them byte for byte. They survived the port to Go and the port from it, which is the point — the transcripts are the contract, not any one implementation.
