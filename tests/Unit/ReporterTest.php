@@ -11,12 +11,12 @@ declare(strict_types=1);
 it('writes each line item with its prefix and counts it', function () {
     [$reporter, $out, $err] = captureReport(function ($r) {
         $r->ok('a');
-        $r->would('b');
+        $r->changed('b');
         $r->note('c');
         $r->detected('d');
     });
 
-    expect($out)->toBe("✓  a\n→  b\n!  c\n   d\n");
+    expect($out)->toBe("✓  a\n+  b\n!  c\n   d\n");
     expect($err)->toBe('');
     expect([$reporter->okCount, $reporter->changedCount, $reporter->noteCount])->toBe([1, 1, 1]);
 });
@@ -77,8 +77,40 @@ it('prints the summary with no leading blank line', function () {
     [, $out] = captureReport(function ($r) {
         $r->ok('a');
         $r->fail('b');
-        $r->summary();
+        $r->summary('would change');
     });
 
     expect($out)->toEndWith("Summary: 1 ok, 0 would change, 0 notes, 1 failed\n");
+});
+
+it('counts a would-change the same as a change', function () {
+    // Under --dry-run the summary is the count of writes a real run would
+    // issue, so the two verbs share a counter.
+    [$reporter, $out] = captureReport(function ($r) {
+        $r->would("branch 'x': create (dry-run)");
+    });
+
+    expect($out)->toBe("→  branch 'x': create (dry-run)\n");
+    expect($reporter->changedCount)->toBe(1);
+});
+
+it('counts a mutation but not a plan line', function () {
+    [$reporter, $out] = captureReport(function ($r) {
+        $r->planned('map composer -> /a');
+        $r->changed("branch 'x': create");
+    });
+
+    expect($out)->toBe("→  map composer -> /a\n+  branch 'x': create\n");
+    // A plan line is not a mutation. Counting it made a second run that
+    // wrote nothing still say "2 changed".
+    expect($reporter->changedCount)->toBe(1);
+});
+
+it('names the middle counter after what the run did', function () {
+    [, $out] = captureReport(function ($r) {
+        $r->changed('did a thing');
+        $r->summary('changed');
+    });
+
+    expect($out)->toEndWith("Summary: 0 ok, 1 changed, 0 notes, 0 failed\n");
 });

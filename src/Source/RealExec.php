@@ -30,6 +30,15 @@ final class RealExec implements Execer
         return new ExecResult($process->getOutput(), $process->getExitCode() ?? 1);
     }
 
+    public function runInput(array $argv, string $stdin): ExecResult
+    {
+        $process = new Process($argv, timeout: self::TIMEOUT);
+        $process->setInput($stdin);
+        $process->run();
+
+        return new ExecResult($process->getErrorOutput(), $process->getExitCode() ?? 1);
+    }
+
     public function combined(array $argv): ExecResult
     {
         $process = new Process($argv, timeout: self::TIMEOUT);
