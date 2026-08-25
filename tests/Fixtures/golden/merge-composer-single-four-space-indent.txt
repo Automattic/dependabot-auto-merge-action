@@ -1,0 +1,24 @@
+Scanning acme/widgets
+
+Detected mappings:
+   composer: /
+
+!  existing entry (composer, /somewhere/else) matches nothing we detected — left alone
+→  map composer -> /
+
+--- a/.github/dependabot.yml
++++ b/.github/dependabot.yml
+@@ -4,3 +4,11 @@
+       directory: "/somewhere/else"
+       schedule:
+           interval: "weekly"
++    - package-ecosystem: "composer"
++      directory: "/"
++      schedule:
++        interval: "weekly"
++        day: "monday"
++      open-pull-requests-limit: 0
++      cooldown:
++        default-days: 7
+
+Summary: 0 ok, 1 would change, 1 notes, 0 failed

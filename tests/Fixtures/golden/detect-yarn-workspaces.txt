@@ -1,0 +1,10 @@
+Scanning acme/widgets
+
+!  1 directory with a lockfile shadowed by the workspace covering them — hoisted installs ignore those, so no entry was emitted:
+     /packages/b
+!  1 directory with a package.json but no lockfile and no workspace covering them — no entry was emitted:
+     /tools/helper
+Detected mappings:
+   npm: /
+
+Summary: 0 ok, 0 would change, 2 notes, 0 failed

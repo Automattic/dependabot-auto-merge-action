@@ -1,0 +1,13 @@
+parameters:
+    level: max
+    paths:
+        - src
+        - bin
+    tmpDir: .phpstan.cache
+    treatPhpDocTypesAsCertain: false
+
+# tests/ is deliberately outside the analysed paths. Pest's expect() chain and
+# its expect()->extend() closures are dynamically typed by design — $this inside
+# a custom expectation has no static type — so analysing them at level max
+# reports the framework's idiom rather than defects in this code. The suite
+# itself is what checks the tests.
