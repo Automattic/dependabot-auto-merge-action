@@ -39,7 +39,7 @@ jobs:
               # -exec {} + propagates shellcheck's exit status.
               run: |
                   find scripts -type f -name '*.sh' -exec shellcheck --severity=warning {} +
-                  shellcheck --severity=warning tests/stubs/gh
+                  shellcheck --severity=warning tests/stubs/gh tests/*.bash
               shell: bash
 
     bats:

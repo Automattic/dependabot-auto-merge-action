@@ -373,8 +373,11 @@ jobs:
                   SCORE: ${{ steps.meta.outputs.compatibility-score }}
                   THRESHOLD: ${{ inputs.compatibility-threshold }}
 
-            # Metadata unavailable or gates 2/3 failed — label for human review.
+            # Metadata unavailable or gates 2/3 failed — label for human
+            # review. The review and pending labels are mutually exclusive
+            # states, so taking one always sheds the other.
             - name: Label — ${{ inputs.review-label }}
+              id: label-review
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true') &&
@@ -399,8 +402,18 @@ jobs:
                   if [ -n "$REVIEW_TEAM" ]; then
                       TEAM_MENTION=" cc @$REVIEW_TEAM"
                   fi
-                  gh pr edit "$PR_URL" --add-label "$REVIEW_LABEL"
+                  # Comment before labelling. Under `bash -e` a failed edit
+                  # aborts the step, and the reviewer notification is the part
+                  # a human still needs when that happens.
                   gh pr comment "$PR_URL" --body "This PR has been routed to the security-review path: $REASON.$TEAM_MENTION"
+                  # One `gh pr edit` rather than two calls, though not one
+                  # atomic call. gh sends the add and the remove as two
+                  # concurrent mutations with no rollback, so a failure on the
+                  # remove half can still leave both labels on. The invariant
+                  # survives that. The cron excludes any PR carrying the review
+                  # label, and the next evaluation to reach a verdict clears
+                  # the both-labels state.
+                  gh pr edit "$PR_URL" --add-label "$REVIEW_LABEL" --remove-label "$PENDING_LABEL"
               env:
                   METADATA_AVAILABLE: ${{ steps.cvss.outputs.available }}
                   GATE2_PASS: ${{ steps.gate2.outputs.pass }}
@@ -411,20 +424,28 @@ jobs:
                   COMPAT_THRESHOLD: ${{ inputs.compatibility-threshold }}
                   REVIEW_TEAM: ${{ inputs.review-team }}
                   REVIEW_LABEL: ${{ inputs.review-label }}
+                  PENDING_LABEL: ${{ inputs.pending-label }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            # All gates cleared — label as pending for the scheduled age-gate check.
+            # All gates cleared — label as pending for the scheduled age-gate
+            # check, shedding any review label from an earlier failing run.
+            # The step also runs when the pending label is already present but
+            # the review label still lingers: skipping there would strand the
+            # exact both-labels state this step exists to clear.
             - name: Label — ${{ inputs.pending-label }} (awaiting age gate)
+              id: label-pending
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
                   steps.gate2.outputs.pass == 'true' &&
                   (steps.gate3.conclusion == 'skipped' || steps.gate3.outputs.pass == 'true') &&
-                  !contains(github.event.pull_request.labels.*.name, inputs.pending-label)
+                  (!contains(github.event.pull_request.labels.*.name, inputs.pending-label) ||
+                   contains(github.event.pull_request.labels.*.name, inputs.review-label))
               run: |
-                  gh pr edit "$PR_URL" --add-label "$PENDING_LABEL"
+                  gh pr edit "$PR_URL" --add-label "$PENDING_LABEL" --remove-label "$REVIEW_LABEL"
               env:
                   PENDING_LABEL: ${{ inputs.pending-label }}
+                  REVIEW_LABEL: ${{ inputs.review-label }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -437,7 +458,9 @@ jobs:
                   PR_URL: ${{ github.event.pull_request.html_url }}
 
     # Runs daily. Finds PRs labelled with the pending label that have cleared
-    # the age gate and enables auto-merge on them.
+    # the age gate and enables auto-merge on them. PRs also carrying the
+    # review label are excluded: a stale pending label from before a PR was
+    # routed to review must never keep it in the merge set.
     scheduled-merge:
         name: Scheduled merge of eligible PRs
         runs-on: ubuntu-latest
@@ -445,18 +468,32 @@ jobs:
         if: inputs.event-name == 'schedule'
         steps:
             - name: Merge PRs past age gate
+              id: scheduled-merge
               run: |
                   # Collect PR numbers first, then iterate in the main shell: a
                   # piped `while read` runs in a subshell, where FAILED would be
                   # lost and every merge failure silently reported as success.
+                  # The review-label exclusion is a jq post-filter rather than
+                  # a `--search "-label:..."` qualifier: search rides an
+                  # eventually-consistent index, and a PR labelled for review
+                  # minutes before the cron fires must not slip through.
+                  # The comparison is case-insensitive, as every other label
+                  # comparison in the chain is. Actions `contains()`, `gh pr
+                  # edit` and `gh pr list --label` all ignore case, so a
+                  # caller whose `review-label` input differs in case from the
+                  # repository label still gets the PR excluded here.
                   PR_NUMS=$(gh pr list \
                       --repo "$GITHUB_REPOSITORY" \
                       --author "app/dependabot" \
                       --label "$PENDING_LABEL" \
                       --state open \
-                      --json number,createdAt \
-                  | jq -r --argjson age "$AGE_DAYS" \
-                      '.[] | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age) | .number')
+                      --json number,createdAt,labels \
+                  | jq -r --argjson age "$AGE_DAYS" --arg review "$REVIEW_LABEL" \
+                      '.[]
+                       | select([.labels[].name | ascii_downcase]
+                                | index($review | ascii_downcase) | not)
+                       | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age)
+                       | .number')
 
                   FAILED=0
                   for PR_NUM in $PR_NUMS; do
@@ -469,6 +506,7 @@ jobs:
                   exit $FAILED
               env:
                   PENDING_LABEL: ${{ inputs.pending-label }}
+                  REVIEW_LABEL: ${{ inputs.review-label }}
                   AGE_DAYS: ${{ inputs.age-days }}
                   MERGE_METHOD: ${{ inputs.merge-method }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
