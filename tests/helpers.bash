@@ -47,3 +47,19 @@ log_has_call() {
     done
     [ -n "$lines" ]
 }
+
+# Print the value a step wrote to $GITHUB_OUTPUT under key $1. Handles both
+# forms Actions accepts: bare `key=value` and the `key<<DELIM` heredoc the
+# cvss step uses for values that might contain a newline.
+out() {
+    awk -v k="$1" '
+        !inblock && index($0, k "<<") == 1 {
+            delim = substr($0, length(k) + 3)
+            inblock = 1
+            next
+        }
+        inblock && $0 == delim { inblock = 0; next }
+        inblock { print; next }
+        !inblock && index($0, k "=") == 1 { print substr($0, length(k) + 2) }
+    ' "$GITHUB_OUTPUT"
+}

@@ -114,7 +114,7 @@ Your default branch needs a branch protection rule (or ruleset) with at least on
 
 Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fully verify ruleset-based required status checks with the default `GITHUB_TOKEN`. Classic branch protection details are only readable by admin tokens, so with classic protection the preflight can confirm the branch is protected but only warns that it cannot verify the checks themselves. If neither is configured, preflight fails with an error pointing back here. (`scripts/bootstrap.sh` creates a ruleset, so bootstrapped repos are fully verifiable by preflight.)
 
-Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**) — the Gate 1 fallback for indirect dependencies queries the Dependabot Alerts API.
+Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**) — the Gate 1 fallback queries the Dependabot Alerts API for indirect dependencies and for unscored advisories on direct ones.
 
 ## Inputs
 
@@ -134,7 +134,7 @@ Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Se
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `token` | No | Token used to call the Dependabot alerts API (Gate 1 fallback for indirect deps). Defaults to `GITHUB_TOKEN`. Pass a PAT or fine-grained token when `GITHUB_TOKEN` lacks `security-events: read` access — common in orgs with restricted default permissions. |
+| `token` | No | Token used to call the Dependabot alerts API (Gate 1 fallback). Defaults to `GITHUB_TOKEN`. Pass a PAT or fine-grained token when `GITHUB_TOKEN` lacks `security-events: read` access — common in orgs with restricted default permissions. |
 
 ## Customisation examples
 
@@ -181,7 +181,12 @@ These are the minimum required. If your repo uses a restrictive default permissi
 
 ### When GITHUB_TOKEN returns 403 on the Dependabot alerts API
 
-Some organisations restrict `GITHUB_TOKEN` so it cannot read security events, even when `security-events: read` is declared. In that case the Gate 1 fallback step will fail with a 403. The fix is to create a PAT (or a fine-grained token with **Security events → Read** on the target repo) and pass it as a secret:
+Some organisations restrict `GITHUB_TOKEN` so it cannot read security events, even when `security-events: read` is declared. What a 403 does then depends on why the API was called:
+
+- **Indirect dependency** — the API is the only advisory source, so the Gate 1 fallback step fails the job.
+- **Direct dependency with an unscored advisory** — the API call is a best-effort attempt to recover a real score, so a 403 only logs a warning and the PR goes to human review, exactly as if the API had never been consulted. The job stays green.
+
+The fix for both is to create a PAT (or a fine-grained token with **Security events → Read** on the target repo) and pass it as a secret:
 
 ```yaml
 jobs:
@@ -205,7 +210,7 @@ Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TO
 
 GitHub sometimes returns `0.0` as the CVSS score for a matched advisory. That is not a severity rating — it means the advisory carries no CVSS v3 vector, usually because it was published recently and has not been scored yet. Branch rewrites can also rematch a PR against a newer, unscored advisory.
 
-The workflow treats as missing metadata every zero-like score — empty, `0`, `0.0`, `00`, `.00` — every value it cannot parse as a number, and anything above `10`. All of them fail closed: the PR gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one. This behaviour ships from v1.5; callers pinned at the v1.4 SHA or earlier still see an unscored advisory described as below-threshold.
+The workflow treats as missing metadata every zero-like score — empty, `0`, `0.0`, `00`, `.00` — every value it cannot parse as a number, and anything above `10`. From v1.6 it first tries to recover a real score: an unscored advisory on a direct dependency sends the PR through the Dependabot alerts API, which often holds a score for the same advisory before it reaches PR metadata. Only that advisory counts, never another open alert on the same package. Only when that finds nothing better — no open alert for the advisory, or the call failed (a 403 from a restricted `GITHUB_TOKEN`, typically; expect one warning annotation per such PR) — does the PR fail closed: it gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one. Failing closed ships from v1.5 (v1.4 and earlier described an unscored advisory as below-threshold); the recovery attempt ships from v1.6.
 
 What to do: check the advisory yourself. If it is a real high-severity fix, apply the `fast-track-label` to merge it; the workflow records who did so in an audit comment. Nothing re-evaluates a PR when an advisory is scored later — the gates only re-run on a new PR event, so a stalled PR needs either the fast-track label or a push.
 
@@ -234,8 +239,8 @@ A red preflight is intentional: it surfaces a repo where auto-merge could never 
 Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
 
 1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately, post a one-time audit comment (label applier, UTC timestamp, workflow-run link), and exit. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it.
-2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID. If missing (indirect dep), fall back to the Dependabot Alerts API and match open security alerts against the updated packages.
-3. **Resolve the effective CVSS** — take the score from whichever of the two Gate 1 paths ran. A score that is empty, non-numeric, numerically zero (`0`, `0.0`, `00`, `.00`), or above `10` is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`, and the comment names the score GitHub reported.
+2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID and CVSS. The Dependabot Alerts API is consulted as a fallback in two cases: the GHSA ID is missing (indirect dep — fetch-metadata cannot embed advisory data for those), or it is present but the CVSS is unusable (unscored advisory — the API may hold a real score for it). Open security alerts are matched against the updated packages, and on the direct-dep path against the GHSA ID the PR fixes as well, so a package with several open alerts cannot lend a score from a vulnerability this PR leaves in place.
+3. **Resolve the effective CVSS** — prefer the fetch-metadata score, then the alerts-API score. A score that is empty, non-numeric, numerically zero (`0`, `0.0`, `00`, `.00`), or above `10` is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`, and the comment names the score GitHub reported.
 4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
 5. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
 6. Apply `review-label` and remove `pending-label` if any gate fails; apply `pending-label` and remove `review-label` if all pass. The two labels are mutually exclusive states — a re-evaluated PR always ends up with exactly one.
@@ -249,4 +254,4 @@ Runs on the cron you define in the caller, after preflight passes. Finds open PR
 - The workflow only acts on PRs authored by `app/dependabot`.
 - The fast-track path leaves an audit comment on the PR, so gate bypasses are attributable after the fact.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
-- `security-events: read` is required to call the Dependabot Alerts API for indirect dependency lookups.
+- `security-events: read` is required to call the Dependabot Alerts API — for indirect dependency lookups, and to recover a real score for unscored advisories on direct ones.
