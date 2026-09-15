@@ -4,7 +4,7 @@ on:
     workflow_call:
         secrets:
             token:
-                description: 'Token with security-events: read for the Dependabot alerts API. Pass a PAT or fine-grained token when GITHUB_TOKEN lacks access (e.g. in orgs with restricted default permissions). Defaults to GITHUB_TOKEN.'
+                description: 'Token that can read Dependabot alerts, used by the fetch-metadata alert lookup (which also lists the PR commits) and the Gate 1 fallback. Pass a PAT or fine-grained token with Dependabot alerts read and Pull requests read when GITHUB_TOKEN lacks access. Defaults to GITHUB_TOKEN.'
                 required: false
         inputs:
             event-name:
@@ -175,6 +175,16 @@ jobs:
         steps:
             - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
               id: meta
+              # Both lookups are opt-in. Without them ghsa-id and cvss stay
+              # empty and every compatibility score reads 0, so Gate 1 never
+              # sees an advisory and Gate 3 never sees a score. The alert
+              # lookup reads Dependabot alerts, so it takes the same token as
+              # the fallback. fetch-metadata fails the step when that token
+              # cannot read them.
+              with:
+                  alert-lookup: true
+                  compat-lookup: true
+                  github-token: ${{ secrets.token || github.token }}
 
             # The fast-track label bypasses every gate, but applying a label
             # only takes triage, while enabling auto-merge takes write. So the
@@ -307,8 +317,11 @@ jobs:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             # Gate 1: must be a security advisory, not a routine version bump.
-            # fetch-metadata only embeds ghsa-id for direct-dependency security
-            # update PRs, so indirect deps always come through empty here.
+            # fetch-metadata's alert lookup matches the first updated
+            # dependency's previous version to an alert on its manifest. That
+            # can succeed for a direct or an indirect dependency, and fail for
+            # either, so an empty ghsa-id says nothing about which one this PR
+            # updates. Gate 3 reads dependency-type for that instead.
             # The score is classified here as well: a zero-like or unparseable
             # CVSS means GitHub sent no real severity, and `cvss-usable=false`
             # tells the fallback to try the alerts API for a real one.
@@ -347,22 +360,22 @@ jobs:
                   CVSS: ${{ steps.meta.outputs.cvss }}
 
             # Gate 1 fallback: query the Dependabot alerts API and match open
-            # alerts against the packages being updated. Runs for indirect
-            # dependencies (fetch-metadata cannot embed advisory data for
-            # them) and for direct dependencies whose advisory arrived with an
-            # unusable CVSS — the API may hold a real score for the same
-            # advisory. On the direct-dep path the match is narrowed to that
-            # advisory as well. A package can carry several open alerts, and a
-            # score borrowed from a vulnerability this PR does not fix would
-            # pass Gate 2 on the wrong evidence.
+            # alerts against the dependencies being updated. Runs when PR
+            # metadata named no advisory (the lookup only examines the first
+            # dependency, and only by its previous version), and when it
+            # named one with an unusable CVSS, since the API may hold a real
+            # score for the same advisory. On that second path the match is
+            # narrowed to that advisory as well. A package can carry several
+            # open alerts, and a score borrowed from a vulnerability this PR
+            # does not fix would pass Gate 2 on the wrong evidence.
             #
-            # The two paths also fail differently. For indirect deps the API
-            # is the only advisory source, so an API error fails the job. For
-            # direct deps it is a best-effort enrichment, so an error (a 403
-            # when org policy strips security-events from GITHUB_TOKEN,
-            # typically) degrades to "no better score available" and the
-            # resolver fails closed to review routing, as it did before this
-            # call existed.
+            # The two paths also fail differently. With no advisory named, the
+            # API is the only advisory source, so an API error fails the job.
+            # With one named it is a best-effort enrichment, so an error
+            # (a transient failure, typically, since the metadata lookup
+            # already read alerts with the same token) degrades to "no better
+            # score available" and the resolver fails closed to review
+            # routing, as it did before this call existed.
             - name: Gate 1 fallback — Dependabot alerts API
               id: gate1-fallback
               if: |
@@ -372,30 +385,100 @@ jobs:
               # suite can drive the extracted script with exactly these flags.
               shell: bash
               run: |
-                  PKGS="$DEPENDENCY_NAMES"
-
-                  # $ghsa is empty for indirect deps — fetch-metadata knows
-                  # no advisory for them, so any open alert on the package is
-                  # the only evidence there is and the filter stays open. For
-                  # direct deps it pins the match to the advisory the PR fixes,
-                  # leaving `sort_by` to pick the best-scored record of that
-                  # one advisory across manifests.
+                  # An alert applies to this PR only when it agrees with one
+                  # updated dependency on all four of package name, ecosystem,
+                  # manifest directory and fixed version. A name alone let an
+                  # alert qualify for a same-named package in another
+                  # ecosystem, for a manifest the PR does not touch, or for a
+                  # vulnerability the new version leaves in place. Each entry of
+                  # updated-dependencies-json carries its own name, ecosystem,
+                  # directory and new version. The top-level outputs describe
+                  # the first dependency only.
+                  #
+                  # Ecosystem. fetch-metadata reports Dependabot's package
+                  # manager name (npm_and_yarn, go_modules), the alerts API
+                  # the advisory database ecosystem (npm, go). A manager with
+                  # no advisory database ecosystem maps to nothing and never
+                  # matches.
+                  #
+                  # Directory. The manifest has to sit directly in the updated
+                  # directory. A prefix match would let `/` claim every
+                  # manifest in the repository. GitHub Actions is the one
+                  # exception, where Dependabot reads a directory's workflows
+                  # from its `.github/workflows`.
+                  #
+                  # Version. Ecosystems order pre-releases and qualifiers
+                  # differently (semver, PEP 440 and Maven all disagree), so
+                  # only plain dotted numbers are compared, numerically, with a
+                  # missing component counting as zero. Anything else, or an
+                  # advisory with no patched release, cannot be decided here
+                  # and does not match, so the PR is never auto-merged on an
+                  # alert its new version may not fix.
+                  #
+                  # $ghsa is empty when PR metadata named no advisory, and any
+                  # applicable alert is the only evidence there is. When it
+                  # named one, $ghsa pins the match to that advisory, leaving
+                  # `sort_by` to pick its best-scored record.
                   #
                   # Split API call and jq into separate stages so each failure
                   # mode surfaces as a named warning rather than a silent exit-1.
                   if API_RESPONSE=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/dependabot/alerts?state=open&per_page=100" 2>&1); then
-                      RESULT=$(echo "$API_RESPONSE" | jq \
-                          --arg pkgs "$PKGS" \
+                      RESULT=$(echo "$API_RESPONSE" | jq -c \
+                          --argjson deps "$UPDATED_DEPENDENCIES" \
                           --arg ghsa "$GHSA_ID" \
-                          '[.[][] | select(.security_advisory.ghsa_id != null)
-                           | select($ghsa == "" or .security_advisory.ghsa_id == $ghsa)
-                           | select(.dependency.package.name as $n |
-                               ($pkgs | split(", ") | index($n)) != null)]
-                           | sort_by(-(.security_advisory.cvss.score // 0)) | first
-                           | select(. != null)
-                           | {ghsa: .security_advisory.ghsa_id,
-                              cvss: (.security_advisory.cvss.score // 0)}' 2>&1) || {
-                          echo "::warning::Gate 1 fallback: jq filter failed on Dependabot alerts response — treating as no advisory match."
+                          'def alerts_ecosystem:
+                               if type == "string" then
+                                   {npm_and_yarn: "npm", bun: "npm", bundler: "rubygems",
+                                    pip: "pip", uv: "pip", composer: "composer",
+                                    go_modules: "go", maven: "maven", gradle: "maven",
+                                    sbt: "maven", nuget: "nuget", cargo: "rust",
+                                    hex: "erlang", pub: "pub", github_actions: "actions",
+                                    swift: "swift"}[.]
+                               else null end;
+                           def trim_slashes: sub("^/+"; "") | sub("/+$"; "");
+                           def in_directory($dir; $manager):
+                               if type == "string" and . != "" and ($dir | type) == "string" then
+                                   (trim_slashes | split("/") | .[:-1] | join("/")) as $parent
+                                   | ($dir | trim_slashes) as $want
+                                   | $parent == $want
+                                     or ($manager == "github_actions"
+                                         and $parent == ([$want, ".github/workflows"]
+                                                         | map(select(. != "")) | join("/")))
+                               else false end;
+                           def version_parts:
+                               if type == "string" and test("^v?[0-9]{1,15}([.][0-9]{1,15})*$")
+                               then ltrimstr("v") | split(".") | map(tonumber)
+                               else null end;
+                           def fixed_by($new; $patched):
+                               ($new | version_parts) as $n
+                               | ($patched | version_parts) as $p
+                               | if $n == null or $p == null then false
+                                 else ([$n, $p] | map(length) | max) as $len
+                                   | ($n + [range($len - ($n | length)) | 0])
+                                     >= ($p + [range($len - ($p | length)) | 0])
+                                 end;
+                           def applies($dep):
+                               ($dep.packageEcosystem | alerts_ecosystem) as $eco
+                               | .dependency.package.name == $dep.dependencyName
+                                 and $eco != null
+                                 and .dependency.package.ecosystem == $eco
+                                 and (.dependency.manifest_path
+                                      | in_directory($dep.directory; $dep.packageEcosystem))
+                                 and fixed_by($dep.newVersion;
+                                              .security_vulnerability.first_patched_version.identifier);
+                           if ($deps | type) != "array" then
+                               error("updated-dependencies-json is not an array")
+                           else . end
+                           | [.[][] | select(.security_advisory.ghsa_id != null)
+                              | select($ghsa == "" or .security_advisory.ghsa_id == $ghsa)] as $open
+                           | {named: ([$open[] | .dependency.package.name as $n
+                                       | select(any($deps[]; .dependencyName == $n))] | length),
+                              best: ([$open[] | select(. as $alert | any($deps[]; . as $dep | $alert | applies($dep)))]
+                                     | sort_by(-(.security_advisory.cvss.score // 0)) | first
+                                     | if . == null then null
+                                       else {ghsa: .security_advisory.ghsa_id,
+                                             cvss: (.security_advisory.cvss.score // 0)} end)}' 2>&1) || {
+                          echo "::warning::Gate 1 fallback: could not match the Dependabot alerts response against updated-dependencies-json, so treating it as no advisory match. $(echo "$RESULT" | head -c 300 | tr '\n' ' ')"
                           RESULT=""
                       }
                   elif [ "$GATE1_PASS" = "true" ]; then
@@ -410,23 +493,36 @@ jobs:
                       exit 1
                   fi
 
-                  if [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
+                  BEST=""
+                  NAMED=0
+                  if [ -n "$RESULT" ]; then
+                      BEST=$(echo "$RESULT" | jq -c '.best // empty')
+                      NAMED=$(echo "$RESULT" | jq -r '.named')
+                  fi
+
+                  if [ -z "$BEST" ]; then
                       echo "pass=false" >> "$GITHUB_OUTPUT"
                       echo "cvss=" >> "$GITHUB_OUTPUT"
+                      # Name the near misses. An alert rejected on ecosystem,
+                      # directory or version is the first thing to check when
+                      # a real security PR lands here.
+                      if [ "$NAMED" != "0" ]; then
+                          echo "$NAMED open Dependabot alert(s) name an updated package but do not apply to it (ecosystem, manifest directory, or a version the step cannot confirm is fixed)."
+                      fi
                       if [ "$GATE1_PASS" = "true" ]; then
-                          echo "No matching open Dependabot alert found — no better score available."
+                          echo "No applicable open Dependabot alert found, so no better score available."
                       else
-                          echo "No matching open Dependabot alert found — routine version update."
+                          echo "No applicable open Dependabot alert found, so this is a routine version update."
                       fi
                   else
-                      GHSA=$(echo "$RESULT" | jq -r '.ghsa')
-                      CVSS=$(echo "$RESULT" | jq -r '.cvss')
+                      GHSA=$(echo "$BEST" | jq -r '.ghsa')
+                      CVSS=$(echo "$BEST" | jq -r '.cvss')
                       echo "pass=true" >> "$GITHUB_OUTPUT"
                       echo "cvss=$CVSS" >> "$GITHUB_OUTPUT"
                       echo "Advisory $GHSA (CVSS $CVSS) found via Dependabot alerts API."
                   fi
               env:
-                  DEPENDENCY_NAMES: ${{ steps.meta.outputs.dependency-names }}
+                  UPDATED_DEPENDENCIES: ${{ steps.meta.outputs.updated-dependencies-json }}
                   GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
                   GATE1_PASS: ${{ steps.gate1.outputs.pass }}
                   GH_TOKEN: ${{ secrets.token || github.token }}
@@ -515,29 +611,88 @@ jobs:
                   CVSS: ${{ steps.cvss.outputs.value }}
                   THRESHOLD: ${{ inputs.cvss-threshold }}
 
-            # Gate 3: compatibility score.
-            # Skipped for indirect-dep PRs — those are the ones Gate 1 fails
-            # on, and fetch-metadata cannot provide a score for transitive
-            # dependencies. The age gate provides the timing safeguard. Keyed
-            # on gate1, not gate1-fallback: the fallback also passes for a
-            # direct dep whose score it recovered, and that PR must still
-            # clear the compatibility check.
+            # Gate 3: compatibility score, for direct dependencies.
+            # Runs for every PR that clears Gate 2 and decides inside the
+            # script whether the check applies, from dependency-type. Which
+            # Gate 1 path found the advisory says nothing about that, because
+            # the alert lookup can name an advisory for an indirect dependency
+            # and miss one for a direct dependency. Skipping the step instead
+            # would count as a pass for the pending label, so an `if:` that
+            # wrongly skips it fails open.
             - name: Gate 3 — compatibility score (≥ ${{ inputs.compatibility-threshold }}%)
               id: gate3
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
-                  steps.gate2.outputs.pass == 'true' &&
-                  steps.gate1.outputs.pass == 'true' &&
-                  steps.meta.outputs.compatibility-score != ''
+                  steps.gate2.outputs.pass == 'true'
+              # Explicit so the step runs under `-e -o pipefail` and the bats
+              # suite can drive the extracted script with exactly these flags.
+              shell: bash
               run: |
-                  if [ "${SCORE:-0}" -ge "$THRESHOLD" ]; then
+                  # fetch-metadata sets dependency-type to the most direct type
+                  # across all updated dependencies, ranked direct:production,
+                  # direct:development, indirect. So `indirect` means nothing
+                  # in the PR is direct. Everything else gets the check,
+                  # `unknown` and empty included, because failing to classify a
+                  # PR must not be a way around the gate. fetch-metadata cannot
+                  # score transitive dependencies, and the age gate is their
+                  # timing safeguard.
+                  if [ "$DEPENDENCY_TYPE" = "indirect" ]; then
+                      echo "pass=true" >> "$GITHUB_OUTPUT"
+                      echo "Indirect dependencies only, so the compatibility check does not apply."
+                      exit 0
+                  fi
+
+                  # Every direct dependency needs its own usable score, and the
+                  # lowest one gates the PR. The top-level compatibility-score
+                  # output describes the first dependency only. A usable score
+                  # is a whole number from 1 to 100. fetch-metadata writes 0
+                  # both when the lookup is off and when Dependabot has no score
+                  # for the update, so 0 is missing data, not a 0% score, and
+                  # fails closed to review the way an unusable CVSS does.
+                  if ! RESULT=$(jq -c --argjson threshold "$THRESHOLD" '
+                      if type != "array" then error("updated-dependencies-json is not an array") else . end
+                      | [.[] | select(.dependencyType != "indirect")
+                         | {name: .dependencyName,
+                            score: .compatScore,
+                            usable: ((.compatScore | type) == "number"
+                                     and .compatScore == (.compatScore | floor)
+                                     and .compatScore >= 1 and .compatScore <= 100)}] as $direct
+                      | if ($direct | length) == 0 then {available: false, dependency: ""}
+                        elif any($direct[]; .usable | not) then
+                            {available: false,
+                             dependency: (first($direct[] | select(.usable | not)) | .name)}
+                        else ($direct | min_by(.score)) as $low
+                            | {available: true, dependency: $low.name, score: $low.score,
+                               pass: ($low.score >= $threshold)}
+                        end' <<<"$UPDATED_DEPENDENCIES" 2>&1) || [ -z "$RESULT" ]; then
+                      echo "::warning::Gate 3: could not read updated-dependencies-json, so no compatibility score is available. $(echo "$RESULT" | head -c 300 | tr '\n' ' ')"
+                      RESULT='{"available": false, "dependency": ""}'
+                  fi
+
+                  # Newlines are stripped because the name goes to $GITHUB_OUTPUT,
+                  # where one would start a new output line.
+                  AVAILABLE=$(jq -r '.available' <<<"$RESULT")
+                  DEPENDENCY=$(jq -r '.dependency // ""' <<<"$RESULT" | tr -d '\r\n')
+                  echo "available=$AVAILABLE" >> "$GITHUB_OUTPUT"
+                  echo "dependency=$DEPENDENCY" >> "$GITHUB_OUTPUT"
+
+                  if [ "$AVAILABLE" != "true" ]; then
+                      echo "pass=false" >> "$GITHUB_OUTPUT"
+                      echo "No usable compatibility score for ${DEPENDENCY:-the updated dependencies}, failing closed."
+                      exit 0
+                  fi
+
+                  SCORE=$(jq -r '.score' <<<"$RESULT")
+                  echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+                  if [ "$(jq -r '.pass' <<<"$RESULT")" = "true" ]; then
                       echo "pass=true" >> "$GITHUB_OUTPUT"
                   else
                       echo "pass=false" >> "$GITHUB_OUTPUT"
-                      echo "Compatibility score $SCORE is below $THRESHOLD%."
+                      echo "Compatibility score $SCORE for $DEPENDENCY is below $THRESHOLD%."
                   fi
               env:
-                  SCORE: ${{ steps.meta.outputs.compatibility-score }}
+                  DEPENDENCY_TYPE: ${{ steps.meta.outputs.dependency-type }}
+                  UPDATED_DEPENDENCIES: ${{ steps.meta.outputs.updated-dependencies-json }}
                   THRESHOLD: ${{ inputs.compatibility-threshold }}
 
             # Metadata unavailable or gates 2/3 failed — label for human
@@ -562,8 +717,13 @@ jobs:
                       fi
                   elif [ "$GATE2_PASS" == "false" ]; then
                       REASON="CVSS score ($CVSS) is below the threshold of $THRESHOLD"
+                  elif [ "$GATE3_AVAILABLE" == "false" ]; then
+                      # A missing score gets its own reason. fetch-metadata
+                      # reports it as 0, which would otherwise read as a real
+                      # 0% below the threshold.
+                      REASON="the compatibility score for ${COMPAT_DEPENDENCY:-the updated dependencies} was unavailable, failing closed"
                   else
-                      REASON="compatibility score ($COMPAT_SCORE%) is below the required $COMPAT_THRESHOLD%"
+                      REASON="compatibility score for $COMPAT_DEPENDENCY ($COMPAT_SCORE%) is below the required $COMPAT_THRESHOLD%"
                   fi
                   TEAM_MENTION=""
                   if [ -n "$REVIEW_TEAM" ]; then
@@ -587,7 +747,9 @@ jobs:
                   CVSS: ${{ steps.cvss.outputs.value }}
                   REPORTED_CVSS: ${{ steps.cvss.outputs.reported }}
                   THRESHOLD: ${{ inputs.cvss-threshold }}
-                  COMPAT_SCORE: ${{ steps.meta.outputs.compatibility-score }}
+                  GATE3_AVAILABLE: ${{ steps.gate3.outputs.available }}
+                  COMPAT_SCORE: ${{ steps.gate3.outputs.score }}
+                  COMPAT_DEPENDENCY: ${{ steps.gate3.outputs.dependency }}
                   COMPAT_THRESHOLD: ${{ inputs.compatibility-threshold }}
                   REVIEW_TEAM: ${{ inputs.review-team }}
                   REVIEW_LABEL: ${{ inputs.review-label }}
@@ -600,12 +762,14 @@ jobs:
             # The step also runs when the pending label is already present but
             # the review label still lingers: skipping there would strand the
             # exact both-labels state this step exists to clear.
+            # Gate 3 runs whenever Gate 2 passes, so only its own pass counts
+            # here. A skipped Gate 3 is never read as a passed one.
             - name: Label — ${{ inputs.pending-label }} (awaiting age gate)
               id: label-pending
               if: |
                   steps.fast-track.conclusion == 'skipped' &&
                   steps.gate2.outputs.pass == 'true' &&
-                  (steps.gate3.conclusion == 'skipped' || steps.gate3.outputs.pass == 'true') &&
+                  steps.gate3.outputs.pass == 'true' &&
                   (!contains(github.event.pull_request.labels.*.name, inputs.pending-label) ||
                    contains(github.event.pull_request.labels.*.name, inputs.review-label))
               run: |
@@ -649,9 +813,10 @@ jobs:
                   }
 
                   # The verdict is also an output, so revoke-auto-merge acts on
-                  # the same decision instead of re-deriving it.
-                  if [ "$GATE2_PASS" = "true" ] &&
-                      { [ "$GATE3_CONCLUSION" = "skipped" ] || [ "$GATE3_PASS" = "true" ]; }; then
+                  # the same decision instead of re-deriving it. Gate 3 runs
+                  # for every PR that clears Gate 2, so only its own pass
+                  # counts. A skipped Gate 3 is never read as a passed one.
+                  if [ "$GATE2_PASS" = "true" ] && [ "$GATE3_PASS" = "true" ]; then
                       post_status success "Passed the auto-merge gates at this commit"
                       echo "eligible=true" >> "$GITHUB_OUTPUT"
                       echo "Recorded eligibility for $HEAD_SHA."
@@ -673,7 +838,6 @@ jobs:
                   post_status failure "Not eligible for auto-merge at this commit"
               env:
                   GATE2_PASS: ${{ steps.gate2.outputs.pass }}
-                  GATE3_CONCLUSION: ${{ steps.gate3.conclusion }}
                   GATE3_PASS: ${{ steps.gate3.outputs.pass }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
