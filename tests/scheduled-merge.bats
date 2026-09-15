@@ -129,3 +129,36 @@ merge_step() {
     merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
 }
+
+# --- the merge boundary (QAO-768) -----------------------------------------
+
+@test "the merge is pinned to the head commit whose evidence was checked" {
+    pending_pr_fixture "$HEAD"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    merge_step
+    log_has_call 'pr merge 301' '--auto' "--match-head-commit $HEAD"
+}
+
+@test "evidence withdrawn while the merge was being queued disables it again" {
+    # An evaluation withdraws evidence before it disables auto-merge. If it
+    # does both between this job's evidence check and its merge call, the
+    # merge would re-queue what was just revoked. Checking again after
+    # queueing closes that window.
+    pending_pr_fixture "$HEAD"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    printf '[[%s,%s]]' "$(commit_status failure 'github-actions[bot]')" \
+        "$(commit_status success 'github-actions[bot]')" \
+        >"$GH_STUB_DIR/GET_repos_acme_widgets_commits_${HEAD}_statuses_per_page_100.next"
+    run merge_step
+    log_has_call 'pr merge 301' '--auto'
+    log_has_call 'pr merge 301' '--disable-auto'
+    grep -qF '::warning::' <<<"$output"
+}
+
+@test "evidence that still holds after queueing leaves the merge queued" {
+    pending_pr_fixture "$HEAD"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    merge_step
+    [ "$(log_count "commits/$HEAD/statuses")" -eq 2 ]
+    [ "$(log_count '--disable-auto')" -eq 0 ]
+}
