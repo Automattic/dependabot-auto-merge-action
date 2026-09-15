@@ -52,6 +52,27 @@ gate1() {
     ! grep -q '^cvss' "$GITHUB_OUTPUT"
 }
 
+# fetch-metadata leaves ghsa-id, alert-state and cvss empty, and every
+# compatibility score at 0, unless the two opt-in lookups are on. Without
+# them Gate 1 never sees an advisory and Gate 3 never sees a score, so both
+# gates quietly stop meaning what the README says they do.
+@test "the metadata step enables the alert and compatibility lookups" {
+    with=$(extract_key meta with)
+    grep -qxF 'alert-lookup: true' <<<"$with"
+    grep -qxF 'compat-lookup: true' <<<"$with"
+}
+
+# The alert lookup reads Dependabot alerts, which GITHUB_TOKEN cannot do in
+# many orgs. It has to use the caller's alerts token, the same one the
+# fallback uses, or a caller who configured `secrets.token` still fails here.
+@test "the alert lookup uses the same token as the alerts fallback" {
+    token=$(extract_key meta with | sed -n 's/^github-token: //p')
+    fallback_token=$(extract_key gate1-fallback env | sed -n 's/^GH_TOKEN: //p')
+    [ -n "$token" ]
+    [ "$token" = "$fallback_token" ]
+    grep -qF 'secrets.token' <<<"$token"
+}
+
 # Steps cannot share functions and callers never check this repo out, so the
 # classifier is duplicated between this step and the resolver. The two copies
 # deciding differently would break the fallback contract: a score Gate 1
