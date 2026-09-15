@@ -34,19 +34,22 @@ final class DetectDirectoriesCommand extends Command
     private const REPOSITORY = '~^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$~D';
 
     private const DESCRIPTION = <<<'TEXT'
-        Detect manifest and lockfile locations in a repository and report the
-        .github/dependabot.yml directory mappings needed to cover them.
+        Detect manifest and lockfile locations in a repository and land the
+        .github/dependabot.yml directory mappings needed to cover them, proposed on
+        a branch as a pull request. The default branch is never written to directly.
 
         Detection is remote — the git trees API, plus a handful of Contents API reads
-        for workspace declarations. No full clone.
+        for workspace declarations, with a blobless-clone fallback for trees the API
+        truncates.
 
         Authentication uses the gh CLI's credentials (gh auth login, or the GH_TOKEN
         env var). GH_TOKEN/GITHUB_TOKEN apply to github.com and ghe.com; for GitHub
         Enterprise Server set GH_HOST and GH_ENTERPRISE_TOKEN (or
-        GITHUB_ENTERPRISE_TOKEN). Detection is read-only; a fine-grained PAT scoped
-        to the repo needs:
-           - Contents: Read        (file list and file contents)
-           - Metadata: Read        (implied)
+        GITHUB_ENTERPRISE_TOKEN). A fine-grained PAT scoped to the repo needs:
+           - Contents: Read & write      (file list, file contents, branch and commit)
+           - Pull requests: Read & write (opening and updating the PR)
+           - Metadata: Read              (implied by the above)
+        --dry-run needs only the read halves.
         TEXT;
 
     protected function configure(): void
@@ -56,11 +59,12 @@ final class DetectDirectoriesCommand extends Command
             // Declared as an array so the "how many were given" checks below
             // can produce their own messages rather than Symfony's.
             ->addArgument('repository', InputArgument::IS_ARRAY, 'owner/repo')
-            ->addOption('dry-run', null, InputOption::VALUE_NONE, 'report the mapping and print a unified diff of the proposed .github/dependabot.yml; currently required — the write path lands in a follow-up')
+            ->addOption('dry-run', null, InputOption::VALUE_NONE, 'report the mapping and print a unified diff of the proposed .github/dependabot.yml without writing anything; read-only calls still run, so the output matches what a real run would decide')
             ->addOption('detect-only', null, InputOption::VALUE_NONE, 'print the detected mappings and exit, before any API call')
             ->addOption('include', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'treat a soft-excluded directory name (examples, dist, fixtures, ...) as real; repeatable')
             ->addOption('enable-version-updates', null, InputOption::VALUE_NONE, 'emit the full house template (open-pull-requests-limit 10 plus minor/patch grouping) instead of the security-only default of 0')
             ->addOption('force', null, InputOption::VALUE_NONE, 'proceed past the sanity cap of 50 mapped pairs')
+            ->addOption('allow-full-clone', null, InputOption::VALUE_NONE, 'when the git trees API truncates and the server refuses a blobless clone, fall back to a full clone; off by default because the repositories that truncate are exactly the ones too large to clone whole')
             ->addOption('paths-from-file', null, InputOption::VALUE_REQUIRED, 'read the repository file list from file, one path per line, instead of calling the API; blob contents are read from <file-without-extension>.blobs/<path> — offline testing seam')
             ->addOption('existing-config', null, InputOption::VALUE_REQUIRED, 'read the current .github/dependabot.yml from file instead of the API — offline testing seam');
     }
@@ -123,8 +127,11 @@ final class DetectDirectoriesCommand extends Command
 
         $dryRun = (bool) $input->getOption('dry-run');
         $detectOnly = (bool) $input->getOption('detect-only');
-        if (!$dryRun && !$detectOnly) {
-            throw new FatalException('this revision only reports — re-run with --dry-run (or --detect-only). The write path lands in a follow-up.');
+
+        // The offline seams describe a repository that may not be the real
+        // one, so they must never drive a write.
+        if (!$dryRun && !$detectOnly && (null !== $pathsFromFile || null !== $existingConfig)) {
+            throw new FatalException('--paths-from-file and --existing-config describe a repository from disk — combine them with --dry-run or --detect-only');
         }
 
         return new Options(
@@ -133,6 +140,7 @@ final class DetectDirectoriesCommand extends Command
             detectOnly: $detectOnly,
             enableVersionUpdates: (bool) $input->getOption('enable-version-updates'),
             force: (bool) $input->getOption('force'),
+            allowFullClone: (bool) $input->getOption('allow-full-clone'),
             include: $include,
             pathsFromFile: $pathsFromFile,
             existingConfigFile: $existingConfig,

@@ -10,6 +10,10 @@ use Automattic\DependabotDirectories\Report\Reporter;
 /**
  * Render the missing blocks and splice them into the existing file after the
  * last line of the `updates:` block.
+ *
+ * Each block is reported as a plan line. Plan lines describe intent, not
+ * mutations — counting them made a second run that wrote nothing still say
+ * "2 changed".
  */
 final class ProposalBuilder
 {
@@ -32,7 +36,7 @@ final class ProposalBuilder
         $rendered = '';
         foreach ($missing as $block) {
             $rendered .= BlockRenderer::render($block, $item, $child, $versionUpdates);
-            $reporter->would(sprintf('map %s -> %s', $block->ecosystem->value, $block->directory));
+            $reporter->planned(sprintf('map %s -> %s', $block->ecosystem->value, $block->directory));
         }
 
         if (!$present) {
