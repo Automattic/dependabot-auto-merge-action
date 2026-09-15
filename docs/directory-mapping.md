@@ -188,7 +188,7 @@ The only difference was a two-line stub `pnpm-lock.yaml` at the root, left over 
 
 So an implausible lockfile anywhere in the tree can suppress Dependabot alerting for directories that are themselves perfectly valid, while every surface we would normally check looks healthy. This script cannot detect it — parsing lockfile *contents* is well outside its remit — but it is worth knowing during the rollout, because it presents as "Dependabot is enabled and quiet", which is indistinguishable from "nothing to report".
 
-WooCommerce also exposes the limits of the exclusion list as approved. It maps `/packages/php/email-editor/vendor-prefixed` and `/plugins/woocommerce/bin/composer/*` — vendored and tooling directories that hold a real `composer.json` and `composer.lock` but should never receive PRs. `--include` only re-admits soft-excluded names; there is no way to exclude a path the list does not already name. Worth settling before the write path lands: either extend the soft-exclude list (`vendor-prefixed` is the obvious first entry) or add an `--exclude <dir>` counterpart.
+WooCommerce also exposes the limits of the exclusion list as approved. It maps `/packages/php/email-editor/vendor-prefixed` and `/plugins/woocommerce/bin/composer/*`, vendored and tooling directories that hold a real `composer.json` and `composer.lock` but should never receive PRs. `--include` only re-admits soft-excluded names, so there is no way to exclude a path the list does not already name. v1 ships with the list as approved and this gap documented. Path exemptions belong in the platform-workflows audit config ([QAO-770](https://linear.app/a8c/issue/QAO-770)) rather than a CLI flag.
 
 ## 10. Resolved questions
 
