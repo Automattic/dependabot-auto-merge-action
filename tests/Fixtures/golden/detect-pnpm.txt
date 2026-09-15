@@ -1,0 +1,8 @@
+Scanning acme/widgets
+
+!  1 directory with a package.json but no lockfile and no workspace covering them — no entry was emitted:
+     /test/helper
+Detected mappings:
+   npm: /
+
+Summary: 0 ok, 0 would change, 1 notes, 0 failed

@@ -1,1 +1,7 @@
 .idea/
+/vendor/
+/composer.phar
+*.phar
+.phpunit.cache/
+.php-cs-fixer.cache
+.phpstan.cache/

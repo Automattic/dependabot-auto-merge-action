@@ -1,0 +1,8 @@
+Scanning acme/widgets
+
+!  composer: 2 directories sit at the repository root — keeping singular entries rather than globbing '/*'
+Detected mappings:
+   composer: /a
+   composer: /b
+
+Summary: 0 ok, 0 would change, 1 notes, 0 failed
