@@ -48,6 +48,10 @@ permissions:
     pull-requests: write
     contents: write
     security-events: read
+    # evaluate-pr records its verdict as a commit status, and the scheduled
+    # merge reads it back. Labels cannot carry that verdict: a triage user
+    # can change them.
+    statuses: write
 
 jobs:
     # Verifies the repo is actually configured for auto-merge before either
@@ -589,6 +593,65 @@ jobs:
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+            # Record the verdict as evidence the scheduled merge can trust.
+            # The pending label cannot be that evidence, because a triage
+            # user can apply it, or remove the review label, and evaluation
+            # never touches the labels of a routine update. A commit status
+            # is bound to the head commit evaluated here, and creating one
+            # takes statuses: write, which a triage user does not have.
+            #
+            # A pass writes success. Anything else, including an evaluation
+            # that errored before Gate 2 reported, writes failure, but only
+            # over a success an earlier run recorded for this same commit:
+            # failing every ineligible commit would put a red status on
+            # every routine Dependabot PR. always() so that an errored run
+            # still withdraws. A fast-tracked PR is left alone, as its
+            # auto-merge is already queued.
+            - name: Record eligibility evidence on the head commit
+              id: record-eligibility
+              if: always() && steps.fast-track.conclusion != 'success'
+              # Explicit so the step runs under `-e -o pipefail` and the bats
+              # suite can drive the extracted script with exactly these flags.
+              shell: bash
+              run: |
+                  CONTEXT='dependabot-auto-merge/eligibility'
+                  # The creator GitHub records for a status written with a
+                  # GITHUB_TOKEN. Readers ignore statuses from anyone else.
+                  CREATOR='github-actions[bot]'
+
+                  post_status() {
+                      gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+                          -f state="$1" -f context="$CONTEXT" \
+                          -f description="$2" -f target_url="$RUN_URL" >/dev/null
+                  }
+
+                  if [ "$GATE2_PASS" = "true" ] &&
+                      { [ "$GATE3_CONCLUSION" = "skipped" ] || [ "$GATE3_PASS" = "true" ]; }; then
+                      post_status success "Passed the auto-merge gates at this commit"
+                      echo "Recorded eligibility for $HEAD_SHA."
+                      exit 0
+                  fi
+
+                  if STATUSES=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" 2>&1) &&
+                      LATEST=$(echo "$STATUSES" | jq -r --arg context "$CONTEXT" --arg creator "$CREATOR" \
+                          '[.[][] | select(.context == $context and .creator.login == $creator)] | first | .state // ""' 2>&1); then
+                      if [ "$LATEST" != "success" ]; then
+                          echo "Not eligible, and no eligibility evidence to withdraw for $HEAD_SHA."
+                          exit 0
+                      fi
+                      echo "Not eligible. Withdrawing the eligibility an earlier evaluation recorded for $HEAD_SHA."
+                  else
+                      echo "::warning::Cannot read existing statuses for $HEAD_SHA, so recording ineligibility in case earlier evidence exists. $(echo "$STATUSES" | head -c 300 | tr '\n' ' ')"
+                  fi
+                  post_status failure "Not eligible for auto-merge at this commit"
+              env:
+                  GATE2_PASS: ${{ steps.gate2.outputs.pass }}
+                  GATE3_CONCLUSION: ${{ steps.gate3.conclusion }}
+                  GATE3_PASS: ${{ steps.gate3.outputs.pass }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
             # Labeling step failed — notify so the failure doesn't go unnoticed.
             - name: Notify on labeling failure
               if: failure()
@@ -601,6 +664,10 @@ jobs:
     # the age gate and enables auto-merge on them. PRs also carrying the
     # review label are excluded: a stale pending label from before a PR was
     # routed to review must never keep it in the merge set.
+    #
+    # The labels only pick candidates. A triage user can apply the pending
+    # label, so each candidate merges only when its current head commit
+    # carries the success status evaluate-pr records on a pass.
     scheduled-merge:
         name: Scheduled merge of eligible PRs
         runs-on: ubuntu-latest
@@ -622,27 +689,51 @@ jobs:
                   # edit` and `gh pr list --label` all ignore case, so a
                   # caller whose `review-label` input differs in case from the
                   # repository label still gets the PR excluded here.
-                  PR_NUMS=$(gh pr list \
+                  CANDIDATES=$(gh pr list \
                       --repo "$GITHUB_REPOSITORY" \
                       --author "app/dependabot" \
                       --label "$PENDING_LABEL" \
                       --state open \
-                      --json number,createdAt,labels \
+                      --json number,createdAt,labels,headRefOid \
                   | jq -r --argjson age "$AGE_DAYS" --arg review "$REVIEW_LABEL" \
                       '.[]
                        | select([.labels[].name | ascii_downcase]
                                 | index($review | ascii_downcase) | not)
                        | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age)
-                       | .number')
+                       | "\(.number) \(.headRefOid)"')
+
+                  # Must match what the record-eligibility step writes.
+                  CONTEXT='dependabot-auto-merge/eligibility'
+                  CREATOR='github-actions[bot]'
 
                   FAILED=0
-                  for PR_NUM in $PR_NUMS; do
+                  while read -r PR_NUM HEAD_SHA <&3; do
+                      [ -n "$PR_NUM" ] || continue
+
+                      # Statuses come newest first, so the first match is the
+                      # latest verdict. Evidence for an earlier head does not
+                      # count: the lookup is by the head commit as listed now.
+                      # A failed lookup blocks the merge and fails the job, as
+                      # a failed merge does. Missing or withdrawn evidence only
+                      # skips the PR, since that is the answer, not an error.
+                      if ! STATUSES=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" 2>&1) ||
+                          ! STATE=$(echo "$STATUSES" | jq -r --arg context "$CONTEXT" --arg creator "$CREATOR" \
+                              '[.[][] | select(.context == $context and .creator.login == $creator)] | first | .state // ""' 2>&1); then
+                          echo "::error::Cannot verify eligibility evidence for PR #$PR_NUM at $HEAD_SHA, so it was not merged. $(echo "$STATUSES" | head -c 500 | tr '\n' ' ')"
+                          FAILED=1
+                          continue
+                      fi
+                      if [ "$STATE" != "success" ]; then
+                          echo "::warning::Skipping PR #$PR_NUM. Its head commit $HEAD_SHA has no passing evaluation (latest recorded state: ${STATE:-none}). A pending label is not enough on its own. Any new PR event re-evaluates it."
+                          continue
+                      fi
+
                       echo "Enabling auto-merge on PR #$PR_NUM"
                       if ! ERR=$(gh pr merge "$PR_NUM" --auto --"$MERGE_METHOD" --repo "$GITHUB_REPOSITORY" 2>&1 >/dev/null); then
                           echo "::error::Failed to enable auto-merge on PR #$PR_NUM — $(echo "$ERR" | head -c 500 | tr '\n' ' ')"
                           FAILED=1
                       fi
-                  done
+                  done 3<<<"$CANDIDATES"
                   exit $FAILED
               env:
                   PENDING_LABEL: ${{ inputs.pending-label }}

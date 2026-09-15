@@ -121,14 +121,21 @@ mixed_pr_list_fixture() {
     NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     cat >"$GH_STUB_DIR/pr_list" <<EOF
 [
-  {"number": 101, "createdAt": "2020-01-01T00:00:00Z",
+  {"number": 101, "createdAt": "2020-01-01T00:00:00Z", "headRefOid": "a101",
    "labels": [{"name": "auto-merge-pending"}]},
-  {"number": 102, "createdAt": "2020-01-01T00:00:00Z",
+  {"number": 102, "createdAt": "2020-01-01T00:00:00Z", "headRefOid": "a102",
    "labels": [{"name": "auto-merge-pending"}, {"name": "sirt-review-required"}]},
-  {"number": 103, "createdAt": "$NOW",
+  {"number": 103, "createdAt": "$NOW", "headRefOid": "a103",
    "labels": [{"name": "auto-merge-pending"}]}
 ]
 EOF
+    # Every PR carries passing evidence, so only the label and age
+    # selection under test decides what merges. tests/scheduled-merge.bats
+    # covers the evidence check.
+    local sha
+    for sha in a101 a102 a103; do
+        statuses_fixture "$sha" "$(commit_status success 'github-actions[bot]')"
+    done
 }
 
 @test "scheduled merge skips PRs that also carry the review label" {
@@ -148,9 +155,10 @@ EOF
 # One old, pending-labelled PR that also carries $1 as its review label.
 review_labelled_pr_fixture() {
     jq -n --arg review "$1" \
-        '[{number: 201, createdAt: "2020-01-01T00:00:00Z",
+        '[{number: 201, createdAt: "2020-01-01T00:00:00Z", headRefOid: "a201",
            labels: [{name: "auto-merge-pending"}, {name: $review}]}]' \
         >"$GH_STUB_DIR/pr_list"
+    statuses_fixture a201 "$(commit_status success 'github-actions[bot]')"
 }
 
 # Every other label comparison in the chain ignores case, so a caller whose
