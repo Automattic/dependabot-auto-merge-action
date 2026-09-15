@@ -11,7 +11,7 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 | 3 | Compatibility score | ≥ 80% | Direct deps only; indirect deps skip this gate since fetch-metadata can't provide a score. |
 | 4 | Age gate | 7 days | Scheduled job merges passing PRs after `age-days` days. |
 
-PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A `security-fast-track` label on any PR bypasses all gates immediately. When a PR is fast-tracked, a one-time audit comment is posted recording who applied the label, when, and a link to the workflow run.
+PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A `security-fast-track` label bypasses all gates immediately, but only when the user who most recently applied it has write, maintain, or admin access to the repo. When a PR is fast-tracked, a one-time audit comment is posted recording who applied the label, when, and a link to the workflow run.
 
 `sirt-review-required` and `auto-merge-pending` are mutually exclusive workflow states: every evaluation applies one and removes the other, so a re-evaluated PR — say after Dependabot rewrites the branch — never carries both.
 
@@ -179,7 +179,7 @@ Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Se
 | `compatibility-threshold` | number | `80` | Minimum compatibility score % for Gate 3 (direct deps only). |
 | `age-days` | number | `7` | Days a PR must be open before the scheduled job merges it. |
 | `merge-method` | string | `'squash'` | `squash`, `merge`, or `rebase`. |
-| `fast-track-label` | string | `'security-fast-track'` | Label that bypasses all gates. |
+| `fast-track-label` | string | `'security-fast-track'` | Label that bypasses all gates when applied by a user who can merge. |
 | `review-label` | string | `'sirt-review-required'` | Label applied when a PR fails a gate. |
 | `pending-label` | string | `'auto-merge-pending'` | Label applied when a PR passes all gates and is waiting for the age gate. |
 | `review-team` | string | `''` | Optional. GitHub team slug (`org/team`) @-mentioned in review-required comments. |
@@ -226,12 +226,12 @@ The calling job must declare:
 
 ```yaml
 permissions:
-    pull-requests: write   # label and comment on PRs
+    pull-requests: write   # label and comment on PRs, read label history
     contents: write        # enable auto-merge
     security-events: read  # read Dependabot alerts API
 ```
 
-These are the minimum required. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
+These are the minimum required. The fast-track check reads the PR's issue events, which `pull-requests` covers, and the label applier's repository permission, which only needs the Metadata read access every `GITHUB_TOKEN` has. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
 
 ### When GITHUB_TOKEN returns 403 on the Dependabot alerts API
 
@@ -268,6 +268,12 @@ The workflow treats as missing metadata every zero-like score — empty, `0`, `0
 
 What to do: check the advisory yourself. If it is a real high-severity fix, apply the `fast-track-label` to merge it; the workflow records who did so in an audit comment. Nothing re-evaluates a PR when an advisory is scored later — the gates only re-run on a new PR event, so a stalled PR needs either the fast-track label or a push.
 
+### The fast-track label is on a PR but auto-merge was not enabled
+
+Look for a "Fast-track override refused" warning annotation on the evaluation run. It names the reason. The label only counts when the user who most recently applied it has write, maintain, or admin access, because a triage user can apply labels but cannot enable auto-merge, and the label must not hand them that power. A refused override is not an error. The PR goes through the normal gates as if the label were absent.
+
+What to do: have someone with write access or higher remove the label and apply it again. If the annotation reports a failed lookup instead, re-apply the label once the API is reachable. Every lookup failure refuses the override rather than guessing.
+
 ### A PR carries both `auto-merge-pending` and `sirt-review-required`
 
 The labels are mutually exclusive states, and from v1.6 the workflow enforces that: routing to review removes the pending label, marking pending removes the review label, and the scheduled merge skips any PR carrying the review label even if a stale pending label survives. Callers pinned at the v1.5 SHA or earlier get none of this — a PR that passed the gates and later failed them (a branch rewrite rematching different advisories, typically) keeps both labels, and their scheduled job treats it as an auto-merge candidate. Remove the stale pending label by hand and re-pin.
@@ -292,7 +298,7 @@ A red preflight is intentional: it surfaces a repo where auto-merge could never 
 
 Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
 
-1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately, post a one-time audit comment (label applier, UTC timestamp, workflow-run link), and exit. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it.
+1. **Fast-track check** — if the `fast-track-label` is present, find who most recently applied it in the PR's issue events and look up that user's repository permission. Write, maintain, or admin enables auto-merge immediately, posts a one-time audit comment (verified label applier and role, UTC timestamp, workflow-run link), and exits. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it. Anything else refuses the override with a warning annotation and the PR goes through the gates below as if the label were absent. That covers a triage or read user, a bot, a label removed since the event fired, and a failed or unreadable lookup. The event sender plays no part, so a label a triage user applied earlier cannot ride along on a later `synchronize`.
 2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID and CVSS. The Dependabot Alerts API is consulted as a fallback in two cases: the GHSA ID is missing (indirect dep — fetch-metadata cannot embed advisory data for those), or it is present but the CVSS is unusable (unscored advisory — the API may hold a real score for it). Open security alerts are matched against the updated packages, and on the direct-dep path against the GHSA ID the PR fixes as well, so a package with several open alerts cannot lend a score from a vulnerability this PR leaves in place.
 3. **Resolve the effective CVSS** — prefer the fetch-metadata score, then the alerts-API score. A score that is empty, non-numeric, numerically zero (`0`, `0.0`, `00`, `.00`), or above `10` is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`, and the comment names the score GitHub reported.
 4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
@@ -306,6 +312,7 @@ Runs on the cron you define in the caller, after preflight passes. Finds open PR
 ## Security notes
 
 - The workflow only acts on PRs authored by `app/dependabot`.
+- The fast-track label only bypasses the gates when the user who most recently applied it can merge (write, maintain, or admin). Triage users can label PRs but cannot enable auto-merge, so their label is ignored. Every lookup failure refuses the override.
 - The fast-track path leaves an audit comment on the PR, so gate bypasses are attributable after the fact.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
 - `security-events: read` is required to call the Dependabot Alerts API — for indirect dependency lookups, and to recover a real score for unscored advisories on direct ones.
