@@ -35,3 +35,16 @@ setup_file() {
     # key on exactly that, so the PR falls through to normal evaluation.
     grep -qF "steps.fast-track.conclusion == 'skipped'" <<<"$(extract_if gate1)"
 }
+
+# --- eligibility evidence (QAO-766) ---------------------------------------
+
+@test "every evaluation that did not fast-track records its verdict" {
+    # always(), so an evaluation that errors part-way still withdraws
+    # evidence an earlier run recorded for the same commit.
+    run extract_if record-eligibility
+    [ "$output" = "always() && steps.fast-track.conclusion != 'success'" ]
+}
+
+@test "the workflow token can write commit statuses" {
+    grep -qx '    statuses: write' "$WORKFLOW"
+}
