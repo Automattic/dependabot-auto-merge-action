@@ -54,9 +54,11 @@ status_post_key() {
     : >"$GH_STUB_DIR/$(status_post_key)"
     for gate3 in 'skipped:' 'success:true'; do
         : >"$GH_STUB_LOG"
+        : >"$GITHUB_OUTPUT"
         record true "${gate3%%:*}" "${gate3#*:}"
         log_has_call 'api' '-X POST' "statuses/$HEAD" 'state=success' \
             'context=dependabot-auto-merge/eligibility'
+        [ "$(out eligible)" = "true" ]
     done
 }
 
@@ -65,10 +67,12 @@ status_post_key() {
     statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
     for verdict in 'true:success:false' 'false:skipped:' ':skipped:' 'true:failure:'; do
         : >"$GH_STUB_LOG"
+        : >"$GITHUB_OUTPUT"
         IFS=: read -r gate2 gate3 gate3_pass <<<"$verdict"
         record "$gate2" "$gate3" "$gate3_pass"
         log_has_call '-X POST' "statuses/$HEAD" 'state=failure'
         [ "$(log_count 'state=success')" -eq 0 ]
+        [ "$(out eligible)" = "false" ]
     done
 }
 
@@ -78,6 +82,7 @@ status_post_key() {
     statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]' ci/build)"
     record false skipped
     [ "$(log_count '-X POST')" -eq 0 ]
+    [ "$(out eligible)" = "false" ]
 }
 
 @test "withdrawal ignores a success status someone else wrote" {
@@ -96,7 +101,9 @@ status_post_key() {
 }
 
 @test "a status write failure fails the step" {
-    # No POST fixture: the stub answers 404.
+    # No POST fixture: the stub answers 404. No verdict is written either,
+    # so revoke-auto-merge treats the PR as not eligible.
     run record true skipped
     [ "$status" -ne 0 ]
+    [ "$(out eligible)" = "" ]
 }

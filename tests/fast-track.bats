@@ -17,11 +17,13 @@ setup_file() {
     WORKFLOW="$REPO_ROOT/.github/workflows/dependabot-auto-merge.yml"
     export AUTH_STEP="$BATS_FILE_TMPDIR/fast-track-auth.sh"
     export AUDIT_STEP="$BATS_FILE_TMPDIR/fast-track-audit.sh"
+    export MERGE_STEP="$BATS_FILE_TMPDIR/fast-track.sh"
     extract_run fast-track-auth >"$AUTH_STEP"
     extract_run fast-track-audit >"$AUDIT_STEP"
+    extract_run fast-track >"$MERGE_STEP"
     # Guard the extractor: an empty or half-dedented script would pass the
     # refusal assertions below for the wrong reason.
-    for step in "$AUTH_STEP" "$AUDIT_STEP"; do
+    for step in "$AUTH_STEP" "$AUDIT_STEP" "$MERGE_STEP"; do
         [ -s "$step" ]
         bash -n "$step"
     done
@@ -227,4 +229,15 @@ authorize() {
     [ "$(log_count 'pr comment')" -eq 1 ]
     [ "$(log_count '@ada')" -eq 1 ]
     [ "$(log_count 'maintain')" -eq 1 ]
+}
+
+# --- merge ----------------------------------------------------------------
+
+@test "the fast-track merge is pinned to the evaluated head commit" {
+    # A head pushed after this event fired was not part of this evaluation,
+    # so GitHub must refuse to queue the merge for it.
+    MERGE_METHOD=squash HEAD_SHA=1111111111111111111111111111111111111111 \
+        bash --noprofile --norc -e "$MERGE_STEP"
+    log_has_call 'pr merge' '--auto' "$PR_URL" \
+        '--match-head-commit 1111111111111111111111111111111111111111'
 }
