@@ -11,15 +11,10 @@ on:
             - 'bin/**'
             - 'composer.json'
             - 'composer.lock'
+    # No path filter on pull requests. The main-branch ruleset requires the
+    # actionlint check, and a workflow skipped by a path filter never reports
+    # it, so a docs-only PR would wait on that check forever.
     pull_request:
-        paths:
-            - '.github/workflows/**'
-            - 'scripts/**'
-            - 'tests/**'
-            - 'src/**'
-            - 'bin/**'
-            - 'composer.json'
-            - 'composer.lock'
 
 jobs:
     actionlint:
