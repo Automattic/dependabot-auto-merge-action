@@ -1,0 +1,11 @@
+Scanning acme/widgets
+
+!  1 directory with a composer.json but no composer.lock — no entry was emitted:
+     /projects/plugins/d
+!  composer: '/projects/plugins/*' would also match sibling directories this run did not map — keeping singular entries
+Detected mappings:
+   composer: /projects/plugins/a
+   composer: /projects/plugins/b
+   composer: /projects/plugins/c
+
+Summary: 0 ok, 0 would change, 2 notes, 0 failed
