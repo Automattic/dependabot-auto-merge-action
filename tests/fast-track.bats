@@ -72,8 +72,12 @@ events_fixture() {
 # $1 = login, $2 = legacy permission, $3 = role name. The API maps maintain
 # to write and triage to read, which is exactly the split the step relies on.
 permission_fixture() {
+    # The step URI-encodes the login before the lookup, so a bracketed bot
+    # login keys the fixture as the stub sees the path, not as it is written.
+    local encoded
+    encoded=$(jq -rn --arg a "$1" '$a | @uri')
     printf '{"permission":"%s","role_name":"%s","user":{"login":"%s"}}' "$2" "$3" "$1" \
-        >"$GH_STUB_DIR/GET_repos_acme_widgets_collaborators_$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')_permission"
+        >"$GH_STUB_DIR/GET_repos_acme_widgets_collaborators_$(printf '%s' "$encoded" | tr -c 'A-Za-z0-9' '_')_permission"
 }
 
 # The flags match what the step's `shell: bash` expands to in Actions.
@@ -91,6 +95,19 @@ authorize() {
     [ "$(out authorized)" = "false" ]
     grep -qF '::warning::' <<<"$output"
     grep -qF 'triage' <<<"$output"
+    [ "$(log_count 'pr merge')" -eq 0 ]
+}
+
+@test "a non-collaborator's label does not authorize the override" {
+    # The API answers 200 with "none" for a login that is not a collaborator,
+    # bots among them. It only 404s for a login that is not a user at all.
+    events_fixture "$(label_event 1 labeled 'renovate[bot]' security-fast-track)"
+    permission_fixture 'renovate[bot]' none ''
+    run authorize
+    [ "$status" -eq 0 ]
+    [ "$(out authorized)" = "false" ]
+    grep -qF '::warning::' <<<"$output"
+    grep -qF 'none' <<<"$output"
     [ "$(log_count 'pr merge')" -eq 0 ]
 }
 
@@ -202,7 +219,7 @@ authorize() {
 
 @test "a permission lookup failure refuses the override" {
     # No permission fixture: the stub answers 404, as the API does for a
-    # login that is not a collaborator, a bot among them.
+    # login that is not a GitHub user at all.
     events_fixture "$(label_event 1 labeled 'renovate[bot]' security-fast-track)"
     run authorize
     [ "$status" -eq 0 ]

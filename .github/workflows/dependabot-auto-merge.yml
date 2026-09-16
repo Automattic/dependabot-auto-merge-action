@@ -199,10 +199,11 @@ jobs:
                       refuse "no current application of the $FAST_TRACK_LABEL label was found in the PR's history."
                   fi
 
-                  # The API answers 404 for a login that is not a
-                  # collaborator, bots included, and that refuses too.
-                  # `permission` maps maintain to write and triage to read,
-                  # so write and admin are exactly the roles that can merge.
+                  # A login that is not a collaborator, bots among them,
+                  # comes back as "none", and one that is not a user at all
+                  # answers 404. Both refuse. `permission` maps maintain to
+                  # write and triage to read, so write and admin are exactly
+                  # the roles that can merge.
                   ENC_ACTOR=$(jq -rn --arg a "$ACTOR" '$a | @uri')
                   if ! PERMISSION=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ENC_ACTOR/permission" 2>&1); then
                       refuse "cannot read the repository permission of @$ACTOR, who applied the label. $(echo "$PERMISSION" | head -c 300 | tr '\n' ' ')"
