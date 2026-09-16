@@ -47,7 +47,10 @@ on:
 permissions:
     pull-requests: write
     contents: write
-    security-events: read
+    # Dependabot alerts, for fetch-metadata's alert lookup and the Gate 1
+    # fallback. security-events does not cover them: with it alone the REST
+    # list is a 403 and the GraphQL field returns no alerts.
+    vulnerability-alerts: read
     # evaluate-pr records its verdict as a commit status, and the scheduled
     # merge reads it back. Labels cannot carry that verdict: a triage user
     # can change them.

@@ -62,9 +62,9 @@ gate1() {
     grep -qxF 'compat-lookup: true' <<<"$with"
 }
 
-# The alert lookup reads Dependabot alerts, which GITHUB_TOKEN cannot do in
-# many orgs. It has to use the caller's alerts token, the same one the
-# fallback uses, or a caller who configured `secrets.token` still fails here.
+# The alert lookup reads Dependabot alerts. It has to use the same token as
+# the fallback, or a caller who configured `secrets.token` still reads them
+# with a GITHUB_TOKEN that may lack the permission.
 @test "the alert lookup uses the same token as the alerts fallback" {
     token=$(extract_key meta with | sed -n 's/^github-token: //p')
     fallback_token=$(extract_key gate1-fallback env | sed -n 's/^GH_TOKEN: //p')

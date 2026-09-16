@@ -32,7 +32,7 @@ on:
 permissions:
     pull-requests: write
     contents: write
-    security-events: read
+    vulnerability-alerts: read
     statuses: write
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
         permissions:
             pull-requests: write
             contents: write
-            security-events: read
+            vulnerability-alerts: read
             statuses: write
         with:
             event-name: ${{ github.event_name }}
@@ -170,7 +170,7 @@ Your default branch needs a branch protection rule (or ruleset) with at least on
 
 Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fully verify ruleset-based required status checks with the default `GITHUB_TOKEN`. Classic branch protection details are only readable by admin tokens, so with classic protection the preflight can confirm the branch is protected but only warns that it cannot verify the checks themselves. If neither is configured, preflight fails with an error pointing back here. (`scripts/bootstrap.sh` creates a ruleset, so bootstrapped repos are fully verifiable by preflight.)
 
-Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**). Gate 1 reads them twice, once through fetch-metadata's alert lookup and again through the Dependabot alerts API when that lookup names no advisory or an unscored one.
+Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**). Gate 1 reads them twice, once through fetch-metadata's alert lookup and again through the Dependabot alerts API when that lookup names no advisory or an unscored one. In practice the second read finds the advisory: fetch-metadata v3.1.0 matches an alert only when its vulnerable requirement reads `= <version>`, and GitHub now reports the bare version, so the lookup names nothing and the fallback carries the gate.
 
 ## Inputs
 
@@ -190,7 +190,7 @@ Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Se
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `token` | No | Token used to read Dependabot alerts, both by `dependabot/fetch-metadata` (its alert lookup, which also lists the PR's commits) and by the Gate 1 fallback. Defaults to `GITHUB_TOKEN`. Pass a PAT or fine-grained token when `GITHUB_TOKEN` cannot read Dependabot alerts, which is common. A fine-grained token needs **Dependabot alerts: Read** and, from v1.6, **Pull requests: Read**. |
+| `token` | No | Token used to read Dependabot alerts, both by `dependabot/fetch-metadata` (its alert lookup, which also lists the PR's commits) and by the Gate 1 fallback. Defaults to `GITHUB_TOKEN`, which reads them once the job grants `vulnerability-alerts: read`. Pass a PAT or fine-grained token only where that permission is unavailable. A fine-grained token needs **Dependabot alerts: Read** and, from v1.6, **Pull requests: Read**. |
 
 ## Customisation examples
 
@@ -230,26 +230,28 @@ The calling job must declare:
 permissions:
     pull-requests: write   # label and comment on PRs, read label history
     contents: write        # enable auto-merge
-    security-events: read  # read Dependabot alerts API
+    vulnerability-alerts: read  # read Dependabot alerts
     statuses: write        # record and read eligibility evidence
 ```
 
 These are the minimum required. The fast-track check reads the PR's issue events, which `pull-requests` covers, and the label applier's repository permission, which only needs the Metadata read access every `GITHUB_TOKEN` has. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
 
-**`statuses: write` is a breaking change for callers pinned at v1.5 or earlier.** Add it to both `permissions` blocks when you re-pin. Without it GitHub refuses to start the reusable workflow, because a called workflow cannot hold a permission its caller did not grant. The workflow writes a `dependabot-auto-merge/eligibility` commit status when a PR passes the gates, and the scheduled merge will not act on a PR without one. See [How it works](#scheduled-merge-job-triggers-on-schedule) for why a label is not enough.
+**`statuses: write` and `vulnerability-alerts: read` are breaking changes for callers pinned at v1.5 or earlier.** Add both to both `permissions` blocks when you re-pin, and drop `security-events: read`, which the workflow no longer requests. Without them GitHub refuses to start the reusable workflow, because a called workflow cannot hold a permission its caller did not grant. The workflow writes a `dependabot-auto-merge/eligibility` commit status when a PR passes the gates, and the scheduled merge will not act on a PR without one. See [How it works](#scheduled-merge-job-triggers-on-schedule) for why a label is not enough.
 
 Add `unlabeled` to the caller's `pull_request_target` types at the same time. Removing the `fast-track-label` is how a reviewer withdraws an override, and without that trigger the workflow never learns of it, so the auto-merge the override queued stays queued. Removing any other label is ignored.
 
 ### When the token cannot read Dependabot alerts
 
-`GITHUB_TOKEN` often cannot read Dependabot alerts, even when `security-events: read` is declared. From v1.6 that shows up first in the `dependabot/fetch-metadata` step, whose alert lookup reads the same alerts. That step fails, and the job with it, before any gate runs. On v1.5 and earlier the Gate 1 fallback step failed the job instead.
+`security-events: read` does not grant Dependabot alerts. A `GITHUB_TOKEN` without `vulnerability-alerts: read` gets a 403 from the alerts API, and the GraphQL field fetch-metadata's alert lookup uses returns an empty list instead of an error. So the `dependabot/fetch-metadata` step passes with no advisory named, and the Gate 1 fallback step fails the job with `Resource not accessible by integration`. The fix is to grant `vulnerability-alerts: read` on the caller job and at the top of the caller workflow, as in the usage example.
+
+Where that permission is unavailable, pass a token instead.
 
 If the lookup succeeds but the later Dependabot alerts API call fails, what happens depends on why the API was called:
 
 - **PR metadata named no advisory.** The API is the only advisory source, so the Gate 1 fallback step fails the job.
 - **PR metadata named an unscored advisory.** The API call is a best-effort attempt to recover a real score, so a failure only logs a warning and the PR goes to human review, exactly as if the API had never been consulted. The job stays green.
 
-The fix is to create a PAT, or a fine-grained token with **Dependabot alerts: Read** and **Pull requests: Read** on the target repo, and pass it as a secret:
+Create a PAT, or a fine-grained token with **Dependabot alerts: Read** and **Pull requests: Read** on the target repo, and pass it as a secret. A token scoped to alerts alone fails the `dependabot/fetch-metadata` step with `Resource not accessible by personal access token` when it lists the PR's commits:
 
 ```yaml
 jobs:
@@ -258,7 +260,7 @@ jobs:
         permissions:
             pull-requests: write
             contents: write
-            security-events: read
+            vulnerability-alerts: read
             statuses: write
         with:
             event-name: ${{ github.event_name }}
@@ -374,5 +376,5 @@ Limits of the evidence: any other workflow in your repo that holds `statuses: wr
 - The scheduled merge trusts a commit status on the PR's current head, not its labels. Triage users can change labels but cannot write statuses.
 - A queued auto-merge is withdrawn when a later evaluation rejects the PR or the fast-track override is removed, and both merge paths refuse a head commit that was not the one evaluated.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
-- `security-events: read` is required to read Dependabot alerts, both in fetch-metadata's alert lookup and in the Gate 1 fallback. Where `GITHUB_TOKEN` still cannot read them, pass `secrets.token`.
+- `vulnerability-alerts: read` is required to read Dependabot alerts, both in fetch-metadata's alert lookup and in the Gate 1 fallback. Where `GITHUB_TOKEN` cannot hold that permission, pass `secrets.token`.
 - The `token` secret reaches `dependabot/fetch-metadata`, a pinned third-party action, as well as the workflow's own `gh` calls. Scope it to Dependabot alerts and pull requests, read only.
