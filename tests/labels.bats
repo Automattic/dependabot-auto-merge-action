@@ -85,6 +85,33 @@ run_step() {
     [ "$(log_count '@security')" -eq 1 ]
 }
 
+# Gate 3 fails in two ways that need different reviewer action. Either a
+# real score is below the threshold, or there is no score at all.
+# fetch-metadata spells the second as 0, so without its own reason it read
+# as "0% is below 80%".
+@test "an unavailable compatibility score is named as unavailable" {
+    METADATA_AVAILABLE=true GATE2_PASS=true GATE3_AVAILABLE=false \
+        COMPAT_SCORE='' COMPAT_DEPENDENCY=minimist COMPAT_THRESHOLD=80 \
+        REVIEW_TEAM='' REVIEW_LABEL=sirt-review-required \
+        PENDING_LABEL=auto-merge-pending \
+        run_step "$REVIEW_STEP"
+    [ "$(log_count 'pr comment')" -eq 1 ]
+    [ "$(log_count 'unavailable')" -eq 1 ]
+    [ "$(log_count 'minimist')" -eq 1 ]
+    [ "$(log_count 'below')" -eq 0 ]
+}
+
+@test "a below-threshold compatibility score names the dependency and score" {
+    METADATA_AVAILABLE=true GATE2_PASS=true GATE3_AVAILABLE=true \
+        COMPAT_SCORE=60 COMPAT_DEPENDENCY=minimist COMPAT_THRESHOLD=80 \
+        REVIEW_TEAM='' REVIEW_LABEL=sirt-review-required \
+        PENDING_LABEL=auto-merge-pending \
+        run_step "$REVIEW_STEP"
+    [ "$(log_count 'minimist')" -eq 1 ]
+    [ "$(log_count '60%')" -eq 1 ]
+    [ "$(log_count '80%')" -eq 1 ]
+}
+
 # --- review -> pass -------------------------------------------------------
 
 @test "marking pending sheds the review label in the same edit" {
