@@ -151,11 +151,88 @@ jobs:
             - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
               id: meta
 
-            # Human override: a reviewer has verified this is a legitimate security
-            # fix. Bypass all automated gates and enable auto-merge immediately.
+            # The fast-track label bypasses every gate, but applying a label
+            # only takes triage, while enabling auto-merge takes write. So the
+            # label counts only when the user who most recently applied it
+            # could have merged the PR themselves. The running event cannot
+            # say who that was: on a `synchronize` the sender is Dependabot,
+            # and a label applied long ago rides along on every later event.
+            # The issue events API records each application with its actor.
+            #
+            # Every failure refuses the override. The step itself still
+            # succeeds, so the fast-track step is skipped and the PR falls
+            # through to the normal gates, as if the label were absent.
+            - name: Fast-track authorization check
+              id: fast-track-auth
+              if: contains(github.event.pull_request.labels.*.name, inputs.fast-track-label)
+              # Explicit so the step runs under `-e -o pipefail` and the bats
+              # suite can drive the extracted script with exactly these flags.
+              shell: bash
+              run: |
+                  refuse() {
+                      echo "::warning::Fast-track override refused: $1 Falling through to the normal gates."
+                      echo "authorized=false" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  }
+
+                  if ! EVENTS=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/events?per_page=100" 2>&1); then
+                      refuse "cannot read the label history. $(echo "$EVENTS" | head -c 300 | tr '\n' ' ')"
+                  fi
+
+                  # Latest labeled or unlabeled event for this label, sorted
+                  # rather than taken in response order. An unlabeled event
+                  # there means the label came off after this event fired.
+                  # Label names compare case-insensitively, as everywhere else
+                  # in this workflow.
+                  if ! LATEST=$(echo "$EVENTS" | jq -c --arg label "$FAST_TRACK_LABEL" '
+                      [.[][]
+                       | select(.event == "labeled" or .event == "unlabeled")
+                       | select((.label.name // "" | ascii_downcase) == ($label | ascii_downcase))]
+                      | sort_by(.created_at, .id) | last
+                      | {event: (.event // ""), actor: (.actor.login // "")}' 2>&1); then
+                      refuse "cannot parse the label history."
+                  fi
+
+                  EVENT=$(echo "$LATEST" | jq -r '.event')
+                  ACTOR=$(echo "$LATEST" | jq -r '.actor')
+                  if [ "$EVENT" != "labeled" ] || [ -z "$ACTOR" ]; then
+                      refuse "no current application of the $FAST_TRACK_LABEL label was found in the PR's history."
+                  fi
+
+                  # A login that is not a collaborator, bots among them,
+                  # comes back as "none", and one that is not a user at all
+                  # answers 404. Both refuse. `permission` maps maintain to
+                  # write and triage to read, so write and admin are exactly
+                  # the roles that can merge.
+                  ENC_ACTOR=$(jq -rn --arg a "$ACTOR" '$a | @uri')
+                  if ! PERMISSION=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ENC_ACTOR/permission" 2>&1); then
+                      refuse "cannot read the repository permission of @$ACTOR, who applied the label. $(echo "$PERMISSION" | head -c 300 | tr '\n' ' ')"
+                  fi
+                  LEVEL=$(echo "$PERMISSION" | jq -r '.permission // ""' 2>/dev/null || true)
+                  ROLE=$(echo "$PERMISSION" | jq -r '.role_name // ""' 2>/dev/null || true)
+
+                  case "$LEVEL" in
+                      admin | write)
+                          echo "authorized=true" >> "$GITHUB_OUTPUT"
+                          echo "applied-by=$ACTOR" >> "$GITHUB_OUTPUT"
+                          echo "role=${ROLE:-$LEVEL}" >> "$GITHUB_OUTPUT"
+                          echo "The $FAST_TRACK_LABEL label was applied by @$ACTOR (${ROLE:-$LEVEL}), who can merge."
+                          ;;
+                      *)
+                          refuse "@$ACTOR applied the $FAST_TRACK_LABEL label but has the '${ROLE:-${LEVEL:-unknown}}' role, and only write, maintain or admin can authorize a merge."
+                          ;;
+                  esac
+              env:
+                  FAST_TRACK_LABEL: ${{ inputs.fast-track-label }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # Human override: a reviewer who can merge has verified this is a
+            # legitimate security fix. Bypass all automated gates and enable
+            # auto-merge immediately.
             - name: Fast-track — human-verified override (bypasses all gates)
               id: fast-track
-              if: contains(github.event.pull_request.labels.*.name, inputs.fast-track-label)
+              if: steps.fast-track-auth.outputs.authorized == 'true'
               run: |
                   gh pr merge --auto --"$MERGE_METHOD" "$PR_URL"
               env:
@@ -165,9 +242,11 @@ jobs:
 
             # Audit trail: the fast-track path enables auto-merge silently, so
             # record who applied the label, when, and the workflow run on the PR.
-            # The hidden marker makes this exactly-once: repeated synchronize
-            # events find it in an existing comment and skip.
+            # The applier is the one the authorization step verified, not the
+            # event sender. The hidden marker makes this exactly-once: repeated
+            # synchronize events find it in an existing comment and skip.
             - name: Fast-track — post audit comment (once)
+              id: fast-track-audit
               if: steps.fast-track.conclusion == 'success'
               run: |
                   MARKER='<!-- dependabot-auto-merge:fast-track-audit -->'
@@ -178,19 +257,13 @@ jobs:
                       exit 0
                   fi
 
-                  if [ "$EVENT_ACTION" = "labeled" ] && [ "$LABEL_NAME" = "$FAST_TRACK_LABEL" ]; then
-                      APPLIED_BY="@$SENDER"
-                  else
-                      APPLIED_BY="not recorded — the label was already present when this $EVENT_ACTION event ran"
-                  fi
-
                   TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
                   BODY=$(cat <<EOF
                   $MARKER
                   **Fast-track audit** — auto-merge was enabled on this PR via the **$FAST_TRACK_LABEL** label, bypassing all gates.
 
-                  - **Label applied by:** $APPLIED_BY
+                  - **Label applied by:** @$APPLIED_BY ($ROLE)
                   - **When (UTC):** $TIMESTAMP
                   - **Workflow run:** $RUN_URL
                   EOF
@@ -198,9 +271,8 @@ jobs:
 
                   gh pr comment "$PR_URL" --body "$BODY"
               env:
-                  EVENT_ACTION: ${{ github.event.action }}
-                  LABEL_NAME: ${{ github.event.label.name }}
-                  SENDER: ${{ github.event.sender.login }}
+                  APPLIED_BY: ${{ steps.fast-track-auth.outputs.applied-by }}
+                  ROLE: ${{ steps.fast-track-auth.outputs.role }}
                   FAST_TRACK_LABEL: ${{ inputs.fast-track-label }}
                   PR_NUMBER: ${{ github.event.pull_request.number }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
