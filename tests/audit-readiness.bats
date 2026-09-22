@@ -394,12 +394,30 @@ rec() {
     [[ "$(rec .checks.dependabot_config.detail)" == *".yml"* ]]
 }
 
-@test "no config and no manifest is n/a, not a failure" {
+@test "no manifest anywhere is n/a, not a failure" {
     repo_set '. * {depYml: null, depYaml: null, caller: null,
                    root: {entries: [{name: "README.md", type: "blob"}]}}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"README.md"},{"type":"blob","path":"src/thing.php"}]}
+EOF
     run_audit
     [ "$(rec .checks.dependabot_config.status)" = "na" ]
     [ "$(rec .verdict)" = "na" ]
+    [ "$(rec .wave.band)" = "null" ]
+}
+
+@test "manifests only in subdirectories are found, not read as no dependencies" {
+    # Keying manifest detection on the root tree alone dropped these repos out
+    # of the rollout entirely while reporting them as having nothing to scan.
+    repo_set '. * {depYml: null, depYaml: null,
+                   root: {entries: [{name: "README.md", type: "blob"}]}}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"README.md"},{"type":"blob","path":"packages/a/package.json"},{"type":"blob","path":"packages/b/composer.json"}]}
+EOF
+    run_audit
+    [ "$(rec .checks.dependabot_config.status)" = "fail" ]
+    [ "$(rec .verdict)" != "na" ]
+    [[ "$(rec .checks.dependabot_config.detail)" == *"packages/a/package.json"* ]]
 }
 
 @test "no config passes when every manifest is at the root" {
@@ -676,6 +694,19 @@ EOF
 }
 
 # --- scope, output and concurrency --------------------------------------------
+
+@test "an n/a repo is kept out of the wave bands" {
+    # A repo that cannot produce a Dependabot PR is the worst pilot candidate,
+    # and being dormant sorts it to the front of the queue.
+    repo_set '. * {depYml: null, depYaml: null, caller: null,
+                   root: {entries: [{name: "README.md", type: "blob"}]}}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"README.md"}]}
+EOF
+    run_audit
+    [ "$(rec .wave.band)" = "null" ]
+    [ "$(rec '.wave.score | type')" = "number" ]
+}
 
 @test "archived repos are excluded by default and included on request" {
     repo_set '. * {isArchived: true}'

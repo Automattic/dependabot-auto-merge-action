@@ -579,7 +579,7 @@ phase_activity() {
 
 probe_repo() {
     local repo=$1 node branch enc out
-    local checks_status="" checks_detail="" config_status="" config_detail=""
+    local checks_status="" checks_detail="" config_status="" config_detail="" manifest_count=""
 
     node=$(jq -c --arg r "$repo" 'select(.nameWithOwner == $r)' "$AUDIT_WORK/nodes.jsonl" | head -1)
     if [[ -z $node ]]; then
@@ -636,9 +636,12 @@ probe_repo() {
     # preflight, its security PRs ship without lockfile updates, CI stays red
     # and auto-merge never fires. So the question is not "is there a config"
     # but "is there a manifest the defaults would miss".
-    if [[ $(jq -r 'if .depYml == null and .depYaml == null
-                      and ((.root.entries // []) | any(.type == "blob" and (.name == "package.json" or .name == "composer.json")))
-                   then "yes" else "no" end' <<<"$node") == yes ]]; then
+    # Runs for any repo without a config, not just ones with a root manifest.
+    # Keying it on the root tree missed repos whose manifests live only in
+    # subdirectories: they read as having no dependencies at all and dropped out
+    # of the rollout silently, which is the exact shape of failure this audit
+    # exists to surface.
+    if [[ $(jq -r 'if .depYml == null and .depYaml == null then "yes" else "no" end' <<<"$node") == yes ]]; then
         if [[ -z $branch ]]; then
             config_status=unknown
             config_detail="no default branch"
@@ -651,7 +654,15 @@ probe_repo() {
             config_status=unknown
             config_detail="the file tree is truncated; run bin/dependabot-directories to map this repo"
         else
-            local nested
+            local manifests nested
+            manifests=$(jq -r '
+                [.tree[]
+                 | select(.type == "blob")
+                 | select(.path | test("(^|/)(package|composer)\\.json$"))
+                 | select(.path | test("(^|/)(node_modules|vendor|bower_components|\\.git)/") | not)
+                 | select(.path | test("(^|/)(fixtures|__fixtures__|testdata|examples|example|dist|build|\\.next|coverage)/") | not)
+                 | .path]
+                | length' <<<"$out" 2>/dev/null)
             nested=$(jq -r '
                 [.tree[]
                  | select(.type == "blob")
@@ -660,7 +671,11 @@ probe_repo() {
                  | select(.path | test("(^|/)(fixtures|__fixtures__|testdata|examples|example|dist|build|\\.next|coverage)/") | not)
                  | .path]
                 | .[0:3] | join(", ")' <<<"$out" 2>/dev/null)
-            if [[ -n $nested ]]; then
+            manifest_count=${manifests:-0}
+            if [[ ${manifests:-0} -eq 0 ]]; then
+                config_status=na
+                config_detail="no npm or Composer manifest anywhere in the repository"
+            elif [[ -n $nested ]]; then
                 config_status=fail
                 config_detail="manifests outside the root need explicit directory mappings (e.g. $nested); run bin/dependabot-directories"
             else
@@ -672,10 +687,13 @@ probe_repo() {
 
     jq -cn --arg r "$repo" \
         --arg cs "$checks_status" --arg cd "$checks_detail" \
-        --arg gs "$config_status" --arg gd "$config_detail" \
+        --arg gs "$config_status" --arg gd "$config_detail" --arg mc "$manifest_count" \
         '{repo: $r}
          + (if $cs == "" then {} else {required_checks: {status: $cs, detail: $cd, source: "rest"}} end)
-         + (if $gs == "" then {} else {dependabot_config: {status: $gs, detail: $gd, source: "rest"}} end)'
+         + (if $gs == "" then {} else
+              {dependabot_config: {status: $gs, detail: $gd, source: "rest",
+                                   manifest_count: (if $mc == "" then null else ($mc | tonumber) end)}}
+            end)'
 }
 
 phase_narrow() {
@@ -685,7 +703,9 @@ phase_narrow() {
     # visible in the bulk sweep. Everything else was already answered for free.
     # A repo lands here if the bulk sweep could not answer either of the two
     # questions REST can settle: whether the default branch requires a check,
-    # and whether any manifest sits outside the root.
+    # and, for any repo without a config, where its manifests actually live.
+    # The second one deliberately does not pre-filter on a root manifest. That
+    # is what hid repos whose manifests live only in subdirectories.
     jq -r '
         select(.isArchived == false and .isFork == false and .isDisabled == false)
         | select(
@@ -694,11 +714,7 @@ phase_narrow() {
               and (.defaultBranchRef.branchProtectionRule // null) == null
               and .defaultBranchRef != null
             )
-            or
-            (
-              .depYml == null and .depYaml == null
-              and ((.root.entries // []) | any(.type == "blob" and (.name == "package.json" or .name == "composer.json")))
-            )
+            or (.depYml == null and .depYaml == null)
           )
         | .nameWithOwner
     ' "$WORK/nodes.jsonl" | sort -u >"$WORK/todo"
@@ -822,7 +838,9 @@ assemble() {
           | ($n.viewerPermission // "READ") as $perm
           | (["ADMIN","MAINTAIN","WRITE"] | index($perm)) as $write_access
           | ($write_access != null) as $trusted
-          | has_manifest($n) as $manifest
+          | narrow_for($repo) as $nr_early
+          | (has_manifest($n)
+             or (($nr_early.dependabot_config.manifest_count // 0) > 0)) as $manifest
           | (($n.depYml != null) or ($n.depYaml != null)) as $any_config
           | ($manifest or $any_config) as $applicable
           | (($n.defaultBranchRef.rules.nodes // [])
@@ -905,10 +923,10 @@ assemble() {
                     check("pass"; ".github/dependabot.yml present (\($n.depYml.byteSize) bytes)"; "graphql")
                   elif ($n.depYaml != null) then
                     check("fail"; ".github/dependabot.yaml present but Dependabot only reads .yml — rename it"; "graphql")
-                  elif ($manifest | not) then
-                    check("na"; "no npm or Composer manifest at the repository root"; "graphql")
                   elif ($nr.dependabot_config != null) then
                     check($nr.dependabot_config.status; $nr.dependabot_config.detail; "rest")
+                  elif ($manifest | not) then
+                    check("na"; "no npm or Composer manifest found"; "graphql")
                   else
                     check("unknown"; "could not determine whether a config is needed"; "graphql")
                   end),
@@ -1054,14 +1072,15 @@ assemble() {
         # first, then widening waves. `score` is the stable number; `band` only
         # means anything relative to the other repos in the same run.
         | . as $recs
-        | ($recs | map(.wave.score) | sort) as $sorted
+        | ($recs | map(select(.verdict != "na") | .wave.score) | sort) as $sorted
         | ($sorted | length) as $n
         | (if $n == 0 then 0 else $sorted[((($n - 1) * 10) / 100) | floor] end) as $t1
         | (if $n == 0 then 0 else $sorted[((($n - 1) * 40) / 100) | floor] end) as $t2
         | (if $n == 0 then 0 else $sorted[((($n - 1) * 75) / 100) | floor] end) as $t3
         | $recs
         | map(.wave.band = (
-              if   .wave.score <= $t1 then 1
+              if .verdict == "na" then null
+              elif .wave.score <= $t1 then 1
               elif .wave.score <= $t2 then 2
               elif .wave.score <= $t3 then 3
               else 4 end))
@@ -1143,8 +1162,9 @@ render_summary() {
           ($all | map(.risks[].id) | group_by(.) | map({k: .[0], n: length})
                 | sort_by(-.n) | .[] | "  \(.n | tostring | (. + "    ")[0:4]) \(.k)"),
           "",
-          "Wave bands (roll out lowest first):",
-          ($all | group_by(.wave.band) | .[] | "  band \(.[0].wave.band)  \(length) repos")
+          "Wave bands (roll out lowest first; n/a repos are excluded):",
+          ($all | map(select(.wave.band != null)) | group_by(.wave.band) | .[]
+                | "  band \(.[0].wave.band)  \(length) repos")
     '
 }
 
