@@ -12,6 +12,17 @@
 #   neither     "HTTP 404"-style error to stderr, exit 1 (matches how the
 #               bootstrap script distinguishes absent resources)
 #
+# `gh api graphql` responses are keyed "graphql_<OperationName>", taken from
+# the document passed as -f query=. Every operation the scripts send is named
+# for exactly this reason; an anonymous document is a stub error, not a silent
+# miss. When "<key>.1" exists the fixtures are served in sequence (.1, .2, ...),
+# which is how a paginated --slurp run and per-page error injection are
+# expressed.
+#
+# With -i, the response is prefixed with a status line and
+# X-Ratelimit-Remaining (from $GH_STUB_RATELIMIT, default 4999) so the rate
+# brake can be exercised. A "<key>.headers" file overrides that block.
+#
 # `gh pr <sub>` responses use the same scheme keyed "pr_<sub>". Without a
 # fixture, the mutating subcommands (edit/comment/merge) succeed bodiless —
 # most tests only assert on the log — but `pr list` fails: its callers feed
@@ -60,20 +71,34 @@ shift
 method=GET
 path=""
 jq_filter=""
+gql_doc=""
+include_headers=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         -X)
             method=$2
             shift 2
             ;;
-        --jq)
+        --jq | -q)
             jq_filter=$2
             shift 2
             ;;
         --input)
             shift 2
             ;;
-        --paginate | -*)
+        -f | -F)
+            # Typed/raw fields. Only the GraphQL document changes what we
+            # serve; the variables are already in the log for assertions.
+            case $2 in
+                query=*) gql_doc=${2#query=} ;;
+            esac
+            shift 2
+            ;;
+        -i | --include)
+            include_headers=true
+            shift
+            ;;
+        --paginate | --slurp | -*)
             shift
             ;;
         *)
@@ -83,9 +108,39 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-key="${method}_$(printf '%s' "$path" | tr -c 'A-Za-z0-9' '_')"
+if [[ $path == graphql ]]; then
+    op=$(printf '%s' "$gql_doc" | sed -n 's/^[[:space:]]*query \([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' | head -1)
+    if [[ -z $op ]]; then
+        printf 'gh-stub: anonymous graphql document — name every operation\n' >&2
+        exit 64
+    fi
+    key="graphql_$op"
+else
+    key="${method}_$(printf '%s' "$path" | tr -c 'A-Za-z0-9' '_')"
+fi
+
+# Sequenced fixtures: serve <key>.1, <key>.2, ... in order when they exist.
+if [[ -f $GH_STUB_DIR/$key.1 ]]; then
+    seq_file="$GH_STUB_DIR/.seq_$key"
+    n=$(cat "$seq_file" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    printf '%s' "$n" >"$seq_file"
+    [[ -f $GH_STUB_DIR/$key.$n ]] && key="$key.$n"
+fi
+
+emit_headers() {
+    [[ $include_headers == true ]] || return 0
+    if [[ -f $GH_STUB_DIR/$key.headers ]]; then
+        cat "$GH_STUB_DIR/$key.headers"
+    else
+        printf 'HTTP/2.0 200 OK\n'
+        printf 'X-Ratelimit-Remaining: %s\n' "${GH_STUB_RATELIMIT:-4999}"
+    fi
+    printf '\n'
+}
 
 if [[ -f $GH_STUB_DIR/$key ]]; then
+    emit_headers
     if [[ -n $jq_filter ]]; then
         jq -r "$jq_filter" <"$GH_STUB_DIR/$key"
     else

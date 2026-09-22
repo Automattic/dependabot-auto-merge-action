@@ -170,6 +170,51 @@ Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fu
 
 Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**) — the Gate 1 fallback queries the Dependabot Alerts API for indirect dependencies and for unscored advisories on direct ones.
 
+## Auditing readiness across an organisation
+
+[`scripts/audit-readiness.sh`](scripts/audit-readiness.sh) reports which repositories are ready for this workflow and what each one is missing. It is the read-only inverse of `bootstrap.sh`: it never issues a non-GET request, so it is safe to hand to anyone who wants to check their own repositories before agreeing to anything.
+
+```bash
+./scripts/audit-readiness.sh --repo owner/repo
+./scripts/audit-readiness.sh --org my-org --format summary --format team
+```
+
+`--repo` is repeatable and needs no organisation read access, so a team lead can audit exactly their own repositories. `--org` sweeps a whole organisation.
+
+### Every check reports one of four states
+
+| State | Meaning |
+|-------|---------|
+| `pass` | configured |
+| `fail` | positively observed as not configured |
+| `unknown` | your token cannot see it |
+| `na` | the repo has no npm or Composer manifest, so the check cannot apply |
+
+**`unknown` is not `fail`.** Several of the settings this audit reads are only visible to a token with write or admin access, and classic branch protection details need admin outright. A repo you cannot fully see is reported `unknown`, never as broken. A repo is `ready` only when nothing failed and nothing is unknown.
+
+### What it checks
+
+1. `Allow auto-merge` is enabled.
+2. The default branch has at least one required status check. This reproduces the preflight job's logic exactly, rulesets first and classic branch protection as the fallback, so a repo the audit calls `ready` is one preflight will not fail.
+3. The three labels exist, compared case-insensitively because the Actions runtime is.
+4. Dependabot vulnerability alerts are enabled.
+5. `.github/dependabot.yml` exists. A `.github/dependabot.yaml` is a failure, because Dependabot only reads `.yml`.
+6. The caller workflow is present and well formed: both triggers, `labeled` in `types`, a commit SHA rather than a tag, and complete `permissions` in both the workflow-level and job-level blocks.
+7. The repo allows the merge method the workflow is configured to use. Nothing else catches this, and a repo with squash disabled passes preflight and then fails at `gh pr merge --auto --squash`.
+
+It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, label colour drift, and "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside.
+
+### Output
+
+`--out-dir` (default `.audit`) always receives `repos.jsonl`, one JSON record per repository, plus a `run.json` describing the run. `--format` selects the rendered views: `table`, `team`, `summary`, `csv` or `jsonl`, and is repeatable. `--from-jsonl` re-renders a previous run's artifact and issues no API call at all.
+
+Filters apply to the views, not the artifact: `--team`, `--status`, `--wave`, `--has-dependabot-config`.
+
+### Team ownership
+
+With `--org`, the audit guesses an owning team for each repository: the smallest team holding admin or maintain, after dropping bot teams by name and org-wide teams by size (`--max-team-size`, default 25% of the in-scope repositories). Use `--explain-owners` to see why each team was kept or dropped, and [`scripts/audit-team-overrides.tsv`](scripts/audit-team-overrides.tsv) to correct the cases it gets wrong. A repository the heuristic cannot place is reported as unassigned, never guessed.
+
+
 ## Inputs
 
 | Input | Type | Default | Description |
@@ -188,7 +233,9 @@ Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Se
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `token` | No | Token used to call the Dependabot alerts API (Gate 1 fallback). Defaults to `GITHUB_TOKEN`. Pass a PAT or fine-grained token when `GITHUB_TOKEN` lacks `security-events: read` access — common in orgs with restricted default permissions. |
+| `token` | **Yes, in practice** | Token used to call the Dependabot alerts API (Gate 1 fallback). Defaults to `GITHUB_TOKEN`, which cannot read that API at all — see below. Without this secret, every security PR for an indirect dependency fails the job. |
+
+`token` is declared optional so the workflow still starts without it, but any repository with indirect dependencies needs it. `GITHUB_TOKEN` is not a substitute.
 
 ## Customisation examples
 
@@ -233,14 +280,24 @@ permissions:
 
 These are the minimum required. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
 
-### When GITHUB_TOKEN returns 403 on the Dependabot alerts API
+### GITHUB_TOKEN cannot read the Dependabot alerts API
 
-Some organisations restrict `GITHUB_TOKEN` so it cannot read security events, even when `security-events: read` is declared. What a 403 does then depends on why the API was called:
+This is not a misconfiguration you can fix in your org settings. `security-events: read` does not cover Dependabot alerts, and the GitHub Actions app that `GITHUB_TOKEN` is minted for cannot hold the permission that endpoint requires. The call returns:
+
+```
+HTTP 403: Resource not accessible by integration
+```
+
+Confirmed in production on eight repositories with `SecurityEvents: read` granted on the run and no org-level restriction in place. Only a GitHub App granted **Dependabot alerts: Read**, or a PAT with the equivalent, can read it.
+
+What the 403 costs depends on why the API was called:
 
 - **Indirect dependency** — the API is the only advisory source, so the Gate 1 fallback step fails the job.
 - **Direct dependency with an unscored advisory** — the API call is a best-effort attempt to recover a real score, so a 403 only logs a warning and the PR goes to human review, exactly as if the API had never been consulted. The job stays green.
 
-The fix for both is to create a PAT (or a fine-grained token with **Security events → Read** on the target repo) and pass it as a secret:
+So a repository without this secret silently loses all indirect-dependency coverage and fails loudly on every such PR.
+
+The fix for both is a token that can actually read the endpoint. A GitHub App installation token granted **Dependabot alerts: Read**, minted per run with [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token), or a fine-grained PAT with **Dependabot alerts → Read** on the target repo. Pass it as a secret:
 
 ```yaml
 jobs:
@@ -256,7 +313,9 @@ jobs:
             token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
 ```
 
-Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`.
+Store it as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`. An organisation secret is the least work across many repositories: set it once, and each caller picks it up with the two lines above.
+
+`scripts/audit-readiness.sh` does not check for this secret. Secret names are not readable through the API, so the audit cannot tell an org secret from a missing one; treat it as a prerequisite you confirm centrally rather than per repo.
 
 ## Troubleshooting
 

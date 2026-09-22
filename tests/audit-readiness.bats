@@ -1,0 +1,615 @@
+#!/usr/bin/env bats
+# Tests for scripts/audit-readiness.sh, run against the gh stub in tests/stubs/.
+#
+# The contract these tests exist to defend: a check the caller's token cannot
+# see is reported `unknown`, never `fail`. Calling a repo broken when we simply
+# could not look is the failure mode that costs trust with the teams who own
+# these repos, so most of what follows is about that distinction.
+
+setup() {
+    REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+    SCRIPT="$REPO_ROOT/scripts/audit-readiness.sh"
+    export GH_STUB_DIR="$BATS_TEST_TMPDIR/fixtures"
+    export GH_STUB_LOG="$BATS_TEST_TMPDIR/gh-calls.log"
+    OUT="$BATS_TEST_TMPDIR/out"
+    mkdir -p "$GH_STUB_DIR"
+    : >"$GH_STUB_LOG"
+    PATH="$REPO_ROOT/tests/stubs:$PATH"
+}
+
+fixture() {
+    cat >"$GH_STUB_DIR/$1"
+}
+
+mutation_count() {
+    grep -cE -- '-X (POST|PATCH|PUT|DELETE)' "$GH_STUB_LOG" || true
+}
+
+log_count() {
+    grep -cF -- "$1" "$GH_STUB_LOG" || true
+}
+
+# The caller workflow exactly as the eight onboarded repos ship it.
+good_caller() {
+    cat <<'EOF'
+name: Dependabot auto-merge
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: '0 9 * * *'
+permissions:
+  pull-requests: write
+  contents: write
+  security-events: read
+jobs:
+  dependabot-auto-merge:
+    uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@8143c95d871e96dc12cb448aa1dde9c2abae694e # v1.5
+    permissions:
+      pull-requests: write
+      contents: write
+      security-events: read
+    with:
+      event-name: ${{ github.event_name }}
+EOF
+}
+
+# A repo where every check passes. Tests patch this with a jq expression to
+# break exactly one thing, so a failure names its own cause.
+base_node() {
+    jq -n --arg caller "$(good_caller)" '{
+      nameWithOwner: "acme/widgets",
+      isArchived: false, isFork: false, isPrivate: false, isDisabled: false, isEmpty: false,
+      pushedAt: "2026-09-01T00:00:00Z",
+      autoMergeAllowed: true, squashMergeAllowed: true,
+      mergeCommitAllowed: true, rebaseMergeAllowed: true,
+      viewerPermission: "ADMIN", hasVulnerabilityAlertsEnabled: true,
+      openAlerts: {totalCount: 0}, everAlerts: {totalCount: 5},
+      latestRelease: null,
+      defaultBranchRef: {
+        name: "main",
+        target: {committedDate: "2026-09-01T00:00:00Z", history: {totalCount: 100}},
+        branchProtectionRule: null,
+        rules: {totalCount: 1, nodes: [{
+          type: "REQUIRED_STATUS_CHECKS",
+          parameters: {
+            __typename: "RequiredStatusChecksParameters",
+            strictRequiredStatusChecksPolicy: false,
+            requiredStatusChecks: [{context: "ci"}]
+          },
+          repositoryRuleset: {name: "Main rules", enforcement: "ACTIVE"}
+        }]}
+      },
+      ft:   {nodes: [{name: "security-fast-track",  color: "0075ca", description: "x"}]},
+      pend: {nodes: [{name: "auto-merge-pending",   color: "e4e669", description: "x"}]},
+      sirt: {nodes: [{name: "sirt-review-required", color: "d93f0b", description: "x"}]},
+      depYml: {byteSize: 100}, depYaml: null,
+      caller: {byteSize: 559, isTruncated: false, text: $caller},
+      root: {entries: [{name: "composer.json", type: "blob"}, {name: "package.json", type: "blob"}]}
+    }'
+}
+
+# Always needed: the script probes GraphQL reachability before anything else.
+viewer_fixture() {
+    fixture graphql_Viewer <<<'{"data":{"viewer":{"login":"tester"},"rateLimit":{"remaining":4999}}}'
+}
+
+# Write a RepoSet response (the --repo path) from base_node patched by $1.
+repo_set() {
+    local patch=${1:-.}
+    viewer_fixture
+    base_node | jq --argjson rl '{"cost":1,"remaining":4999,"resetAt":null}' \
+        "{data: {rateLimit: \$rl, r_0: ($patch)}}" | fixture graphql_RepoSet
+}
+
+# Write a RepoSet response holding several nodes; each argument is a jq patch.
+repo_set_many() {
+    viewer_fixture
+    local out i=0 patch
+    out=$(jq -n '{data: {rateLimit: {cost: 1, remaining: 4999, resetAt: null}}}')
+    for patch in "$@"; do
+        out=$(base_node | jq --argjson acc "$out" \
+            "\$acc * {data: {r_$i: ($patch)}}")
+        i=$((i + 1))
+    done
+    printf '%s' "$out" | fixture graphql_RepoSet
+}
+
+run_audit() {
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl "$@"
+}
+
+# Read a jq path out of the single record the run produced.
+rec() {
+    jq -r "$1" "$OUT/repos.jsonl"
+}
+
+# --- argument validation ------------------------------------------------------
+
+@test "no arguments exits 2 with usage" {
+    run "$SCRIPT"
+    [ "$status" -eq 2 ]
+    [[ $output == *"missing required argument"* ]]
+    [[ $output == *"Usage:"* ]]
+}
+
+@test "no arguments makes no API call" {
+    run "$SCRIPT"
+    [ "$status" -eq 2 ]
+    [ ! -s "$GH_STUB_LOG" ]
+}
+
+@test "invalid repository is refused" {
+    run "$SCRIPT" --repo widgets
+    [ "$status" -eq 2 ]
+    [[ $output == *"invalid repository"* ]]
+}
+
+@test "a literal placeholder repo never reaches gh" {
+    run "$SCRIPT" --repo '{owner}/{repo}'
+    [ "$status" -eq 2 ]
+    [ ! -s "$GH_STUB_LOG" ]
+}
+
+@test "--org and --repo together are refused" {
+    run "$SCRIPT" --org acme --repo acme/widgets
+    [ "$status" -eq 2 ]
+    [[ $output == *"mutually exclusive"* ]]
+}
+
+@test "unknown option names itself" {
+    run "$SCRIPT" --repo acme/widgets --frobnicate
+    [ "$status" -eq 2 ]
+    [[ $output == *"unknown option: --frobnicate"* ]]
+}
+
+@test "an option swallowing the next flag is refused before anything runs" {
+    run "$SCRIPT" --repo acme/widgets --team --format
+    [ "$status" -eq 2 ]
+    [ ! -s "$GH_STUB_LOG" ]
+}
+
+@test "invalid --format, --status, --wave, --jobs and --merge-method are each refused" {
+    run "$SCRIPT" --repo acme/widgets --format bogus
+    [ "$status" -eq 2 ]
+    run "$SCRIPT" --repo acme/widgets --status bogus
+    [ "$status" -eq 2 ]
+    run "$SCRIPT" --repo acme/widgets --wave 9
+    [ "$status" -eq 2 ]
+    run "$SCRIPT" --repo acme/widgets --jobs 0
+    [ "$status" -eq 2 ]
+    run "$SCRIPT" --repo acme/widgets --merge-method bogus
+    [ "$status" -eq 2 ]
+}
+
+@test "the equals form of an option is accepted" {
+    repo_set
+    run "$SCRIPT" --repo=acme/widgets --out-dir="$OUT" --format=jsonl --merge-method=squash
+    [ "$status" -eq 0 ]
+    [ "$(rec .checks.merge_method.status)" = "pass" ]
+}
+
+# --- read-only discipline -----------------------------------------------------
+
+@test "a full run issues no mutation" {
+    repo_set
+    run_audit
+    [ "$status" -eq 0 ]
+    [ "$(mutation_count)" -eq 0 ]
+    [ "$(log_count 'gh pr')" -eq 0 ]
+}
+
+@test "--from-jsonl re-renders with no API call at all" {
+    repo_set
+    run_audit
+    [ "$status" -eq 0 ]
+    : >"$GH_STUB_LOG"
+    run "$SCRIPT" --from-jsonl "$OUT/repos.jsonl" --format summary
+    [ "$status" -eq 0 ]
+    [ ! -s "$GH_STUB_LOG" ]
+    [[ $output == *"Repositories audited: 1"* ]]
+}
+
+# --- the taxonomy -------------------------------------------------------------
+
+@test "a fully configured repo is ready" {
+    repo_set
+    run_audit
+    [ "$status" -eq 0 ]
+    [ "$(rec .verdict)" = "ready" ]
+    [ "$(rec '.blockers | length')" -eq 0 ]
+    [ "$(rec '.unknowns | length')" -eq 0 ]
+}
+
+@test "auto-merge off blocks, and --exit-code turns that into exit 1" {
+    repo_set '. * {autoMergeAllowed: false}'
+    run_audit
+    [ "$status" -eq 0 ]
+    [ "$(rec .verdict)" = "blocked" ]
+    [ "$(rec '.blockers | index("auto_merge") != null')" = "true" ]
+    repo_set '. * {autoMergeAllowed: false}'
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --exit-code
+    [ "$status" -eq 1 ]
+}
+
+@test "a GraphQL error on one field reports unknown, not fail" {
+    viewer_fixture
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            r_0: (. * {hasVulnerabilityAlertsEnabled: null})},
+                     errors: [{message: "Resource not accessible",
+                               path: ["r_0", "hasVulnerabilityAlertsEnabled"]}]}' \
+        | fixture graphql_RepoSet
+    run_audit
+    [ "$status" -eq 0 ]
+    [ "$(rec .checks.vuln_alerts.status)" = "unknown" ]
+    [ "$(rec .verdict)" = "unknown" ]
+    [ "$(rec '.blockers | length')" -eq 0 ]
+}
+
+@test "a fail outranks an unknown in the verdict" {
+    viewer_fixture
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            r_0: (. * {autoMergeAllowed: false,
+                                       hasVulnerabilityAlertsEnabled: null})},
+                     errors: [{message: "nope", path: ["r_0", "hasVulnerabilityAlertsEnabled"]}]}' \
+        | fixture graphql_RepoSet
+    run_audit
+    [ "$(rec .verdict)" = "blocked" ]
+    [ "$(rec '.blockers | length')" -eq 1 ]
+    [ "$(rec '.unknowns | length')" -eq 1 ]
+}
+
+@test "one broken node does not lose the others in the same page" {
+    repo_set_many '. * {nameWithOwner: "acme/one"}' \
+                  '. * {nameWithOwner: "acme/two", autoMergeAllowed: false}' \
+                  '. * {nameWithOwner: "acme/three"}'
+    run "$SCRIPT" --repo acme/one --repo acme/two --repo acme/three \
+        --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 3 ]
+}
+
+# --- required checks: parity with the workflow's preflight job ----------------
+
+@test "a ruleset with checks passes without any REST call" {
+    repo_set
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "pass" ]
+    [ "$(rec .checks.required_checks.path)" = "ruleset" ]
+    [ "$(log_count 'branches')" -eq 0 ]
+}
+
+@test "classic protection visible in the bulk sweep passes without a REST call" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []},
+                                      branchProtectionRule: {requiresStatusChecks: true,
+                                                             requiredStatusCheckContexts: ["ci"],
+                                                             requiredApprovingReviewCount: 0}}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "pass" ]
+    [ "$(rec .checks.required_checks.path)" = "classic" ]
+    [ "$(log_count 'branches')" -eq 0 ]
+}
+
+@test "an unprotected default branch fails" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":false}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "fail" ]
+    [ "$(rec .verdict)" = "blocked" ]
+}
+
+@test "protected with required checks passes via the classic fallback" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":true}'
+    fixture GET_repos_acme_widgets_branches_main_protection <<<'{"required_status_checks":{"contexts":["ci"]}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "pass" ]
+}
+
+@test "protected with no required checks fails" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":true}'
+    fixture GET_repos_acme_widgets_branches_main_protection <<<'{"required_status_checks":null}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "fail" ]
+}
+
+@test "protected but unreadable protection is unknown, matching preflight's warn" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":true}'
+    # No protection fixture: the stub 404s, exactly as the admin-only endpoint
+    # does for a token without admin.
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "unknown" ]
+    [ "$(rec .verdict)" = "unknown" ]
+    [[ "$(rec .checks.required_checks.detail)" == *"admin token"* ]]
+}
+
+@test "an unreadable branch is unknown, never fail" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main.err <<<'gh: Not Found (HTTP 404)'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "unknown" ]
+}
+
+@test "a branch name with URL-significant characters is encoded" {
+    repo_set '. * {defaultBranchRef: {name: "feature/x#1",
+                                      rules: {totalCount: 0, nodes: []},
+                                      branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_feature_2Fx_231 <<<'{"protected":false}'
+    run_audit
+    [ "$(log_count 'feature%2Fx%231')" -ge 1 ]
+}
+
+# --- labels -------------------------------------------------------------------
+
+@test "all three labels present passes" {
+    repo_set
+    run_audit
+    [ "$(rec .checks.labels.status)" = "pass" ]
+}
+
+@test "a missing label fails and names itself" {
+    repo_set '. * {pend: {nodes: []}}'
+    run_audit
+    [ "$(rec .checks.labels.status)" = "fail" ]
+    [[ "$(rec .checks.labels.detail)" == *"auto-merge-pending"* ]]
+}
+
+@test "labels differing only in case pass, because the runtime is case-insensitive" {
+    repo_set '. * {ft: {nodes: [{name: "Security-Fast-Track", color: "0075ca", description: "x"}]}}'
+    run_audit
+    [ "$(rec .checks.labels.status)" = "pass" ]
+}
+
+@test "fuzzy label search results are not counted as a match" {
+    # labels(query:) is a substring search that returns junk; only an exact
+    # (case-insensitive) name may satisfy the check.
+    repo_set '. * {sirt: {nodes: [{name: "forge", color: "ffffff", description: "x"}]}}'
+    run_audit
+    [ "$(rec .checks.labels.status)" = "fail" ]
+    [[ "$(rec .checks.labels.detail)" == *"sirt-review-required"* ]]
+}
+
+@test "a custom label name is sent in the query and checked" {
+    repo_set '. * {ft: {nodes: [{name: "fast-track", color: "0075ca", description: "x"}]}}'
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --fast-track-label fast-track
+    [ "$status" -eq 0 ]
+    [ "$(rec .checks.labels.status)" = "pass" ]
+}
+
+@test "a label whose colour drifted still passes, as a risk" {
+    repo_set '. * {ft: {nodes: [{name: "security-fast-track", color: "123456", description: "x"}]}}'
+    run_audit
+    [ "$(rec .checks.labels.status)" = "pass" ]
+    [ "$(rec '.risks | map(.id) | index("label_drift") != null')" = "true" ]
+}
+
+# --- dependabot config --------------------------------------------------------
+
+@test "a .yaml config fails, because Dependabot only reads .yml" {
+    repo_set '. * {depYml: null, depYaml: {byteSize: 50}}'
+    run_audit
+    [ "$(rec .checks.dependabot_config.status)" = "fail" ]
+    [[ "$(rec .checks.dependabot_config.detail)" == *".yml"* ]]
+}
+
+@test "no config and no manifest is n/a, not a failure" {
+    repo_set '. * {depYml: null, depYaml: null, caller: null,
+                   root: {entries: [{name: "README.md", type: "blob"}]}}'
+    run_audit
+    [ "$(rec .checks.dependabot_config.status)" = "na" ]
+    [ "$(rec .verdict)" = "na" ]
+}
+
+@test "no config but a real manifest fails" {
+    repo_set '. * {depYml: null, depYaml: null}'
+    run_audit
+    [ "$(rec .checks.dependabot_config.status)" = "fail" ]
+}
+
+# --- caller workflow ----------------------------------------------------------
+
+@test "the shipped caller shape passes and reports its pin" {
+    repo_set
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+    [ "$(rec .caller.ref_kind)" = "sha" ]
+    [ "$(rec .caller.version_comment)" = "v1.5" ]
+}
+
+@test "a tag pin fails, because the org requires SHA pinning" {
+    repo_set '.caller.text |= sub("@8143c95d871e96dc12cb448aa1dde9c2abae694e"; "@v1.5")'
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "fail" ]
+    [[ "$(rec .checks.caller_workflow.detail)" == *"commit SHA"* ]]
+}
+
+@test "types without labeled fails, because fast-track cannot work" {
+    repo_set '.caller.text |= sub("\\[opened, synchronize, reopened, labeled\\]"; "[opened, synchronize]")'
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "fail" ]
+    [[ "$(rec .checks.caller_workflow.detail)" == *"labeled"* ]]
+}
+
+@test "a missing schedule trigger fails, because the age gate never fires" {
+    repo_set '.caller.text |= sub("  schedule:\n    - cron: .0 9 \\* \\* \\*.\n"; "")'
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "fail" ]
+    [[ "$(rec .checks.caller_workflow.detail)" == *"age gate"* ]]
+}
+
+@test "permissions present in only one block fails" {
+    repo_set '.caller.text |= sub("    permissions:\n      pull-requests: write\n      contents: write\n      security-events: read\n"; "")'
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "fail" ]
+    [[ "$(rec .checks.caller_workflow.detail)" == *"permissions"* ]]
+}
+
+@test "a caller we cannot parse is unknown, never fail" {
+    repo_set '.caller.text = "on:\n\tpull_request_target:\n\t\ttypes: [labeled]\n"'
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "unknown" ]
+    [[ "$(rec .caller.shape)" == unrecognized* ]]
+    [ "$(rec .verdict)" = "unknown" ]
+}
+
+@test "a missing caller workflow fails" {
+    repo_set '. * {caller: null}'
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "fail" ]
+}
+
+# --- merge method and risks ---------------------------------------------------
+
+@test "squash disabled fails under the default merge method" {
+    repo_set '. * {squashMergeAllowed: false}'
+    run_audit
+    [ "$(rec .checks.merge_method.status)" = "fail" ]
+}
+
+@test "--merge-method merge checks the merge-commit setting instead" {
+    repo_set '. * {squashMergeAllowed: false, mergeCommitAllowed: true}'
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --merge-method merge
+    [ "$status" -eq 0 ]
+    [ "$(rec .checks.merge_method.status)" = "pass" ]
+}
+
+@test "a strict required-status-checks policy is a risk, not a blocker" {
+    repo_set '.defaultBranchRef.rules.nodes[0].parameters.strictRequiredStatusChecksPolicy = true'
+    run_audit
+    [ "$(rec .verdict)" = "ready" ]
+    [ "$(rec '.risks | map(.id) | index("strict_required_status_checks") != null')" = "true" ]
+}
+
+@test "an approval rule is a risk, because a bot PR can never satisfy it" {
+    repo_set '.defaultBranchRef.rules.nodes += [{type: "PULL_REQUEST",
+        parameters: {__typename: "PullRequestParameters", requiredApprovingReviewCount: 1},
+        repositoryRuleset: {name: "Main rules", enforcement: "ACTIVE"}}]'
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("approval_rule") != null')" = "true" ]
+}
+
+@test "a ruleset that is not active is a risk" {
+    repo_set '.defaultBranchRef.rules.nodes[0].repositoryRuleset.enforcement = "EVALUATE"'
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("ruleset_not_active") != null')" = "true" ]
+}
+
+@test "alerts on with none ever seen is the stub-lockfile risk" {
+    repo_set '. * {everAlerts: {totalCount: 0}}'
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("alerts_enabled_no_alerts_ever") != null')" = "true" ]
+}
+
+@test "the stub-lockfile risk is suppressed when the alert counts cannot be trusted" {
+    # A low-access viewer gets a silent 0 rather than an error, so an untrusted
+    # zero must not be reported as a finding.
+    repo_set '. * {everAlerts: {totalCount: 0}, viewerPermission: "READ"}'
+    run_audit
+    [ "$(rec .activity.alert_counts_trusted)" = "false" ]
+    [ "$(rec '.risks | map(.id) | index("alerts_enabled_no_alerts_ever")')" = "null" ]
+}
+
+# --- scope, output and concurrency --------------------------------------------
+
+@test "archived repos are excluded by default and included on request" {
+    repo_set '. * {isArchived: true}'
+    run_audit
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 0 ]
+
+    repo_set '. * {isArchived: true}'
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --include-archived
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 1 ]
+    [ "$(rec .scope.archived)" = "true" ]
+}
+
+@test "the jsonl artifact is one valid object per line" {
+    repo_set_many '. * {nameWithOwner: "acme/one"}' '. * {nameWithOwner: "acme/two"}'
+    run "$SCRIPT" --repo acme/one --repo acme/two --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 2 ]
+    run jq -e -c . "$OUT/repos.jsonl"
+    [ "$status" -eq 0 ]
+}
+
+@test "--format csv emits the documented header" {
+    repo_set
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format csv
+    [ "$status" -eq 0 ]
+    [[ $output == *"repo,verdict,team,wave_band,wave_score"* ]]
+}
+
+@test "--status filters the rendered view without changing the artifact" {
+    repo_set_many '. * {nameWithOwner: "acme/one"}' \
+                  '. * {nameWithOwner: "acme/two", autoMergeAllowed: false}'
+    run "$SCRIPT" --repo acme/one --repo acme/two --out-dir "$OUT" --format table --status ready
+    [ "$status" -eq 0 ]
+    [[ $output == *"acme/one"* ]]
+    [[ $output != *"acme/two "* ]]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 2 ]
+}
+
+@test "--has-dependabot-config narrows the view to repos that have one" {
+    repo_set_many '. * {nameWithOwner: "acme/one"}' \
+                  '. * {nameWithOwner: "acme/two", depYml: null}'
+    run "$SCRIPT" --repo acme/one --repo acme/two --out-dir "$OUT" --format table --has-dependabot-config
+    [ "$status" -eq 0 ]
+    [[ $output == *"acme/one"* ]]
+    [[ $output != *"acme/two "* ]]
+}
+
+@test "every call carries the cache flag, and --no-cache removes it" {
+    repo_set
+    run_audit
+    [ "$(log_count '--cache=1h')" -ge 1 ]
+
+    : >"$GH_STUB_LOG"
+    repo_set
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --no-cache
+    [ "$status" -eq 0 ]
+    [ "$(log_count '--cache')" -eq 0 ]
+}
+
+@test "--jobs does not change the output bytes" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":false}'
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --jobs 1
+    [ "$status" -eq 0 ]
+    one=$(jq -S 'del(.audited_at)' "$OUT/repos.jsonl")
+
+    rm -f "$GH_STUB_DIR"/.seq_* 2>/dev/null || true
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":false}'
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --jobs 4
+    [ "$status" -eq 0 ]
+    four=$(jq -S 'del(.audited_at)' "$OUT/repos.jsonl")
+
+    [ "$one" = "$four" ]
+}
+
+@test "an anonymous GraphQL document is a stub error, so every operation stays named" {
+    viewer_fixture
+    run bash -c 'gh api graphql -f query="query { viewer { login } }"'
+    [ "$status" -eq 64 ]
+    [[ $output == *"anonymous graphql document"* ]]
+}
+
+# --- enterprise host ----------------------------------------------------------
+
+@test "GH_HOST scopes the auth check to the target host" {
+    repo_set
+    GH_HOST=ghe.example.com run_audit
+    [ "$(log_count 'ghe.example.com')" -ge 1 ]
+}
+
+# --- parse failures -----------------------------------------------------------
+
+@test "the run fails loudly rather than reporting a confident verdict when the sweep cannot be read" {
+    viewer_fixture
+    fixture graphql_RepoSet <<<'{"data":null,"errors":[{"message":"boom"}]}'
+    run_audit
+    [ "$status" -ne 0 ] || [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 0 ]
+}
