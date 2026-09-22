@@ -40,6 +40,10 @@ Scope:
                              form a team lead runs.
   --include-archived         Include archived repositories.
   --include-forks            Include forks.
+  --include-advisory-forks   Include the private <repo>-ghsa-xxxx-xxxx-xxxx
+                             repositories GitHub creates for security
+                             advisories. They are not marked as forks, so they
+                             are excluded by name instead.
   --has-dependabot-config    Only repositories that already have
                              .github/dependabot.yml.
   --team <slug>              Only repositories owned by this team. Repeatable.
@@ -759,6 +763,7 @@ assemble() {
         --arg expect_ref "$expect_ref" \
         --argjson include_archived "$INCLUDE_ARCHIVED" \
         --argjson include_forks "$INCLUDE_FORKS" \
+        --argjson include_advisory_forks "$INCLUDE_ADVISORY_FORKS" \
         --arg audited_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '
         def narrow_for($repo): ($narrow | map(select(.repo == $repo)) | first);
@@ -848,6 +853,12 @@ assemble() {
           | ($n.defaultBranchRef.branchProtectionRule) as $bpr
           | narrow_for($repo) as $nr
 
+          # GitHub creates a private repo per security advisory when a
+          # temporary private fork is opened, named <repo>-ghsa-xxxx-xxxx-xxxx.
+          # The API does not mark them as forks, so they survive the fork
+          # filter and land in rollout waves as if they were real repos.
+          | ($repo | test("-ghsa-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$")) as $advisory_fork
+
           | {
               schema_version: 1,
               audited_at: $audited_at,
@@ -856,7 +867,9 @@ assemble() {
               scope: {
                 in_scope: ((($include_archived or ($n.isArchived | not)))
                            and (($include_forks or ($n.isFork | not)))
+                           and ($include_advisory_forks or ($advisory_fork | not))
                            and ($n.isDisabled | not)),
+                advisory_fork: $advisory_fork,
                 archived: $n.isArchived, fork: $n.isFork, disabled: $n.isDisabled,
                 empty: $n.isEmpty, visibility: (if $n.isPrivate then "PRIVATE" else "PUBLIC" end)
               },
@@ -1204,6 +1217,7 @@ ORG=""
 REPOS=()
 INCLUDE_ARCHIVED=false
 INCLUDE_FORKS=false
+INCLUDE_ADVISORY_FORKS=false
 HAS_DEPENDABOT_CONFIG=false
 FILTER_TEAMS=""
 FILTER_STATUS=""
@@ -1255,6 +1269,7 @@ while [[ $# -gt 0 ]]; do
         --repo=*) REPOS+=("${1#--repo=}"); shift ;;
         --include-archived) INCLUDE_ARCHIVED=true; shift ;;
         --include-forks) INCLUDE_FORKS=true; shift ;;
+        --include-advisory-forks) INCLUDE_ADVISORY_FORKS=true; shift ;;
         --has-dependabot-config) HAS_DEPENDABOT_CONFIG=true; shift ;;
         --team)
             need_value "$1" $#

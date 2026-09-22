@@ -721,6 +721,28 @@ EOF
     [ "$(rec '.wave.score | type')" = "number" ]
 }
 
+@test "a security-advisory temporary fork is excluded by default" {
+    # GitHub creates these per advisory and does not mark them as forks, so the
+    # fork filter misses them and they land in rollout waves.
+    repo_set_many '. * {nameWithOwner: "acme/widgets-ghsa-6wvr-47ff-m546"}'
+    run "$SCRIPT" --repo acme/widgets-ghsa-6wvr-47ff-m546 --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 0 ]
+
+    repo_set_many '. * {nameWithOwner: "acme/widgets-ghsa-6wvr-47ff-m546"}'
+    run "$SCRIPT" --repo acme/widgets-ghsa-6wvr-47ff-m546 --out-dir "$OUT" --format jsonl --include-advisory-forks
+    [ "$status" -eq 0 ]
+    [ "$(rec .scope.advisory_fork)" = "true" ]
+}
+
+@test "a repo that merely contains ghsa in its name is not excluded" {
+    repo_set_many '. * {nameWithOwner: "acme/ghsa-tooling"}'
+    run "$SCRIPT" --repo acme/ghsa-tooling --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 1 ]
+    [ "$(rec .scope.advisory_fork)" = "false" ]
+}
+
 @test "archived repos are excluded by default and included on request" {
     repo_set '. * {isArchived: true}'
     run_audit
