@@ -402,10 +402,47 @@ rec() {
     [ "$(rec .verdict)" = "na" ]
 }
 
-@test "no config but a real manifest fails" {
+@test "no config passes when every manifest is at the root" {
+    # Dependabot's security updates cover default paths without a config, so
+    # requiring one here would fail a repo that is actually fine.
     repo_set '. * {depYml: null, depYaml: null}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"composer.json"},{"type":"blob","path":"package.json"},{"type":"blob","path":"src/Thing.php"}]}
+EOF
+    run_audit
+    [ "$(rec .checks.dependabot_config.status)" = "pass" ]
+    [ "$(rec .verdict)" = "ready" ]
+}
+
+@test "no config fails when a manifest sits outside the root" {
+    repo_set '. * {depYml: null, depYaml: null}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"package.json"},{"type":"blob","path":"packages/thing/package.json"}]}
+EOF
     run_audit
     [ "$(rec .checks.dependabot_config.status)" = "fail" ]
+    [[ "$(rec .checks.dependabot_config.detail)" == *"packages/thing/package.json"* ]]
+}
+
+@test "vendored manifests do not count as needing a mapping" {
+    repo_set '. * {depYml: null, depYaml: null}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"composer.json"},{"type":"blob","path":"vendor/acme/lib/composer.json"},{"type":"blob","path":"node_modules/x/package.json"}]}
+EOF
+    run_audit
+    [ "$(rec .checks.dependabot_config.status)" = "pass" ]
+}
+
+@test "a truncated file tree is unknown, never a verdict" {
+    # Deciding on an incomplete list is the exact failure this check exists to
+    # catch, so it refuses rather than guessing.
+    repo_set '. * {depYml: null, depYaml: null}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":true,"tree":[{"type":"blob","path":"package.json"}]}
+EOF
+    run_audit
+    [ "$(rec .checks.dependabot_config.status)" = "unknown" ]
+    [[ "$(rec .checks.dependabot_config.detail)" == *"truncated"* ]]
 }
 
 # --- caller workflow ----------------------------------------------------------
@@ -454,10 +491,27 @@ rec() {
     [ "$(rec .verdict)" = "unknown" ]
 }
 
-@test "a missing caller workflow fails" {
+@test "a repo that has not adopted yet is not reported as broken" {
+    # Adding the caller workflow is the step this audit exists to plan. A repo
+    # without one is the normal case, not a fault.
     repo_set '. * {caller: null}'
     run_audit
-    [ "$(rec .checks.caller_workflow.status)" = "fail" ]
+    [ "$(rec .checks.caller_workflow.status)" = "na" ]
+    [ "$(rec .adoption)" = "not-adopted" ]
+    [ "$(rec '.blockers | index("caller_workflow")')" = "null" ]
+}
+
+@test "a caller workflow that is present and malformed is a blocker" {
+    repo_set '.caller.text |= sub("@8143c95d871e96dc12cb448aa1dde9c2abae694e"; "@v1.5")'
+    run_audit
+    [ "$(rec .adoption)" = "adopted-broken" ]
+    [ "$(rec '.blockers | index("caller_workflow") != null')" = "true" ]
+}
+
+@test "a well-formed caller workflow reports as adopted" {
+    repo_set
+    run_audit
+    [ "$(rec .adoption)" = "adopted" ]
 }
 
 # --- merge method and risks ---------------------------------------------------

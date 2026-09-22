@@ -45,6 +45,10 @@ Scope:
   --team <slug>              Only repositories owned by this team. Repeatable.
   --status <s>               Filter output: ready|blocked|unknown|na. Repeatable.
   --wave <n>                 Filter output to wave band n (1-4). Repeatable.
+                             Bands are quantiles of the current run, so they
+                             only mean something relative to the other repos
+                             audited alongside. wave.score is the stable
+                             number.
 
 Expectations:
   --merge-method <m>         squash|merge|rebase (default squash). Which repo
@@ -561,40 +565,98 @@ phase_activity() {
 # can never contradict the job it exists to predict.
 
 probe_repo() {
-    local repo=$1 branch enc out status detail
+    local repo=$1 node branch enc out
+    local checks_status="" checks_detail="" config_status="" config_detail=""
 
-    branch=$(jq -r --arg r "$repo" 'select(.nameWithOwner == $r) | .defaultBranchRef.name // empty' \
-        "$AUDIT_WORK/nodes.jsonl" | head -1)
-
-    if [[ -z $branch ]]; then
-        printf '{"repo":%s,"status":"unknown","detail":"no default branch","source":"rest"}\n' "$(jq -Rn --arg s "$repo" '$s')"
+    node=$(jq -c --arg r "$repo" 'select(.nameWithOwner == $r)' "$AUDIT_WORK/nodes.jsonl" | head -1)
+    if [[ -z $node ]]; then
+        jq -cn --arg r "$repo" '{repo: $r}'
         return 0
     fi
+    branch=$(jq -r '.defaultBranchRef.name // empty' <<<"$node")
 
-    # Branch names may contain URL-significant characters ('#' starts a
-    # fragment); encode exactly as preflight does.
-    enc=$(printf '%s' "$branch" | jq -sRr '@uri')
-
-    if ! out=$(api_rest "repos/$repo/branches/$enc"); then
-        status=unknown
-        detail="cannot read branch '$branch': $(api_err)"
-    elif [[ $(jq -r '.protected' <<<"$out" 2>/dev/null) != true ]]; then
-        status=fail
-        detail="default branch '$branch' is not protected and has no ruleset checks"
-    elif ! out=$(api_rest "repos/$repo/branches/$enc/protection"); then
-        # Admin-only endpoint. Preflight warns and continues here; so do we.
-        status=unknown
-        detail="branch '$branch' is protected but its protection details need an admin token"
-    elif [[ $(jq -r '.required_status_checks | if . == null then "null" else "set" end' <<<"$out" 2>/dev/null) == set ]]; then
-        status=pass
-        detail="classic branch protection requires status checks on '$branch'"
-    else
-        status=fail
-        detail="branch '$branch' is protected but requires no status checks"
+    # --- required status checks, classic fallback -----------------------------
+    #
+    # Only for repos the bulk sweep could not answer. Follows preflight's chain
+    # so the audit can never contradict the job it exists to predict.
+    if [[ $(jq -r 'if ((.defaultBranchRef.rules.nodes // []) | map(select(.type == "REQUIRED_STATUS_CHECKS")) | length) == 0
+                      and (.defaultBranchRef.branchProtectionRule // null) == null
+                      and .defaultBranchRef != null
+                   then "yes" else "no" end' <<<"$node") == yes ]]; then
+        if [[ -z $branch ]]; then
+            checks_status=unknown
+            checks_detail="no default branch"
+        else
+            # Branch names may contain URL-significant characters ('#' starts a
+            # fragment); encode exactly as preflight does.
+            enc=$(printf '%s' "$branch" | jq -sRr '@uri')
+            if ! out=$(api_rest "repos/$repo/branches/$enc"); then
+                checks_status=unknown
+                checks_detail="cannot read branch '$branch': $(api_err)"
+            elif [[ $(jq -r '.protected' <<<"$out" 2>/dev/null) != true ]]; then
+                checks_status=fail
+                checks_detail="default branch '$branch' is not protected and has no ruleset checks"
+            elif ! out=$(api_rest "repos/$repo/branches/$enc/protection"); then
+                # Admin-only endpoint. Preflight warns and continues here; so do we.
+                checks_status=unknown
+                checks_detail="branch '$branch' is protected but its protection details need an admin token"
+            elif [[ $(jq -r '.required_status_checks | if . == null then "null" else "set" end' <<<"$out" 2>/dev/null) == set ]]; then
+                checks_status=pass
+                checks_detail="classic branch protection requires status checks on '$branch'"
+            else
+                checks_status=fail
+                checks_detail="branch '$branch' is protected but requires no status checks"
+            fi
+        fi
     fi
 
-    jq -cn --arg r "$repo" --arg s "$status" --arg d "$detail" \
-        '{repo: $r, status: $s, detail: $d, source: "rest"}'
+    # --- does this repo actually need a dependabot.yml? -----------------------
+    #
+    # Security updates do not require a config when every manifest sits at
+    # Dependabot's default path. A config is needed when one does not, which is
+    # the failure mode docs/directory-mapping.md exists for: the repo passes
+    # preflight, its security PRs ship without lockfile updates, CI stays red
+    # and auto-merge never fires. So the question is not "is there a config"
+    # but "is there a manifest the defaults would miss".
+    if [[ $(jq -r 'if .depYml == null and .depYaml == null
+                      and ((.root.entries // []) | any(.type == "blob" and (.name == "package.json" or .name == "composer.json")))
+                   then "yes" else "no" end' <<<"$node") == yes ]]; then
+        if [[ -z $branch ]]; then
+            config_status=unknown
+            config_detail="no default branch"
+        elif ! out=$(api_rest "repos/$repo/git/trees/$branch?recursive=1"); then
+            config_status=unknown
+            config_detail="cannot read the file tree: $(api_err)"
+        elif [[ $(jq -r '.truncated' <<<"$out" 2>/dev/null) == true ]]; then
+            # Never decide on a truncated list. A silently incomplete file list
+            # is exactly the failure this check exists to catch.
+            config_status=unknown
+            config_detail="the file tree is truncated; run bin/dependabot-directories to map this repo"
+        else
+            local nested
+            nested=$(jq -r '
+                [.tree[]
+                 | select(.type == "blob")
+                 | select(.path | test("/(package|composer)\\.json$"))
+                 | select(.path | test("(^|/)(node_modules|vendor|bower_components)/") | not)
+                 | .path]
+                | .[0:3] | join(", ")' <<<"$out" 2>/dev/null)
+            if [[ -n $nested ]]; then
+                config_status=fail
+                config_detail="manifests outside the root need explicit directory mappings (e.g. $nested); run bin/dependabot-directories"
+            else
+                config_status=pass
+                config_detail="no config needed; every manifest is at the root, which Dependabot covers by default"
+            fi
+        fi
+    fi
+
+    jq -cn --arg r "$repo" \
+        --arg cs "$checks_status" --arg cd "$checks_detail" \
+        --arg gs "$config_status" --arg gd "$config_detail" \
+        '{repo: $r}
+         + (if $cs == "" then {} else {required_checks: {status: $cs, detail: $cd, source: "rest"}} end)
+         + (if $gs == "" then {} else {dependabot_config: {status: $gs, detail: $gd, source: "rest"}} end)'
 }
 
 phase_narrow() {
@@ -602,13 +664,23 @@ phase_narrow() {
 
     # Undecided means: no ruleset status-check rule, and no classic rule
     # visible in the bulk sweep. Everything else was already answered for free.
+    # A repo lands here if the bulk sweep could not answer either of the two
+    # questions REST can settle: whether the default branch requires a check,
+    # and whether any manifest sits outside the root.
     jq -r '
         select(.isArchived == false and .isFork == false and .isDisabled == false)
         | select(
-            ((.defaultBranchRef.rules.nodes // []) | map(select(.type == "REQUIRED_STATUS_CHECKS")) | length) == 0
+            (
+              ((.defaultBranchRef.rules.nodes // []) | map(select(.type == "REQUIRED_STATUS_CHECKS")) | length) == 0
+              and (.defaultBranchRef.branchProtectionRule // null) == null
+              and .defaultBranchRef != null
+            )
+            or
+            (
+              .depYml == null and .depYaml == null
+              and ((.root.entries // []) | any(.type == "blob" and (.name == "package.json" or .name == "composer.json")))
+            )
           )
-        | select((.defaultBranchRef.branchProtectionRule // null) == null)
-        | select(.defaultBranchRef != null)
         | .nameWithOwner
     ' "$WORK/nodes.jsonl" | sort -u >"$WORK/todo"
 
@@ -780,8 +852,8 @@ assemble() {
                   elif ($bpr != null and $bpr.requiresStatusChecks == true) then
                     check("pass"; "classic branch protection requires status checks"; "graphql")
                       + {contexts: ($bpr.requiredStatusCheckContexts // []), path: "classic"}
-                  elif ($nr != null) then
-                    check($nr.status; $nr.detail; "rest") + {path: "classic"}
+                  elif ($nr.required_checks != null) then
+                    check($nr.required_checks.status; $nr.required_checks.detail; "rest") + {path: "classic"}
                   elif ($n.defaultBranchRef == null) then
                     check("unknown"; "repository has no default branch"; "graphql")
                   else
@@ -816,14 +888,16 @@ assemble() {
                     check("fail"; ".github/dependabot.yaml present but Dependabot only reads .yml — rename it"; "graphql")
                   elif ($manifest | not) then
                     check("na"; "no npm or Composer manifest at the repository root"; "graphql")
+                  elif ($nr.dependabot_config != null) then
+                    check($nr.dependabot_config.status; $nr.dependabot_config.detail; "rest")
                   else
-                    check("fail"; "no .github/dependabot.yml"; "graphql")
+                    check("unknown"; "could not determine whether a config is needed"; "graphql")
                   end),
 
                 caller_workflow: (
                   caller_info($n) as $c
                   | if ($c.present | not) then
-                      check("fail"; "no .github/workflows/dependabot-auto-merge.yml"; "graphql")
+                      check("na"; "not adopted yet; this is the step the audit exists to plan"; "graphql")
                     elif ($c.shape != "recognized") then
                       check("unknown"; "caller workflow \($c.shape) — not parsed, check it by hand"; "graphql")
                     else
@@ -900,9 +974,21 @@ assemble() {
           | ([$rec.checks | to_entries[] | select(.value.status == "fail") | .key]) as $blockers
           | ([$rec.checks | to_entries[] | select(.value.status == "unknown") | .key]) as $unknowns
           | ([$rec.checks | to_entries[] | select(.value.status == "na") | .key]) as $nas
+          # bootstrap.sh fixes these four itself, idempotently. The rest need a
+          # decision or a file, so they are what a team actually has to act on.
+          | (["auto_merge", "labels", "vuln_alerts", "required_checks"]) as $bootstrappable
           | $rec + {
+              adoption: (
+                if ($rec.caller.present | not) then "not-adopted"
+                elif $rec.checks.caller_workflow.status == "unknown" then "unparsed"
+                elif $rec.checks.caller_workflow.status == "fail" then "adopted-broken"
+                else "adopted" end),
               blockers: $blockers,
               unknowns: $unknowns,
+              remediation: {
+                bootstrap_fixes: ($blockers | map(select(. as $b | $bootstrappable | index($b)))),
+                needs_work: ($blockers | map(select(. as $b | $bootstrappable | index($b) | not)))
+              },
               verdict: (
                 if ($applicable | not) then "na"
                 elif ($blockers | length) > 0 then "blocked"
@@ -938,13 +1024,28 @@ assemble() {
           | $rec + {
               wave: {
                 score: $score,
-                band: (if $score < 25 then 1 elif $score < 50 then 2 elif $score < 75 then 3 else 4 end),
                 confidence: (if $rec.activity.alert_counts_trusted then "high" else "low" end),
                 inputs: {risk: $risk, activity: $activity_score, effort: $effort}
               }
             }
         ]
         | map(select(.scope.in_scope))
+
+        # Bands are quantiles of this run, not absolute scores. A small pilot
+        # first, then widening waves. `score` is the stable number; `band` only
+        # means anything relative to the other repos in the same run.
+        | . as $recs
+        | ($recs | map(.wave.score) | sort) as $sorted
+        | ($sorted | length) as $n
+        | (if $n == 0 then 0 else $sorted[((($n - 1) * 10) / 100) | floor] end) as $t1
+        | (if $n == 0 then 0 else $sorted[((($n - 1) * 40) / 100) | floor] end) as $t2
+        | (if $n == 0 then 0 else $sorted[((($n - 1) * 75) / 100) | floor] end) as $t3
+        | $recs
+        | map(.wave.band = (
+              if   .wave.score <= $t1 then 1
+              elif .wave.score <= $t2 then 2
+              elif .wave.score <= $t3 then 3
+              else 4 end))
         | sort_by(.wave.score, .repo)
         | .[]
         '
@@ -1004,6 +1105,12 @@ render_summary() {
           "  blocked  \($all | map(select(.verdict == "blocked")) | length)",
           "  unknown  \($all | map(select(.verdict == "unknown")) | length)",
           "  n/a      \($all | map(select(.verdict == "na")) | length)",
+          "",
+          "Adoption:",
+          ($all | group_by(.adoption) | sort_by(-length) | .[]
+                | "  \(length | tostring | (. + "    ")[0:4]) \(.[0].adoption)"),
+          "",
+          "  of which bootstrap.sh fixes every blocker on  \($all | map(select(.verdict == "blocked" and (.remediation.needs_work | length) == 0)) | length)",
           "",
           "Most common blockers:",
           ($all | map(.blockers[]) | group_by(.) | map({k: .[0], n: length})
