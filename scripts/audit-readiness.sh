@@ -62,6 +62,9 @@ Expectations:
   --exclude-team <slug>      Repeatable; adds to the bot-team defaults.
   --max-team-size <n|pct>    Teams larger than this are treated as org-wide and
                              ignored for ownership. Default 25%.
+  --max-owner-candidates <n> A repo with more than this many candidate teams is
+                             reported as shared rather than assigned to one.
+                             Default 3.
 
 Output:
   --format <f>               jsonl|table|team|summary|csv (default table).
@@ -497,17 +500,27 @@ phase_teams() {
 
     # Smallest remaining team holding ADMIN or MAINTAIN wins; ties break on
     # slug so the result is deterministic across runs.
-    jq -s '
+    #
+    # Except when a repo has many candidate teams, where "smallest" is
+    # actively wrong: a widely shared repo picks up whichever team happens to
+    # own fewest repos overall, which is the least likely owner rather than
+    # the most. The WooCommerce monorepo has 19 candidates and this rule chose
+    # a one-repo payments team. Above the threshold the audit reports the repo
+    # as shared and names the candidates instead of guessing, which is the
+    # same refusal it makes everywhere else it cannot see clearly.
+    jq -s --argjson max_candidates "$MAX_OWNER_CANDIDATES" '
         map(select(.permission == "ADMIN" or .permission == "MAINTAIN"))
         | group_by(.repo)
         | map({
             key: .[0].repo,
-            value: (sort_by(.size, .team) | {
-                team: .[0].team,
-                permission: .[0].permission,
-                candidates: (map(.team) | unique),
-                source: "team-index"
-            })
+            value: (sort_by(.size, .team) as $ranked
+              | (map(.team) | unique) as $candidates
+              | if ($candidates | length) > $max_candidates then
+                  {team: null, permission: null, candidates: $candidates, source: "ambiguous"}
+                else
+                  {team: $ranked[0].team, permission: $ranked[0].permission,
+                   candidates: $candidates, source: "team-index"}
+                end)
           })
         | from_entries
     ' "$WORK/team-edges.jsonl" >"$WORK/teams.json" 2>/dev/null || printf '{}' >"$WORK/teams.json"
@@ -612,6 +625,11 @@ probe_repo() {
 
     # --- does this repo actually need a dependabot.yml? -----------------------
     #
+    # Exclusions match docs/directory-mapping.md: the hard list that is never
+    # mapped, and the soft list that is skipped with a warning. A repo whose
+    # only nested manifests are fixtures or build output needs no mapping, so
+    # counting them would fail a repo that is fine.
+    #
     # Security updates do not require a config when every manifest sits at
     # Dependabot's default path. A config is needed when one does not, which is
     # the failure mode docs/directory-mapping.md exists for: the repo passes
@@ -638,7 +656,8 @@ probe_repo() {
                 [.tree[]
                  | select(.type == "blob")
                  | select(.path | test("/(package|composer)\\.json$"))
-                 | select(.path | test("(^|/)(node_modules|vendor|bower_components)/") | not)
+                 | select(.path | test("(^|/)(node_modules|vendor|bower_components|\\.git)/") | not)
+                 | select(.path | test("(^|/)(fixtures|__fixtures__|testdata|examples|example|dist|build|\\.next|coverage)/") | not)
                  | .path]
                 | .[0:3] | join(", ")' <<<"$out" 2>/dev/null)
             if [[ -n $nested ]]; then
@@ -1106,6 +1125,10 @@ render_summary() {
           "  unknown  \($all | map(select(.verdict == "unknown")) | length)",
           "  n/a      \($all | map(select(.verdict == "na")) | length)",
           "",
+          "Ownership:",
+          ($all | group_by(.owner.source) | sort_by(-length) | .[]
+                | "  \(length | tostring | (. + "    ")[0:4]) \(.[0].owner.source)"),
+          "",
           "Adoption:",
           ($all | group_by(.adoption) | sort_by(-length) | .[]
                 | "  \(length | tostring | (. + "    ")[0:4]) \(.[0].adoption)"),
@@ -1169,6 +1192,7 @@ EXPECT_REF=""
 TEAM_OVERRIDES=""
 EXCLUDE_TEAMS="$DEFAULT_EXCLUDE_TEAMS"
 MAX_TEAM_SIZE="25%"
+MAX_OWNER_CANDIDATES=3
 FORMATS=""
 OUT_DIR=".audit"
 FROM_JSONL=""
@@ -1263,6 +1287,11 @@ while [[ $# -gt 0 ]]; do
             [[ $2 != -* ]] || die_usage "--max-team-size needs a value, got option '$2'"
             MAX_TEAM_SIZE=$2; shift 2 ;;
         --max-team-size=*) MAX_TEAM_SIZE=${1#--max-team-size=}; shift ;;
+        --max-owner-candidates)
+            need_value "$1" $#
+            [[ $2 != -* ]] || die_usage "--max-owner-candidates needs a value, got option '$2'"
+            MAX_OWNER_CANDIDATES=$2; shift 2 ;;
+        --max-owner-candidates=*) MAX_OWNER_CANDIDATES=${1#--max-owner-candidates=}; shift ;;
         --format)
             need_value "$1" $#
             [[ $2 != -* ]] || die_usage "--format needs a value, got option '$2'"
@@ -1335,6 +1364,7 @@ esac
     die_usage "invalid --jobs '$JOBS' — expected an integer between 1 and 16"
 [[ $RATE_FLOOR =~ ^[0-9]+$ ]] || die_usage "invalid --rate-floor '$RATE_FLOOR' — expected an integer"
 [[ $MAX_TEAM_SIZE =~ ^[0-9]+%?$ ]] || die_usage "invalid --max-team-size '$MAX_TEAM_SIZE' — expected a number or a percentage"
+[[ $MAX_OWNER_CANDIDATES =~ ^[0-9]+$ ]] || die_usage "invalid --max-owner-candidates '$MAX_OWNER_CANDIDATES' — expected an integer"
 
 # --- re-render path: issues no API call at all --------------------------------
 

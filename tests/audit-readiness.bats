@@ -424,10 +424,11 @@ EOF
     [[ "$(rec .checks.dependabot_config.detail)" == *"packages/thing/package.json"* ]]
 }
 
-@test "vendored manifests do not count as needing a mapping" {
+@test "vendored and fixture manifests do not count as needing a mapping" {
+    # Matches the hard and soft exclusion lists in docs/directory-mapping.md.
     repo_set '. * {depYml: null, depYaml: null}'
     fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
-{"truncated":false,"tree":[{"type":"blob","path":"composer.json"},{"type":"blob","path":"vendor/acme/lib/composer.json"},{"type":"blob","path":"node_modules/x/package.json"}]}
+{"truncated":false,"tree":[{"type":"blob","path":"composer.json"},{"type":"blob","path":"vendor/acme/lib/composer.json"},{"type":"blob","path":"node_modules/x/package.json"},{"type":"blob","path":"utils/__tests__/fixtures/test-package/package.json"},{"type":"blob","path":"dist/package.json"}]}
 EOF
     run_audit
     [ "$(rec .checks.dependabot_config.status)" = "pass" ]
@@ -563,6 +564,115 @@ EOF
     run_audit
     [ "$(rec .activity.alert_counts_trusted)" = "false" ]
     [ "$(rec '.risks | map(.id) | index("alerts_enabled_no_alerts_ever")')" = "null" ]
+}
+
+# --- ownership ----------------------------------------------------------------
+
+# Minimal --org fixture set: one page of repos, a team list, and per-team repos.
+org_fixtures() {
+    viewer_fixture
+    fixture graphql_OrgProbe <<<'{"data":{"organization":{"login":"acme"}}}'
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            organization: {repositories: {
+                              pageInfo: {hasNextPage: false, endCursor: null},
+                              totalCount: 1, nodes: [.]}}}}' \
+        | fixture graphql_RepoPage
+    fixture graphql_DependabotPRs <<<'{"data":{"rateLimit":{"cost":1,"remaining":4999},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}'
+}
+
+# $1 is a jq array of {slug,size}; $2 maps slug -> permission for acme/widgets.
+team_fixtures() {
+    fixture graphql_TeamList <<EOF
+{"data":{"rateLimit":{"cost":1,"remaining":4999},"organization":{"teams":{
+  "pageInfo":{"hasNextPage":false,"endCursor":null},
+  "nodes":$(jq -c 'map({slug: .slug, repositories: {totalCount: .size}})' <<<"$1")}}}}
+EOF
+    # One sequenced TeamRepos response per surviving team, in team-decisions order.
+    local i=0 slug
+    for slug in $(jq -r '.[].slug' <<<"$1"); do
+        i=$((i + 1))
+        jq -cn --arg s "$slug" --arg p "$(jq -r --arg s "$slug" '.[$s] // "ADMIN"' <<<"$2")" '
+          {data: {rateLimit: {cost: 1, remaining: 4999},
+                  organization: {team: {slug: $s, repositories: {
+                    pageInfo: {hasNextPage: false, endCursor: null},
+                    edges: [{permission: $p, node: {nameWithOwner: "acme/widgets"}}]}}}}}' \
+            | fixture "graphql_TeamRepos.$i"
+    done
+}
+
+@test "the smallest candidate team with admin wins" {
+    org_fixtures
+    team_fixtures '[{"slug":"small","size":3},{"slug":"big","size":40}]' '{}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl --max-team-size 100
+    [ "$status" -eq 0 ]
+    [ "$(rec .owner.team)" = "small" ]
+    [ "$(rec .owner.source)" = "team-index" ]
+}
+
+@test "an org-wide team is dropped by size" {
+    org_fixtures
+    team_fixtures '[{"slug":"squad","size":3},{"slug":"everyone","size":900}]' '{}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl --max-team-size 100
+    [ "$status" -eq 0 ]
+    [ "$(rec .owner.team)" = "squad" ]
+    [ "$(rec '.owner.candidates | index("everyone")')" = "null" ]
+}
+
+@test "a bot team is dropped by name even though it is small" {
+    org_fixtures
+    team_fixtures '[{"slug":"squad","size":9},{"slug":"woo-eng-bot","size":2}]' '{}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl --max-team-size 100
+    [ "$status" -eq 0 ]
+    [ "$(rec .owner.team)" = "squad" ]
+}
+
+@test "a team with only pull access is not an owner" {
+    org_fixtures
+    team_fixtures '[{"slug":"squad","size":3}]' '{"squad":"READ"}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl --max-team-size 100
+    [ "$status" -eq 0 ]
+    [ "$(rec .owner.team)" = "null" ]
+    [ "$(rec .owner.source)" = "unmapped" ]
+}
+
+@test "a widely shared repo is reported as shared rather than assigned" {
+    # Smallest-wins is actively wrong here: it picks whichever team happens to
+    # own fewest repos overall, which is the least likely owner.
+    org_fixtures
+    team_fixtures '[{"slug":"tiny","size":1},{"slug":"b","size":5},{"slug":"c","size":6},{"slug":"d","size":7}]' '{}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl --max-team-size 100
+    [ "$status" -eq 0 ]
+    [ "$(rec .owner.source)" = "ambiguous" ]
+    [ "$(rec .owner.team)" = "null" ]
+    [ "$(rec '.owner.candidates | length')" -eq 4 ]
+}
+
+@test "--max-owner-candidates raises the threshold" {
+    org_fixtures
+    team_fixtures '[{"slug":"tiny","size":1},{"slug":"b","size":5},{"slug":"c","size":6},{"slug":"d","size":7}]' '{}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl --max-team-size 100 --max-owner-candidates 4
+    [ "$status" -eq 0 ]
+    [ "$(rec .owner.team)" = "tiny" ]
+}
+
+@test "an override wins over the heuristic" {
+    org_fixtures
+    team_fixtures '[{"slug":"small","size":3}]' '{}'
+    printf '# comment\n\nacme/widgets\tchosen-team\tbecause I said so\n' >"$BATS_TEST_TMPDIR/ov.tsv"
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl --max-team-size 100 \
+        --team-overrides "$BATS_TEST_TMPDIR/ov.tsv"
+    [ "$status" -eq 0 ]
+    [ "$(rec .owner.team)" = "chosen-team" ]
+    [ "$(rec .owner.source)" = "override" ]
+}
+
+@test "--explain-owners reports why each team was kept or dropped" {
+    org_fixtures
+    team_fixtures '[{"slug":"squad","size":3},{"slug":"everyone","size":900}]' '{}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format summary --max-team-size 100 --explain-owners
+    [ "$status" -eq 0 ]
+    [[ $output == *"squad"* ]]
+    [[ $output == *"everyone"* ]]
 }
 
 # --- scope, output and concurrency --------------------------------------------
