@@ -1010,7 +1010,6 @@ assemble() {
           | . as $rec
           | ([$rec.checks | to_entries[] | select(.value.status == "fail") | .key]) as $blockers
           | ([$rec.checks | to_entries[] | select(.value.status == "unknown") | .key]) as $unknowns
-          | ([$rec.checks | to_entries[] | select(.value.status == "na") | .key]) as $nas
           # bootstrap.sh fixes these four itself, idempotently. The rest need a
           # decision or a file, so they are what a team actually has to act on.
           | (["auto_merge", "labels", "vuln_alerts", "required_checks"]) as $bootstrappable
@@ -1026,11 +1025,16 @@ assemble() {
                 bootstrap_fixes: ($blockers | map(select(. as $b | $bootstrappable | index($b)))),
                 needs_work: ($blockers | map(select(. as $b | $bootstrappable | index($b) | not)))
               },
+              # Applicability is decided first, because a repo with no
+              # dependencies should not be reported as blocked on labels. But
+              # "no manifest found" and "could not read the file tree" are not
+              # the same answer, and calling the second one not-applicable
+              # would quietly drop a repo we never managed to look at.
               verdict: (
-                if ($applicable | not) then "na"
+                if (($applicable | not) and ($rec.checks.dependabot_config.status == "unknown")) then "unknown"
+                elif ($applicable | not) then "na"
                 elif ($blockers | length) > 0 then "blocked"
                 elif ($unknowns | length) > 0 then "unknown"
-                elif ($nas | length) == ($rec.checks | length) then "na"
                 else "ready" end),
               preflight: {
                 verdict: (

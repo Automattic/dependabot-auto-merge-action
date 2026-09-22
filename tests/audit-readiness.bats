@@ -452,6 +452,19 @@ EOF
     [ "$(rec .checks.dependabot_config.status)" = "pass" ]
 }
 
+@test "an unreadable file tree is not reported as having no dependencies" {
+    # "no manifest found" and "could not look" are different answers, and
+    # calling the second one not-applicable drops the repo from the rollout.
+    repo_set '. * {depYml: null, depYaml: null, caller: null,
+                   root: {entries: [{name: "README.md", type: "blob"}]}}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":true,"tree":[]}
+EOF
+    run_audit
+    [ "$(rec .checks.dependabot_config.status)" = "unknown" ]
+    [ "$(rec .verdict)" = "unknown" ]
+}
+
 @test "a truncated file tree is unknown, never a verdict" {
     # Deciding on an incomplete list is the exact failure this check exists to
     # catch, so it refuses rather than guessing.
