@@ -21,7 +21,7 @@ jobs:
         name: actionlint
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - name: Download actionlint
               id: get_actionlint
               # actionlint v1.7.12
@@ -35,7 +35,7 @@ jobs:
         name: shellcheck
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - name: Check shell scripts
               # shellcheck is preinstalled on ubuntu-latest. find keeps the
               # coverage recursive to match the scripts/** trigger paths;
@@ -51,7 +51,7 @@ jobs:
         name: bats
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - name: Install bats
               run: sudo apt-get update && sudo apt-get install -y bats
             - name: Run tests
@@ -69,7 +69,7 @@ jobs:
                 # CI proves the version operators are told they need.
                 php: ['8.2', '8.4']
         steps:
-            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
               with:
                   php-version: ${{ matrix.php }}
