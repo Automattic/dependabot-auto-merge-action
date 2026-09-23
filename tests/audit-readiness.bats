@@ -51,7 +51,18 @@ jobs:
       security-events: read
     with:
       event-name: ${{ github.event_name }}
+    secrets:
+      token: ${{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN }}
 EOF
+}
+
+# Repo and organisation secret listings. Values are never readable through the
+# API; names are, which is all the check needs.
+secrets_fixture() {
+    local names=${1:-QUALITYOPS_DEPENDABOT_ALERTS_TOKEN}
+    jq -cn --arg n "$names" '{secrets: ($n | split(",") | map(select(length > 0) | {name: .}))}' \
+        | fixture GET_repos_acme_widgets_actions_secrets_per_page_100
+    fixture GET_repos_acme_widgets_actions_organization_secrets_per_page_100 <<<'{"secrets":[]}'
 }
 
 # A repo where every check passes. Tests patch this with a jq expression to
@@ -98,6 +109,7 @@ viewer_fixture() {
 repo_set() {
     local patch=${1:-.}
     viewer_fixture
+    secrets_fixture
     base_node | jq --argjson rl '{"cost":1,"remaining":4999,"resetAt":null}' \
         "{data: {rateLimit: \$rl, r_0: ($patch)}}" | fixture graphql_RepoSet
 }
@@ -105,6 +117,7 @@ repo_set() {
 # Write a RepoSet response holding several nodes; each argument is a jq patch.
 repo_set_many() {
     viewer_fixture
+    secrets_fixture
     local out i=0 patch
     out=$(jq -n '{data: {rateLimit: {cost: 1, remaining: 4999, resetAt: null}}}')
     for patch in "$@"; do
@@ -234,6 +247,7 @@ rec() {
 
 @test "a GraphQL error on one field reports unknown, not fail" {
     viewer_fixture
+    secrets_fixture
     base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
                             r_0: (. * {hasVulnerabilityAlertsEnabled: null})},
                      errors: [{message: "Resource not accessible",
@@ -248,6 +262,7 @@ rec() {
 
 @test "a fail outranks an unknown in the verdict" {
     viewer_fixture
+    secrets_fixture
     base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
                             r_0: (. * {autoMergeAllowed: false,
                                        hasVulnerabilityAlertsEnabled: null})},
@@ -544,6 +559,76 @@ EOF
     repo_set
     run_audit
     [ "$(rec .adoption)" = "adopted" ]
+}
+
+# --- alerts token -------------------------------------------------------------
+
+@test "the alerts token passes when the secret the caller names exists" {
+    repo_set
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+    [ "$(rec .checks.alerts_token.secret)" = "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN" ]
+}
+
+@test "a missing alerts token blocks, because GITHUB_TOKEN cannot read that API" {
+    repo_set
+    secrets_fixture "SOME_OTHER_SECRET"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    [ "$(rec '.blockers | index("alerts_token") != null')" = "true" ]
+    [[ "$(rec .checks.alerts_token.detail)" == *"GITHUB_TOKEN cannot read"* ]]
+}
+
+@test "an organisation secret satisfies the alerts token check" {
+    repo_set
+    secrets_fixture ""
+    fixture GET_repos_acme_widgets_actions_organization_secrets_per_page_100 \
+        <<<'{"secrets":[{"name":"QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"}]}'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "the secret name is read from the caller rather than assumed" {
+    repo_set '.caller.text |= sub("QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"; "MY_OWN_TOKEN")'
+    secrets_fixture "MY_OWN_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+    [ "$(rec .checks.alerts_token.secret)" = "MY_OWN_TOKEN" ]
+}
+
+@test "a caller with no secrets block falls back to the configured name" {
+    repo_set '.caller.text |= sub("\n    secrets:\n      token: \\$\\{\\{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN \\}\\}"; "")'
+    secrets_fixture "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.secret)" = "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN" ]
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "--alerts-token-secret changes the name looked for" {
+    repo_set '.caller.text |= sub("\n    secrets:\n      token: \\$\\{\\{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN \\}\\}"; "")'
+    secrets_fixture "WOO_ALERTS_TOKEN"
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --alerts-token-secret WOO_ALERTS_TOKEN
+    [ "$status" -eq 0 ]
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "secrets we cannot list are unknown, not a missing token" {
+    # Listing repository secrets needs admin, so a lead without it must not be
+    # told their repo is broken.
+    repo_set
+    rm -f "$GH_STUB_DIR/GET_repos_acme_widgets_actions_secrets_per_page_100"
+    fixture GET_repos_acme_widgets_actions_secrets_per_page_100.err <<<'gh: Not Found (HTTP 404)'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "unknown" ]
+    [ "$(rec '.blockers | index("alerts_token")')" = "null" ]
+}
+
+@test "the alerts token is not something bootstrap.sh can fix" {
+    repo_set
+    secrets_fixture "NOTHING_USEFUL"
+    run_audit
+    [ "$(rec '.remediation.needs_work | index("alerts_token") != null')" = "true" ]
+    [ "$(rec '.remediation.bootstrap_fixes | index("alerts_token")')" = "null" ]
 }
 
 # --- merge method and risks ---------------------------------------------------

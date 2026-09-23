@@ -60,6 +60,10 @@ Expectations:
   --fast-track-label <name>  Default security-fast-track.
   --pending-label <name>     Default auto-merge-pending.
   --review-label <name>      Default sirt-review-required.
+  --alerts-token-secret <n>  Secret name to look for when a caller workflow does
+                             not name one itself. Default
+                             QUALITYOPS_DEPENDABOT_ALERTS_TOKEN, the name
+                             already in use in the Automattic org.
   --expect-ref <sha>         Caller workflows are compared against this ref.
                              Unresolvable means unknown, never fail.
   --team-overrides <file>    Default scripts/audit-team-overrides.tsv.
@@ -584,6 +588,7 @@ phase_activity() {
 probe_repo() {
     local repo=$1 node branch enc out
     local checks_status="" checks_detail="" config_status="" config_detail="" manifest_count=""
+    local token_status="" token_detail=""
 
     node=$(jq -c --arg r "$repo" 'select(.nameWithOwner == $r)' "$AUDIT_WORK/nodes.jsonl" | head -1)
     if [[ -z $node ]]; then
@@ -689,7 +694,41 @@ probe_repo() {
         fi
     fi
 
+    # --- is an alerts token actually wired up? --------------------------------
+    #
+    # GITHUB_TOKEN cannot read the Dependabot alerts API under any
+    # configuration, so a repo without this secret loses every
+    # indirect-dependency security PR. Secret *values* are never readable;
+    # names are, which is enough to tell "wired" from "not wired".
+    local want_secret repo_secrets org_secrets
+    # The caller names the secret in a `secrets:` block, so the name sits on the
+    # `token:` line rather than after a literal "secrets.token". capture()
+    # raises on no match, hence the `?`.
+    want_secret=$(jq -r '((.caller.text // "")
+        | capture("(^|\\n)\\s*token\\s*:\\s*\\$\\{\\{\\s*secrets\\.(?<n>[A-Za-z0-9_]+)")?
+        | .n) // empty' <<<"$node" 2>/dev/null)
+    [[ -n $want_secret ]] || want_secret=$ALERTS_TOKEN_SECRET
+
+    if ! repo_secrets=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
+        # Listing repository secrets needs admin. Not knowing is not a failure.
+        token_status=unknown
+        token_detail="cannot list repository secrets (needs admin); could not confirm '$want_secret'"
+    else
+        org_secrets=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100" || printf '{"secrets":[]}')
+        if jq -e --arg n "$want_secret" '
+                [(.repo.secrets // [])[], (.org.secrets // [])[]]
+                | any(.name == $n)
+            ' >/dev/null 2>&1 <<<"$(jq -n --argjson repo "$repo_secrets" --argjson org "${org_secrets:-\{\}}" '{repo: $repo, org: $org}' 2>/dev/null || printf '{}')"; then
+            token_status=pass
+            token_detail="secret '$want_secret' exists"
+        else
+            token_status=fail
+            token_detail="no secret named '$want_secret'; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
+        fi
+    fi
+
     jq -cn --arg r "$repo" \
+        --arg ts "$token_status" --arg td "$token_detail" --arg tn "$want_secret" \
         --arg cs "$checks_status" --arg cd "$checks_detail" \
         --arg gs "$config_status" --arg gd "$config_detail" --arg mc "$manifest_count" \
         '{repo: $r}
@@ -697,6 +736,9 @@ probe_repo() {
          + (if $gs == "" then {} else
               {dependabot_config: {status: $gs, detail: $gd, source: "rest",
                                    manifest_count: (if $mc == "" then null else ($mc | tonumber) end)}}
+            end)
+         + (if $ts == "" then {} else
+              {alerts_token: {status: $ts, detail: $td, source: "rest", secret: $tn}}
             end)'
 }
 
@@ -705,21 +747,11 @@ phase_narrow() {
 
     # Undecided means: no ruleset status-check rule, and no classic rule
     # visible in the bulk sweep. Everything else was already answered for free.
-    # A repo lands here if the bulk sweep could not answer either of the two
-    # questions REST can settle: whether the default branch requires a check,
-    # and, for any repo without a config, where its manifests actually live.
-    # The second one deliberately does not pre-filter on a root manifest. That
-    # is what hid repos whose manifests live only in subdirectories.
+    # Every in-scope repo is probed, because the alerts-token check applies to
+    # all of them. The probe decides which of its three REST questions a given
+    # repo actually needs, so one the bulk sweep already answered stays cheap.
     jq -r '
         select(.isArchived == false and .isFork == false and .isDisabled == false)
-        | select(
-            (
-              ((.defaultBranchRef.rules.nodes // []) | map(select(.type == "REQUIRED_STATUS_CHECKS")) | length) == 0
-              and (.defaultBranchRef.branchProtectionRule // null) == null
-              and .defaultBranchRef != null
-            )
-            or (.depYml == null and .depYaml == null)
-          )
         | .nameWithOwner
     ' "$WORK/nodes.jsonl" | sort -u >"$WORK/todo"
 
@@ -728,7 +760,13 @@ phase_narrow() {
     [[ $count -gt 0 ]] || return 0
 
     mkdir -p "$WORK/probes"
+    # The worker is a fresh process that only receives --probe-repo, so every
+    # setting its REST calls depend on has to travel by environment.
     export AUDIT_WORK="$WORK"
+    export AUDIT_CACHE_TTL="$CACHE_TTL"
+    export AUDIT_NO_CACHE="$NO_CACHE"
+    export AUDIT_RATE_FLOOR="$RATE_FLOOR"
+    export AUDIT_ALERTS_TOKEN_SECRET="$ALERTS_TOKEN_SECRET"
 
     if [[ $JOBS -le 1 ]]; then
         local r
@@ -964,6 +1002,14 @@ assemble() {
                         end
                     end),
 
+                alerts_token: (
+                  if ($nr.alerts_token == null) then
+                    check("unknown"; "the alerts-token secret was not checked"; "rest")
+                  else
+                    check($nr.alerts_token.status; $nr.alerts_token.detail; "rest")
+                      + {secret: $nr.alerts_token.secret}
+                  end),
+
                 merge_method: (
                   if (merge_allowed($n) == null) then
                     check("unknown"; "your token cannot see the merge settings"; "graphql_error")
@@ -1025,6 +1071,8 @@ assemble() {
           | ([$rec.checks | to_entries[] | select(.value.status == "unknown") | .key]) as $unknowns
           # bootstrap.sh fixes these four itself, idempotently. The rest need a
           # decision or a file, so they are what a team actually has to act on.
+          # bootstrap.sh fixes these four. The alerts token is deliberately not
+          # among them: it is one central secret, not per-repo work.
           | (["auto_merge", "labels", "vuln_alerts", "required_checks"]) as $bootstrappable
           | $rec + {
               adoption: (
@@ -1227,6 +1275,7 @@ FAST_TRACK_LABEL="security-fast-track"
 PENDING_LABEL="auto-merge-pending"
 REVIEW_LABEL="sirt-review-required"
 EXPECT_REF=""
+ALERTS_TOKEN_SECRET="QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
 TEAM_OVERRIDES=""
 EXCLUDE_TEAMS="$DEFAULT_EXCLUDE_TEAMS"
 MAX_TEAM_SIZE="25%"
@@ -1311,6 +1360,11 @@ while [[ $# -gt 0 ]]; do
             [[ $2 != -* ]] || die_usage "--expect-ref needs a value, got option '$2'"
             EXPECT_REF=$2; shift 2 ;;
         --expect-ref=*) EXPECT_REF=${1#--expect-ref=}; shift ;;
+        --alerts-token-secret)
+            need_value "$1" $#
+            [[ $2 != -* ]] || die_usage "--alerts-token-secret needs a value, got option '$2'"
+            ALERTS_TOKEN_SECRET=$2; shift 2 ;;
+        --alerts-token-secret=*) ALERTS_TOKEN_SECRET=${1#--alerts-token-secret=}; shift ;;
         --team-overrides)
             need_value "$1" $#
             [[ $2 != -* ]] || die_usage "--team-overrides needs a value, got option '$2'"
@@ -1374,6 +1428,10 @@ done
 if [[ -n $PROBE_REPO ]]; then
     : "${AUDIT_WORK:?--probe-repo is internal and needs AUDIT_WORK}"
     WORK=$AUDIT_WORK
+    CACHE_TTL=${AUDIT_CACHE_TTL:-$CACHE_TTL}
+    NO_CACHE=${AUDIT_NO_CACHE:-$NO_CACHE}
+    RATE_FLOOR=${AUDIT_RATE_FLOOR:-$RATE_FLOOR}
+    ALERTS_TOKEN_SECRET=${AUDIT_ALERTS_TOKEN_SECRET:-$ALERTS_TOKEN_SECRET}
     braked && exit 75
     probe_repo "$PROBE_REPO" >"$WORK/probes/$(printf '%s' "$PROBE_REPO" | tr -c 'A-Za-z0-9' '_').json"
     exit 0

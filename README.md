@@ -315,7 +315,7 @@ jobs:
 
 Store it as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`. An organisation secret is the least work across many repositories: set it once, and each caller picks it up with the two lines above.
 
-`scripts/audit-readiness.sh` does not check for this secret. Secret names are not readable through the API, so the audit cannot tell an org secret from a missing one; treat it as a prerequisite you confirm centrally rather than per repo.
+`scripts/audit-readiness.sh` checks this. It reads the secret name out of your caller workflow's `secrets.token` line and confirms a secret by that name exists, at repo or organisation level. Values are never readable, only names, and listing repository secrets needs admin, so without it the check reports `unknown` rather than a failure.
 
 ## Troubleshooting
 
