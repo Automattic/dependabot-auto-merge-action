@@ -1,0 +1,117 @@
+{
+  "$comment": "Wire contract for the request body the action POSTs to wpcom/v2/ci-telemetry. Machine-checked by validate.mjs. Types here are the types that must survive into the Logstash properties object, so changing one is an Elasticsearch mapping change, not a rename.",
+  "feature": "dependabot_auto_merge",
+  "endpoint": "https://public-api.wordpress.com/wpcom/v2/ci-telemetry",
+  "auth_header": "X-CI-Telemetry-Token",
+  "body_cap_bytes": 8192,
+
+  "outcomes": {
+    "preflight_pass": { "job": "preflight", "success": true, "severity": "info", "message": "preflight_passed" },
+    "preflight_warn": { "job": "preflight", "success": true, "severity": "warning", "message": "preflight_unverifiable" },
+    "preflight_fail": { "job": "preflight", "success": false, "severity": "error", "message": "preflight_failed" },
+
+    "fast_track": { "job": "evaluate_pr", "success": true, "severity": "info", "message": "fast_tracked" },
+    "no_advisory": { "job": "evaluate_pr", "success": true, "severity": "info", "message": "no_advisory" },
+    "cvss_unavailable": { "job": "evaluate_pr", "success": true, "severity": "info", "message": "review_required" },
+    "below_cvss_threshold": { "job": "evaluate_pr", "success": true, "severity": "info", "message": "review_required" },
+    "compat_unavailable": { "job": "evaluate_pr", "success": true, "severity": "info", "message": "review_required" },
+    "below_compat_threshold": { "job": "evaluate_pr", "success": true, "severity": "info", "message": "review_required" },
+    "pending": { "job": "evaluate_pr", "success": true, "severity": "info", "message": "gates_passed" },
+    "evaluate_error": { "job": "evaluate_pr", "success": false, "severity": "error", "message": "evaluation_failed" },
+
+    "scheduled_merge_enabled": { "job": "scheduled_merge", "success": true, "severity": "info", "message": "merge_enabled" },
+    "scheduled_merge_skipped": { "job": "scheduled_merge", "success": true, "severity": "warning", "message": "merge_skipped" },
+    "scheduled_merge_revoked": { "job": "scheduled_merge", "success": true, "severity": "warning", "message": "merge_revoked" },
+    "scheduled_merge_failed": { "job": "scheduled_merge", "success": false, "severity": "error", "message": "merge_failed" },
+    "scheduled_merge_evidence_unreadable": { "job": "scheduled_merge", "success": false, "severity": "error", "message": "merge_blocked" },
+    "scheduled_merge_revoke_failed": { "job": "scheduled_merge", "success": false, "severity": "error", "message": "merge_revoke_failed" }
+  },
+
+  "$outcome_notes": {
+    "$comment": "Why the list is longer than the gates suggest.",
+    "compat_unavailable": "Gate 3 fails closed when no direct dependency carries a usable compatibility score, which is a different signal from a score below the threshold. fetch-metadata writes 0 both when the lookup is off and when Dependabot has no score, so this counts the unscored, exactly as cvss_unavailable does for advisories.",
+    "evaluate_error": "The emitter runs under always(), so it also fires when the job errored before reaching a verdict. Without its own outcome those runs would either be lost or miscounted as a gate decision.",
+    "scheduled_merge_skipped": "A candidate whose head commit carries no passing eligibility status. The job warns and moves on, so this is the action working, not a failure.",
+    "scheduled_merge_revoked": "An evaluation withdrew the eligibility evidence while auto-merge was being enabled, so the job disabled it again. Rare, and worth counting because it means two jobs raced.",
+    "fast_track_refused": "Not an outcome. A refused override falls through to the normal gates, so the run still ends in a gate outcome and the refusal rides along as fast_track_refused with a reason."
+  },
+
+  "fail_reasons": {
+    "preflight_fail": ["auto_merge_disabled", "no_required_checks", "repo_metadata_unreadable"],
+    "preflight_warn": ["auto_merge_unverifiable", "classic_protection_unverifiable", "rulesets_unreadable"],
+    "compat_unavailable": ["no_usable_score", "no_direct_dependencies", "metadata_unreadable"],
+    "evaluate_error": ["gate_step_failed", "labeling_failed", "eligibility_write_failed", "revoke_failed", "unknown"],
+    "scheduled_merge_skipped": ["no_eligibility_evidence", "eligibility_withdrawn"],
+    "scheduled_merge_failed": ["merge_api_error"],
+    "scheduled_merge_evidence_unreadable": ["status_lookup_failed"],
+    "scheduled_merge_revoke_failed": ["disable_api_error"]
+  },
+
+  "fields": {
+    "feature":            { "type": "string", "required": true,  "const": "dependabot_auto_merge", "destination": "top_level" },
+    "source":             { "type": "string", "required": true,  "const": "dependabot-auto-merge", "pattern": "^[a-z0-9_-]{1,64}$", "destination": "properties" },
+    "outcome":            { "type": "string", "required": true,  "enum_ref": "outcomes", "destination": "properties" },
+    "job":                { "type": "string", "required": true,  "enum": ["preflight", "evaluate_pr", "scheduled_merge"], "destination": "properties" },
+    "repo":               { "type": "string", "required": true,  "pattern": "^[^/]+/[^/]+$", "destination": "properties" },
+    "github_host":        { "type": "string", "required": true,  "enum": ["github.com", "github.a8c.com"], "destination": "properties" },
+    "ci_provider":        { "type": "string", "required": true,  "const": "github_actions", "destination": "properties" },
+    "build_url":          { "type": "string", "required": true,  "pattern": "^https://", "destination": "top_level_url" },
+
+    "pr":                 { "type": "string", "required": false, "pattern": "^[0-9]+$", "destination": "properties", "note": "String, not integer. ai_review already maps properties.pr as a string in the shared index." },
+    "pr_head_sha":        { "type": "string", "required": false, "destination": "top_level_commit" },
+    "event_action":       { "type": "string", "required": false, "enum": ["opened", "synchronize", "reopened", "labeled", "unlabeled", "schedule"], "destination": "properties", "note": "unlabeled is a caller trigger since QAO-768. Removing the fast-track label has to re-evaluate, or a withdrawn override leaves a queued auto-merge standing." },
+    "duration":           { "type": "number", "required": false, "destination": "top_level" },
+    "fail_reason":        { "type": "string", "required": false, "nullable": true, "destination": "properties" },
+
+    "ghsa_id":            { "type": "string", "required": false, "pattern": "^GHSA-", "destination": "properties" },
+    "gate1_source":       { "type": "string", "required": false, "enum": ["pr_metadata", "alerts_api"], "destination": "properties" },
+    "dependency_names":   { "type": "string", "required": false, "destination": "properties" },
+    "dependency_type":    { "type": "string", "required": false, "enum": ["direct:production", "direct:development", "indirect", "unknown"], "destination": "properties", "note": "The values fetch-metadata actually emits, not a direct/indirect pair. It reports the most direct type across every updated dependency, so indirect means nothing in the PR is direct. Empty is normalised to unknown by the emitter." },
+
+    "cvss_reported":      { "type": "string", "required": false, "destination": "properties", "note": "Deliberately a string. Its purpose is to carry the values GitHub sends that are not usable scores, including \"\", \"0.0\", \"00\", \".00\" and anything non-numeric. Typing it as a number destroys the exact signal it exists to capture." },
+    "cvss_effective":     { "type": "number", "required": false, "minimum": 0.1, "maximum": 10, "destination": "properties", "note": "Present only when the score was usable. Never 0." },
+    "cvss_threshold":     { "type": "number", "required": false, "destination": "properties" },
+    "compat_score":       { "type": "integer", "required": false, "minimum": 1, "maximum": 100, "destination": "properties", "note": "Present only when a usable score exists. Gate 3 treats 0 as missing data, so 0 never reaches this field." },
+    "compat_threshold":   { "type": "integer", "required": false, "destination": "properties" },
+    "compat_dependency":  { "type": "string", "required": false, "destination": "properties", "note": "The direct dependency that decided Gate 3, meaning the lowest scoring one on a pass or a rejection, and the first unscored one when no score was usable." },
+
+    "merge_method":       { "type": "string", "required": false, "enum": ["squash", "merge", "rebase"], "destination": "properties" },
+    "age_days_config":    { "type": "integer", "required": false, "destination": "properties" },
+    "pr_age_days":        { "type": "number", "required": false, "destination": "properties" },
+
+    "fast_track_actor":   { "type": "string", "required": false, "destination": "properties", "note": "The login that applied the fast-track label, resolved from the PR's label history by the authorization check. Already recorded publicly in the audit comment on the PR." },
+    "fast_track_role":    { "type": "string", "required": false, "destination": "properties", "note": "role_name from the collaborator permission lookup, which can be a custom org role, so no enum." },
+    "fast_track_refused": { "type": "boolean", "required": false, "destination": "properties", "note": "Boolean rather than a string. properties is JSON encoded before it reaches Elasticsearch, and ai_review already maps properties.is_followup as a boolean, so nested booleans survive. The string rule applies to top-level success, which PHP casts." },
+    "fast_track_refusal_reason": { "type": "string", "required": false, "enum": ["label_history_unreadable", "label_history_unparseable", "no_current_label_application", "permission_unreadable", "insufficient_role"], "destination": "properties" },
+
+    "auto_merge_revoked": { "type": "boolean", "required": false, "destination": "properties", "note": "The evaluation withdrew an auto-merge this workflow had queued." },
+    "revoke_reason":      { "type": "string", "required": false, "enum": ["gates_failed", "age_gate_not_cleared"], "destination": "properties" }
+  },
+
+  "required_by_outcome": {
+    "preflight_fail": ["fail_reason"],
+    "preflight_warn": ["fail_reason"],
+
+    "fast_track": ["pr", "fast_track_actor"],
+    "cvss_unavailable": ["pr", "cvss_reported"],
+    "below_cvss_threshold": ["pr", "cvss_effective", "cvss_threshold"],
+    "compat_unavailable": ["pr", "compat_threshold", "fail_reason"],
+    "below_compat_threshold": ["pr", "compat_score", "compat_threshold"],
+    "pending": ["pr"],
+    "evaluate_error": ["pr", "fail_reason"],
+
+    "scheduled_merge_enabled": ["pr", "pr_head_sha", "pr_age_days"],
+    "scheduled_merge_skipped": ["pr", "pr_head_sha", "fail_reason"],
+    "scheduled_merge_revoked": ["pr", "pr_head_sha"],
+    "scheduled_merge_failed": ["pr", "fail_reason"],
+    "scheduled_merge_evidence_unreadable": ["pr", "pr_head_sha", "fail_reason"],
+    "scheduled_merge_revoke_failed": ["pr", "pr_head_sha", "fail_reason"]
+  },
+
+  "forbidden_by_outcome": {
+    "$comment": "Invariants that a payload builder can get wrong silently. An unusable score never becomes the effective score, and a fast-tracked PR never ran a gate at all.",
+    "cvss_unavailable": ["cvss_effective"],
+    "compat_unavailable": ["compat_score"],
+    "fast_track": ["cvss_reported", "cvss_effective", "compat_score", "auto_merge_revoked"]
+  }
+}
