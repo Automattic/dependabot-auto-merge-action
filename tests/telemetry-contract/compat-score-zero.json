@@ -1,0 +1,15 @@
+{
+  "compat_score_zero": {
+    "feature": "dependabot_auto_merge",
+    "source": "dependabot-auto-merge",
+    "outcome": "below_compat_threshold",
+    "job": "evaluate_pr",
+    "repo": "Automattic/some-repo",
+    "github_host": "github.com",
+    "ci_provider": "github_actions",
+    "build_url": "https://github.com/Automattic/some-repo/actions/runs/1",
+    "pr": "500",
+    "compat_score": 0,
+    "compat_threshold": 80
+  }
+}
