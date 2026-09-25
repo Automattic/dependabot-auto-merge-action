@@ -1,0 +1,7 @@
+# actionlint 1.7.12 predates the vulnerability-alerts permission GitHub added
+# on 2026-09-03 (rhysd/actionlint#666, #713). Ignore only that message, only
+# on the workflow that requests it.
+paths:
+    .github/workflows/dependabot-auto-merge.yml:
+        ignore:
+            - 'unknown permission scope "vulnerability-alerts"'

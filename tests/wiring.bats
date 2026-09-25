@@ -15,6 +15,17 @@ setup_file() {
     grep -qF "steps.cvss.outputs.available == 'true'" <<<"$(extract_if gate2)"
 }
 
+# --- permissions (QAO-767) --------------------------------------------------
+
+# security-events does not cover Dependabot alerts: with it alone the alerts
+# API is a 403 and fetch-metadata's GraphQL lookup returns nothing. Confirmed
+# live on 2026-09-16 in asahasrabuddhe/qao766-fixture-eligibility.
+@test "the workflow requests vulnerability-alerts: read for Dependabot alerts" {
+    block=$(awk '/^permissions:/{p=1; next} p && /^[^ #]/{exit} p' "$WORKFLOW" | grep -v '^ *#')
+    grep -qxF '    vulnerability-alerts: read' <<<"$block"
+    ! grep -q 'security-events' <<<"$block"
+}
+
 # --- fast-track detection (QAO-765) ---------------------------------------
 
 @test "the fast-track detection runs on every evaluation" {
