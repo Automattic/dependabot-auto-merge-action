@@ -1217,7 +1217,12 @@ render_summary() {
           ($all | group_by(.adoption) | sort_by(-length) | .[]
                 | "  \(length | tostring | (. + "    ")[0:4]) \(.[0].adoption)"),
           "",
-          "  of which bootstrap.sh fixes every blocker on  \($all | map(select(.verdict == "blocked" and (.remediation.needs_work | length) == 0)) | length)",
+          # The alerts token is one central secret, not per-repo work, so
+          # counting it as work makes this number 0 everywhere and useless.
+          # Report both: what a team can finish alone, and what it can finish
+          # once the token is in place centrally.
+          "  bootstrap.sh finishes           \($all | map(select(.verdict == "blocked" and (.remediation.needs_work | length) == 0)) | length)",
+          "  bootstrap.sh plus the token     \($all | map(select(.verdict == "blocked" and ((.remediation.needs_work - ["alerts_token"]) | length) == 0)) | length)",
           "",
           "Most common blockers:",
           ($all | map(.blockers[]) | group_by(.) | map({k: .[0], n: length})
