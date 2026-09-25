@@ -1,33 +1,32 @@
 #!/usr/bin/env bats
-# Tests for the fast-track authorization and audit steps of the reusable
+# Tests for the fast-track detection and audit steps of the reusable
 # workflow, run against the gh stub in tests/stubs/. The step scripts are
 # pulled out of the YAML and run as-is, so these tests exercise the shipped
 # code rather than a copy that can drift.
 #
-# The fast-track label bypasses every gate, and a triage user can apply a
-# label without being able to enable auto-merge. So the label only counts
-# when the user who most recently applied it can merge, and the event that
-# happens to be running (a Dependabot `synchronize`, typically) says nothing
-# about who that was.
+# A person fast-tracks a PR by enabling auto-merge on it themselves. GitHub
+# checks that they can merge, so the workflow only reads who enabled it. A
+# person bypasses the gates; this workflow's own scheduled merge, which
+# enables auto-merge as github-actions[bot], does not.
 
 load helpers
 
 setup_file() {
     REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
     WORKFLOW="$REPO_ROOT/.github/workflows/dependabot-auto-merge.yml"
-    export AUTH_STEP="$BATS_FILE_TMPDIR/fast-track-auth.sh"
+    export DETECT_STEP="$BATS_FILE_TMPDIR/fast-track.sh"
     export AUDIT_STEP="$BATS_FILE_TMPDIR/fast-track-audit.sh"
-    extract_run fast-track-auth >"$AUTH_STEP"
+    extract_run fast-track >"$DETECT_STEP"
     extract_run fast-track-audit >"$AUDIT_STEP"
     # Guard the extractor: an empty or half-dedented script would pass the
-    # refusal assertions below for the wrong reason.
-    for step in "$AUTH_STEP" "$AUDIT_STEP"; do
+    # no-output assertions below for the wrong reason.
+    for step in "$DETECT_STEP" "$AUDIT_STEP"; do
         [ -s "$step" ]
         bash -n "$step"
     done
-    grep -q 'collaborators/' "$AUTH_STEP"
-    grep -q 'authorized=' "$AUTH_STEP"
+    grep -q 'active=' "$DETECT_STEP"
     grep -q 'pr comment' "$AUDIT_STEP"
+    grep -q 'add-label' "$AUDIT_STEP"
 }
 
 setup() {
@@ -39,209 +38,99 @@ setup() {
     export PR_NUMBER=42
     export PR_URL="https://github.com/acme/widgets/pull/42"
     export FAST_TRACK_LABEL=security-fast-track
+    export RUN_URL=https://example.test/run
     mkdir -p "$GH_STUB_DIR"
     : >"$GH_STUB_LOG"
     : >"$GITHUB_OUTPUT"
     PATH="$REPO_ROOT/tests/stubs:$PATH"
 }
 
-EVENTS_KEY="GET_repos_acme_widgets_issues_42_events_per_page_100"
+PULL_KEY="GET_repos_acme_widgets_pulls_42"
+COMMENTS_KEY="GET_repos_acme_widgets_issues_42_comments_per_page_100"
 
-# One issue event: $1 = id, $2 = labeled|unlabeled, $3 = actor, $4 = label
-# name. The timestamp derives from the id so fixtures stay in order without
-# date arithmetic.
-label_event() {
-    printf '{"id":%s,"event":"%s","actor":{"login":"%s"},"label":{"name":"%s","color":"0075ca"},"created_at":"2026-09-01T10:00:%02dZ"}' \
-        "$1" "$2" "$3" "$4" "$1"
+# The PR as the pulls API returns it, with auto-merge enabled by $1, or not
+# enabled at all when $1 is empty. The same shape tests/revoke.bats uses.
+pull_fixture() {
+    if [ -n "$1" ]; then
+        jq -n --arg by "$1" '{auto_merge: {enabled_by: {login: $by}, merge_method: "squash"}}'
+    else
+        jq -n '{auto_merge: null}'
+    fi >"$GH_STUB_DIR/$PULL_KEY"
 }
 
-# Serve the given events as the paginated, slurped events response: an array
-# of pages, each an array of events.
-events_fixture() {
-    {
-        printf '[['
-        local sep=''
-        for event in "$@"; do
-            printf '%s%s' "$sep" "$event"
-            sep=','
-        done
-        printf ']]'
-    } >"$GH_STUB_DIR/$EVENTS_KEY"
+# The flags match what the steps' `shell: bash` expands to in Actions.
+detect() {
+    bash --noprofile --norc -e -o pipefail "$DETECT_STEP"
 }
 
-# $1 = login, $2 = legacy permission, $3 = role name. The API maps maintain
-# to write and triage to read, which is exactly the split the step relies on.
-permission_fixture() {
-    # The step URI-encodes the login before the lookup, so a bracketed bot
-    # login keys the fixture as the stub sees the path, not as it is written.
-    local encoded
-    encoded=$(jq -rn --arg a "$1" '$a | @uri')
-    printf '{"permission":"%s","role_name":"%s","user":{"login":"%s"}}' "$2" "$3" "$1" \
-        >"$GH_STUB_DIR/GET_repos_acme_widgets_collaborators_$(printf '%s' "$encoded" | tr -c 'A-Za-z0-9' '_')_permission"
+audit() {
+    bash --noprofile --norc -e -o pipefail "$AUDIT_STEP"
 }
 
-# The flags match what the step's `shell: bash` expands to in Actions.
-authorize() {
-    bash --noprofile --norc -e -o pipefail "$AUTH_STEP"
+# --- what counts as a fast-track ------------------------------------------
+
+@test "an auto-merge a person enabled is a fast-track" {
+    pull_fixture ada
+    detect
+    [ "$(out active)" = "true" ]
+    [ "$(out enabled-by)" = "ada" ]
 }
 
-# --- who may authorize ----------------------------------------------------
+@test "an auto-merge this workflow queued is not" {
+    pull_fixture 'github-actions[bot]'
+    detect
+    [ "$(out active)" = "false" ]
+    [ -z "$(out enabled-by)" ]
+}
 
-@test "a triage user's label does not authorize the override" {
-    events_fixture "$(label_event 1 labeled trina security-fast-track)"
-    permission_fixture trina read triage
-    run authorize
+@test "a PR with no auto-merge queued is not" {
+    pull_fixture ''
+    detect
+    [ "$(out active)" = "false" ]
+    [ -z "$(out enabled-by)" ]
+}
+
+@test "an auto-merge with no readable enabler is not" {
+    # Fail closed: a bypass needs a person to attribute it to.
+    jq -n '{auto_merge: {enabled_by: null, merge_method: "squash"}}' >"$GH_STUB_DIR/$PULL_KEY"
+    run detect
     [ "$status" -eq 0 ]
-    [ "$(out authorized)" = "false" ]
-    grep -qF '::warning::' <<<"$output"
-    grep -qF 'triage' <<<"$output"
-    [ "$(log_count 'pr merge')" -eq 0 ]
+    [ "$(out active)" = "false" ]
+    grep -qF 'no readable enabler' <<<"$output"
 }
 
-@test "a non-collaborator's label does not authorize the override" {
-    # The API answers 200 with "none" for a login that is not a collaborator,
-    # bots among them. It only 404s for a login that is not a user at all.
-    events_fixture "$(label_event 1 labeled 'renovate[bot]' security-fast-track)"
-    permission_fixture 'renovate[bot]' none ''
-    run authorize
-    [ "$status" -eq 0 ]
-    [ "$(out authorized)" = "false" ]
-    grep -qF '::warning::' <<<"$output"
-    grep -qF 'none' <<<"$output"
-    [ "$(log_count 'pr merge')" -eq 0 ]
-}
-
-@test "write, maintain and admin users authorize the override" {
-    for role in write:write maintain:write admin:admin; do
-        : >"$GITHUB_OUTPUT"
-        events_fixture "$(label_event 1 labeled merger security-fast-track)"
-        permission_fixture merger "${role#*:}" "${role%%:*}"
-        authorize
-        [ "$(out authorized)" = "true" ]
-        [ "$(out applied-by)" = "merger" ]
-        [ "$(out role)" = "${role%%:*}" ]
-    done
-}
-
-# --- which label application counts --------------------------------------
-
-@test "a label already on the PR still needs an authorized applier on a later event" {
-    # The running event is a Dependabot synchronize, and the only activity
-    # since the triage user applied the label is an admin applying a
-    # different one. Neither may stand in for the applier.
-    export GITHUB_EVENT_NAME=pull_request_target SENDER='dependabot[bot]'
-    events_fixture \
-        "$(label_event 1 labeled trina security-fast-track)" \
-        "$(label_event 2 labeled ada dependencies)"
-    permission_fixture trina read triage
-    permission_fixture ada admin admin
-    run authorize
-    [ "$(out authorized)" = "false" ]
-    [ "$(log_count 'collaborators/ada')" -eq 0 ]
-}
-
-@test "the most recent applier decides after the label is removed and re-applied" {
-    events_fixture \
-        "$(label_event 1 labeled ada security-fast-track)" \
-        "$(label_event 2 unlabeled ada security-fast-track)" \
-        "$(label_event 3 labeled trina security-fast-track)"
-    permission_fixture ada admin admin
-    permission_fixture trina read triage
-    run authorize
-    [ "$(out authorized)" = "false" ]
-
-    : >"$GITHUB_OUTPUT"
-    events_fixture \
-        "$(label_event 1 labeled trina security-fast-track)" \
-        "$(label_event 2 unlabeled trina security-fast-track)" \
-        "$(label_event 3 labeled ada security-fast-track)"
-    authorize
-    [ "$(out authorized)" = "true" ]
-    [ "$(out applied-by)" = "ada" ]
-}
-
-@test "events are ordered by time, not by response order" {
-    # The newest application arrives first in the response. Taking the last
-    # element as-is would credit the triage user's removed application.
-    events_fixture \
-        "$(label_event 3 labeled ada security-fast-track)" \
-        "$(label_event 1 labeled trina security-fast-track)" \
-        "$(label_event 2 unlabeled trina security-fast-track)"
-    permission_fixture ada admin admin
-    permission_fixture trina read triage
-    authorize
-    [ "$(out authorized)" = "true" ]
-    [ "$(out applied-by)" = "ada" ]
-}
-
-@test "label names compare case-insensitively" {
-    export FAST_TRACK_LABEL=Security-Fast-Track
-    events_fixture "$(label_event 1 labeled ada SECURITY-fast-track)"
-    permission_fixture ada admin admin
-    authorize
-    [ "$(out authorized)" = "true" ]
-}
-
-@test "a label removed since the event fired does not authorize" {
-    events_fixture \
-        "$(label_event 1 labeled ada security-fast-track)" \
-        "$(label_event 2 unlabeled ada security-fast-track)"
-    permission_fixture ada admin admin
-    run authorize
-    [ "$status" -eq 0 ]
-    [ "$(out authorized)" = "false" ]
-}
-
-@test "no recorded application of the label does not authorize" {
-    events_fixture "$(label_event 1 labeled ada dependencies)"
-    permission_fixture ada admin admin
-    run authorize
-    [ "$status" -eq 0 ]
-    [ "$(out authorized)" = "false" ]
-}
-
-# --- lookups fail closed --------------------------------------------------
-
-@test "an events lookup failure refuses the override" {
-    echo "gh: HTTP 403: Resource not accessible by integration" >"$GH_STUB_DIR/$EVENTS_KEY.err"
-    run authorize
-    [ "$status" -eq 0 ]
-    [ "$(out authorized)" = "false" ]
+@test "a failed read fails the step and writes no verdict" {
+    echo "gh: HTTP 403: Resource not accessible by integration" >"$GH_STUB_DIR/$PULL_KEY.err"
+    run detect
+    [ "$status" -ne 0 ]
+    [ -z "$(out active)" ]
+    grep -qF '::error::' <<<"$output"
     grep -qF 'HTTP 403' <<<"$output"
-}
-
-@test "a malformed events response refuses the override" {
-    echo 'not json' >"$GH_STUB_DIR/$EVENTS_KEY"
-    run authorize
-    [ "$status" -eq 0 ]
-    [ "$(out authorized)" = "false" ]
-}
-
-@test "a permission lookup failure refuses the override" {
-    # No permission fixture: the stub answers 404, as the API does for a
-    # login that is not a GitHub user at all.
-    events_fixture "$(label_event 1 labeled 'renovate[bot]' security-fast-track)"
-    run authorize
-    [ "$status" -eq 0 ]
-    [ "$(out authorized)" = "false" ]
-    grep -qF '::warning::' <<<"$output"
-}
-
-@test "an unrecognised permission value refuses the override" {
-    events_fixture "$(label_event 1 labeled ada security-fast-track)"
-    printf '{"message":"odd"}' >"$GH_STUB_DIR/GET_repos_acme_widgets_collaborators_ada_permission"
-    run authorize
-    [ "$status" -eq 0 ]
-    [ "$(out authorized)" = "false" ]
 }
 
 # --- audit ----------------------------------------------------------------
 
-@test "the audit comment names the verified applier, not the event sender" {
-    echo '[]' >"$GH_STUB_DIR/GET_repos_acme_widgets_issues_42_comments_per_page_100"
-    APPLIED_BY=ada ROLE=maintain RUN_URL=https://example.test/run \
-        bash --noprofile --norc -e "$AUDIT_STEP"
+@test "the audit comment names the person who enabled auto-merge and marks the PR" {
+    echo '[]' >"$GH_STUB_DIR/$COMMENTS_KEY"
+    ENABLED_BY=ada audit
     [ "$(log_count 'pr comment')" -eq 1 ]
     [ "$(log_count '@ada')" -eq 1 ]
-    [ "$(log_count 'maintain')" -eq 1 ]
+    log_has_call 'pr edit' '--add-label' 'security-fast-track'
+}
+
+@test "an existing audit comment is neither re-posted nor relabelled" {
+    jq -n '[{body: "<!-- dependabot-auto-merge:fast-track-audit -->\n**Fast-track audit.**"}, {body: "unrelated"}]' \
+        >"$GH_STUB_DIR/$COMMENTS_KEY"
+    ENABLED_BY=ada audit
+    [ "$(log_count 'pr comment')" -eq 0 ]
+    [ "$(log_count 'pr edit')" -eq 0 ]
+}
+
+@test "a failed comments read fails the step before it posts" {
+    echo "gh: HTTP 500: Server Error" >"$GH_STUB_DIR/$COMMENTS_KEY.err"
+    ENABLED_BY=ada run audit
+    [ "$status" -ne 0 ]
+    [ "$(log_count 'pr comment')" -eq 0 ]
+    [ "$(log_count 'pr edit')" -eq 0 ]
+    grep -qF '::error::' <<<"$output"
 }
