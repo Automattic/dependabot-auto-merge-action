@@ -3,8 +3,7 @@
 # evaluation no longer supports it, run against the gh stub in tests/stubs/.
 # The step script is pulled out of the YAML and run as-is.
 #
-# Routing a PR to review, or removing the fast-track label, used to change
-# labels and comments only. An auto-merge this workflow had already queued
+# Routing a PR to review used to change labels and comments only. An auto-merge this workflow had already queued
 # stayed queued and merged the PR anyway. GitHub disables auto-merge on
 # some head changes, but not reliably enough to count on.
 
@@ -73,9 +72,10 @@ now() {
     [ "$(log_count 'pr comment')" -eq 1 ]
 }
 
-@test "removing the fast-track label disables the auto-merge it queued" {
-    # The label came off a young PR that passes the gates. Without the
-    # override it waits for the age gate like any other PR.
+@test "a young PR that passes the gates loses a merge this workflow queued" {
+    # Only the scheduled merge queues as the bot, and only past the age
+    # gate, so this takes age-days raised since. The merge is not what the
+    # cron would queue now, so it goes like any other stale one.
     pull_fixture 'github-actions[bot]'
     revoke true "$(now)"
     log_has_call 'pr merge' '--disable-auto' "$PR_URL"

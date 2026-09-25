@@ -7,7 +7,7 @@ RULESET_NAME="dependabot-auto-merge-required-checks"
 
 # name|color|description — must stay in sync with the defaults documented in the README
 LABELS=(
-    "security-fast-track|0075ca|Bypass all gates and enable auto-merge immediately"
+    "security-fast-track|0075ca|Marks a PR where a person enabled auto-merge, bypassing the gates"
     "auto-merge-pending|e4e669|Passed all gates; awaiting age gate"
     "sirt-review-required|d93f0b|Requires human security review"
 )
