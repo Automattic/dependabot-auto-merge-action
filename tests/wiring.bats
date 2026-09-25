@@ -15,25 +15,34 @@ setup_file() {
     grep -qF "steps.cvss.outputs.available == 'true'" <<<"$(extract_if gate2)"
 }
 
-# --- fast-track authorization (QAO-765) -----------------------------------
+# --- fast-track detection (QAO-765) ---------------------------------------
 
-@test "the fast-track merge runs only on a verified authorization" {
-    run extract_if fast-track
+@test "the fast-track detection runs on every evaluation" {
+    # extract_if prints nothing for a missing id as well as for a missing
+    # condition, so check the step exists first.
+    grep -q '^ *id: fast-track$' "$WORKFLOW"
+    [ -z "$(extract_if fast-track)" ]
+}
+
+@test "the audit comment follows a detected fast-track only" {
+    run extract_if fast-track-audit
     [ "$status" -eq 0 ]
-    # Exact match, so a condition that ORs the old label check back in
-    # cannot pass.
-    [ "$output" = "steps.fast-track-auth.outputs.authorized == 'true'" ]
+    [ "$output" = "steps.fast-track.outputs.active == 'true'" ]
 }
 
-@test "the authorization check runs whenever the fast-track label is present" {
-    run extract_if fast-track-auth
-    [ "$output" = "contains(github.event.pull_request.labels.*.name, inputs.fast-track-label)" ]
+@test "the gates run unless a person enabled auto-merge" {
+    grep -qF "steps.fast-track.outputs.active != 'true'" <<<"$(extract_if gate1)"
 }
 
-@test "the gates still run when the override is refused" {
-    # A refused override leaves the fast-track step skipped, and the gates
-    # key on exactly that, so the PR falls through to normal evaluation.
-    grep -qF "steps.fast-track.conclusion == 'skipped'" <<<"$(extract_if gate1)"
+@test "nothing authorizes the fast-track label any more" {
+    # The label is a marker. A condition that keys on it would hand merge
+    # power back to anyone who can apply a label.
+    ! grep -q 'fast-track-auth' "$WORKFLOW"
+    ! grep -qF 'contains(github.event.pull_request.labels.*.name, inputs.fast-track-label)' "$WORKFLOW"
+}
+
+@test "the documented caller subscribes to auto-merge being enabled" {
+    grep -qF 'types: [opened, synchronize, reopened, labeled, auto_merge_enabled]' "$REPO_ROOT/README.md"
 }
 
 # --- eligibility evidence (QAO-766) ---------------------------------------
@@ -42,7 +51,7 @@ setup_file() {
     # always(), so an evaluation that errors part-way still withdraws
     # evidence an earlier run recorded for the same commit.
     run extract_if record-eligibility
-    [ "$output" = "always() && steps.fast-track.conclusion != 'success'" ]
+    [ "$output" = "always() && steps.fast-track.outputs.active != 'true'" ]
 }
 
 @test "the workflow token can write commit statuses" {
@@ -60,15 +69,12 @@ job_block() {
     ' "$WORKFLOW"
 }
 
-@test "removing the fast-track label triggers an evaluation, and removing others does not" {
+@test "no event is filtered on the label it removes" {
+    # The fast-track label is a marker, so its removal means nothing and
+    # the jobs must not read the removed label at all.
     for job in preflight evaluate-pr; do
-        grep -qF "github.event.action != 'unlabeled' || github.event.label.name == inputs.fast-track-label" \
-            <<<"$(job_block "$job")"
+        ! grep -qF "github.event.label" <<<"$(job_block "$job")"
     done
-}
-
-@test "the documented caller subscribes to label removal" {
-    grep -qF 'types: [opened, synchronize, reopened, labeled, unlabeled]' "$REPO_ROOT/README.md"
 }
 
 @test "evaluations of the same PR never run at the same time" {
@@ -83,7 +89,7 @@ job_block() {
 
 @test "every evaluation that did not fast-track can revoke a queued auto-merge" {
     run extract_if revoke-auto-merge
-    [ "$output" = "always() && steps.fast-track.conclusion != 'success'" ]
+    [ "$output" = "always() && steps.fast-track.outputs.active != 'true'" ]
 }
 
 @test "evidence is withdrawn before a queued auto-merge is disabled" {

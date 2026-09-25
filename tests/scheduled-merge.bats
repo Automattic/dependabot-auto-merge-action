@@ -40,11 +40,13 @@ setup() {
 HEAD=1111111111111111111111111111111111111111
 OLD_HEAD=0000000000000000000000000000000000000000
 
-# One old, pending-labelled PR 301 whose head is $1.
+# One old, pending-labelled PR 301 whose head is $1, with auto-merge
+# already enabled by $2 when given.
 pending_pr_fixture() {
-    jq -n --arg head "$1" \
+    jq -n --arg head "$1" --arg by "${2:-}" \
         '[{number: 301, createdAt: "2020-01-01T00:00:00Z", headRefOid: $head,
-           labels: [{name: "auto-merge-pending"}]}]' \
+           labels: [{name: "auto-merge-pending"}],
+           autoMergeRequest: (if $by == "" then null else {enabledBy: {login: $by}} end)}]' \
         >"$GH_STUB_DIR/pr_list"
 }
 
@@ -118,6 +120,19 @@ merge_step() {
     merge_step
     [ "$(log_count 'pr merge 301')" -eq 1 ]
     log_has_call 'pr list' '--author app/dependabot' '--label auto-merge-pending'
+}
+
+@test "a PR whose auto-merge a person already enabled is skipped" {
+    # Their fast-track is not this workflow's to re-queue. A second enable
+    # would put the bot's name on it, and the next evaluation could then
+    # revoke a merge a person chose.
+    pending_pr_fixture "$HEAD" ada
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    run merge_step
+    [ "$status" -eq 0 ]
+    [ "$(log_count 'pr merge')" -eq 0 ]
+    grep -qF 'Skipping PR #301' <<<"$output"
+    grep -qF '@ada' <<<"$output" || grep -qF 'enabled by ada' <<<"$output"
 }
 
 @test "evidence does not bypass the age gate" {
