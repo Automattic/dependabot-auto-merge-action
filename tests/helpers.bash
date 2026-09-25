@@ -80,6 +80,30 @@ log_has_call() {
     [ -n "$lines" ]
 }
 
+# One commit status as the statuses API returns it: $1 = state, $2 = the
+# creator's login, $3 = context (default: the eligibility context that
+# evaluate-pr writes).
+commit_status() {
+    printf '{"state":"%s","context":"%s","creator":{"login":"%s"}}' \
+        "$1" "${3:-dependabot-auto-merge/eligibility}" "$2"
+}
+
+# Serve the statuses in $2.. for commit $1 of $GITHUB_REPOSITORY as the
+# paginated, slurped response: an array of pages, newest status first, the
+# order the API documents. No statuses after $1 serves an empty page.
+statuses_fixture() {
+    local sha=$1 sep='' status
+    shift
+    {
+        printf '[['
+        for status in "$@"; do
+            printf '%s%s' "$sep" "$status"
+            sep=','
+        done
+        printf ']]'
+    } >"$GH_STUB_DIR/GET_repos_${GITHUB_REPOSITORY//[^A-Za-z0-9]/_}_commits_${sha}_statuses_per_page_100"
+}
+
 # Print the value a step wrote to $GITHUB_OUTPUT under key $1. Handles both
 # forms Actions accepts: bare `key=value` and the `key<<DELIM` heredoc the
 # cvss step uses for values that might contain a newline.
