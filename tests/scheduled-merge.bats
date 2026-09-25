@@ -40,11 +40,13 @@ setup() {
 HEAD=1111111111111111111111111111111111111111
 OLD_HEAD=0000000000000000000000000000000000000000
 
-# One old, pending-labelled PR 301 whose head is $1.
+# One old, pending-labelled PR 301 whose head is $1, with auto-merge
+# already enabled by $2 when given.
 pending_pr_fixture() {
-    jq -n --arg head "$1" \
+    jq -n --arg head "$1" --arg by "${2:-}" \
         '[{number: 301, createdAt: "2020-01-01T00:00:00Z", headRefOid: $head,
-           labels: [{name: "auto-merge-pending"}]}]' \
+           labels: [{name: "auto-merge-pending"}],
+           autoMergeRequest: (if $by == "" then null else {enabledBy: {login: $by}} end)}]' \
         >"$GH_STUB_DIR/pr_list"
 }
 
@@ -120,6 +122,19 @@ merge_step() {
     log_has_call 'pr list' '--author app/dependabot' '--label auto-merge-pending'
 }
 
+@test "a PR whose auto-merge a person already enabled is skipped" {
+    # Their fast-track is not this workflow's to re-queue. A second enable
+    # would put the bot's name on it, and the next evaluation could then
+    # revoke a merge a person chose.
+    pending_pr_fixture "$HEAD" ada
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    run merge_step
+    [ "$status" -eq 0 ]
+    [ "$(log_count 'pr merge')" -eq 0 ]
+    grep -qF 'Skipping PR #301' <<<"$output"
+    grep -qF '@ada' <<<"$output" || grep -qF 'enabled by ada' <<<"$output"
+}
+
 @test "evidence does not bypass the age gate" {
     jq -n --arg head "$HEAD" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '[{number: 302, createdAt: $now, headRefOid: $head,
@@ -128,4 +143,37 @@ merge_step() {
     statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
     merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
+}
+
+# --- the merge boundary (QAO-768) -----------------------------------------
+
+@test "the merge is pinned to the head commit whose evidence was checked" {
+    pending_pr_fixture "$HEAD"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    merge_step
+    log_has_call 'pr merge 301' '--auto' "--match-head-commit $HEAD"
+}
+
+@test "evidence withdrawn while the merge was being queued disables it again" {
+    # An evaluation withdraws evidence before it disables auto-merge. If it
+    # does both between this job's evidence check and its merge call, the
+    # merge would re-queue what was just revoked. Checking again after
+    # queueing closes that window.
+    pending_pr_fixture "$HEAD"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    printf '[[%s,%s]]' "$(commit_status failure 'github-actions[bot]')" \
+        "$(commit_status success 'github-actions[bot]')" \
+        >"$GH_STUB_DIR/GET_repos_acme_widgets_commits_${HEAD}_statuses_per_page_100.next"
+    run merge_step
+    log_has_call 'pr merge 301' '--auto'
+    log_has_call 'pr merge 301' '--disable-auto'
+    grep -qF '::warning::' <<<"$output"
+}
+
+@test "evidence that still holds after queueing leaves the merge queued" {
+    pending_pr_fixture "$HEAD"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    merge_step
+    [ "$(log_count "commits/$HEAD/statuses")" -eq 2 ]
+    [ "$(log_count '--disable-auto')" -eq 0 ]
 }
