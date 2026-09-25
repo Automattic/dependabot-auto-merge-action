@@ -11,7 +11,7 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 | 3 | Compatibility score | ≥ 80% | Direct deps only; indirect deps skip this gate since fetch-metadata can't provide a score. |
 | 4 | Age gate | 7 days | Scheduled job merges passing PRs after `age-days` days. |
 
-PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A `security-fast-track` label on any PR bypasses all gates immediately. When a PR is fast-tracked, a one-time audit comment is posted recording who applied the label, when, and a link to the workflow run.
+PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A person who can merge bypasses all gates by enabling auto-merge on the PR with GitHub's own button. The workflow then posts a one-time audit comment recording who enabled it, when, and a link to the workflow run, and applies the `security-fast-track` label as a marker.
 
 `sirt-review-required` and `auto-merge-pending` are mutually exclusive workflow states: every evaluation applies one and removes the other, so a re-evaluated PR — say after Dependabot rewrites the branch — never carries both.
 
@@ -25,7 +25,7 @@ name: Dependabot auto-merge
 
 on:
     pull_request_target:
-        types: [opened, synchronize, reopened, labeled]
+        types: [opened, synchronize, reopened, labeled, auto_merge_enabled]
     schedule:
         - cron: '0 9 * * *'
 
@@ -52,6 +52,8 @@ gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.6 --jq .sha
 ```
 
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
+
+Callers pinned at v1.6 or earlier: the `security-fast-track` label no longer enables auto-merge. Enable auto-merge on the PR instead, with the button or `gh pr merge --auto`. Add `auto_merge_enabled` to `types` when you re-pin, so the audit comment posts on that event rather than on the PR's next push.
 
 ### 2. Bootstrap the repo prerequisites
 
@@ -149,7 +151,7 @@ See [docs/directory-mapping.md](docs/directory-mapping.md) for the detection rul
 The workflow needs three labels to exist in your repo. Create them once:
 
 ```bash
-gh label create "security-fast-track" --color "0075ca" --description "Bypass all gates and enable auto-merge immediately"
+gh label create "security-fast-track" --color "0075ca" --description "Marks a PR where a person enabled auto-merge, bypassing the gates"
 gh label create "auto-merge-pending"  --color "e4e669" --description "Passed all gates; awaiting age gate"
 gh label create "sirt-review-required" --color "d93f0b" --description "Requires human security review"
 ```
@@ -179,7 +181,7 @@ Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Se
 | `compatibility-threshold` | number | `80` | Minimum compatibility score % for Gate 3 (direct deps only). |
 | `age-days` | number | `7` | Days a PR must be open before the scheduled job merges it. |
 | `merge-method` | string | `'squash'` | `squash`, `merge`, or `rebase`. |
-| `fast-track-label` | string | `'security-fast-track'` | Label that bypasses all gates. |
+| `fast-track-label` | string | `'security-fast-track'` | Marker label applied when a person enables auto-merge on a PR. Applying it by hand does nothing. |
 | `review-label` | string | `'sirt-review-required'` | Label applied when a PR fails a gate. |
 | `pending-label` | string | `'auto-merge-pending'` | Label applied when a PR passes all gates and is waiting for the age gate. |
 | `review-team` | string | `''` | Optional. GitHub team slug (`org/team`) @-mentioned in review-required comments. |
@@ -226,12 +228,12 @@ The calling job must declare:
 
 ```yaml
 permissions:
-    pull-requests: write   # label and comment on PRs
+    pull-requests: write   # label and comment on PRs, read auto-merge state
     contents: write        # enable auto-merge
     security-events: read  # read Dependabot alerts API
 ```
 
-These are the minimum required. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
+These are the minimum required. The fast-track check reads the PR's auto-merge state through the pulls API, which `pull-requests` covers. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
 
 ### When GITHUB_TOKEN returns 403 on the Dependabot alerts API
 
@@ -266,7 +268,13 @@ GitHub sometimes returns `0.0` as the CVSS score for a matched advisory. That is
 
 The workflow treats as missing metadata every zero-like score — empty, `0`, `0.0`, `00`, `.00` — every value it cannot parse as a number, and anything above `10`. From v1.6 it first tries to recover a real score: an unscored advisory on a direct dependency sends the PR through the Dependabot alerts API, which often holds a score for the same advisory before it reaches PR metadata. Only that advisory counts, never another open alert on the same package. Only when that finds nothing better — no open alert for the advisory, or the call failed (a 403 from a restricted `GITHUB_TOKEN`, typically; expect one warning annotation per such PR) — does the PR fail closed: it gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one. Failing closed ships from v1.5 (v1.4 and earlier described an unscored advisory as below-threshold); the recovery attempt ships from v1.6.
 
-What to do: check the advisory yourself. If it is a real high-severity fix, apply the `fast-track-label` to merge it; the workflow records who did so in an audit comment. Nothing re-evaluates a PR when an advisory is scored later — the gates only re-run on a new PR event, so a stalled PR needs either the fast-track label or a push.
+What to do: check the advisory yourself. If it is a real high-severity fix, enable auto-merge on the PR; the workflow records who did so in an audit comment. Nothing re-evaluates a PR when an advisory is scored later — the gates only re-run on a new PR event, so a stalled PR needs either auto-merge enabled by hand or a push.
+
+### I enabled auto-merge but no audit comment appeared
+
+The workflow posts the comment when it next runs on the PR. It runs at once only if the caller workflow lists `auto_merge_enabled` under the `pull_request_target` types, as the template above does. Without it, the comment and the marker label arrive on the PR's next event, such as a Dependabot rebase. The auto-merge itself is GitHub's and does not wait for the workflow.
+
+If a run did happen and its evaluation job reports "Cannot read the auto-merge state", it stopped before acting on anything. Re-run it once the API is reachable.
 
 ### A PR carries both `auto-merge-pending` and `sirt-review-required`
 
@@ -290,9 +298,9 @@ A red preflight is intentional: it surfaces a repo where auto-merge could never 
 
 ### `evaluate-pr` job (triggers on `pull_request_target`)
 
-Runs on every opened/updated/labelled Dependabot PR, after preflight passes:
+Runs on every opened/updated/labelled Dependabot PR, and when a person enables auto-merge on one, after preflight passes:
 
-1. **Fast-track check** — if the `fast-track-label` is present, enable auto-merge immediately, post a one-time audit comment (label applier, UTC timestamp, workflow-run link), and exit. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it.
+1. **Fast-track check** — read the PR's auto-merge state. If a person (any login other than `github-actions[bot]`) has enabled auto-merge, GitHub has already checked that they can merge, so the workflow posts a one-time audit comment (who enabled it, UTC timestamp, workflow-run link), applies the `fast-track-label` as a marker, and exits. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it. An auto-merge the scheduled job queued, or one with no readable enabler, goes through the gates below. A failed read fails the run rather than guessing.
 2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID and CVSS. The Dependabot Alerts API is consulted as a fallback in two cases: the GHSA ID is missing (indirect dep — fetch-metadata cannot embed advisory data for those), or it is present but the CVSS is unusable (unscored advisory — the API may hold a real score for it). Open security alerts are matched against the updated packages, and on the direct-dep path against the GHSA ID the PR fixes as well, so a package with several open alerts cannot lend a score from a vulnerability this PR leaves in place.
 3. **Resolve the effective CVSS** — prefer the fetch-metadata score, then the alerts-API score. A score that is empty, non-numeric, numerically zero (`0`, `0.0`, `00`, `.00`), or above `10` is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`, and the comment names the score GitHub reported.
 4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
@@ -306,6 +314,7 @@ Runs on the cron you define in the caller, after preflight passes. Finds open PR
 ## Security notes
 
 - The workflow only acts on PRs authored by `app/dependabot`.
-- The fast-track path leaves an audit comment on the PR, so gate bypasses are attributable after the fact.
+- The fast-track label never enables auto-merge. A person bypasses the gates by enabling auto-merge themselves, which GitHub allows only for write, maintain, or admin and records on the PR timeline.
+- Every fast-track leaves an audit comment on the PR as well, so gate bypasses are attributable after the fact.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
 - `security-events: read` is required to call the Dependabot Alerts API — for indirect dependency lookups, and to recover a real score for unscored advisories on direct ones.
