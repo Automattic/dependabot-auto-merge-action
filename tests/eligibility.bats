@@ -37,13 +37,14 @@ setup() {
 
 HEAD=1111111111111111111111111111111111111111
 
-# Run the record step for $HEAD with Gate 2's pass output as $1, Gate 3's
-# conclusion as $2 and Gate 3's pass output as $3. The job status is
-# $JOB_STATUS, success unless a test sets it. The flags match what the
-# step's `shell: bash` expands to in Actions.
+# Run the record step for $HEAD with Gate 2's pass output as $1 and Gate 3's
+# pass output as $2. Gate 3 runs for every PR that clears Gate 2, so its own
+# pass is the only thing that counts. The job status is $JOB_STATUS, success
+# unless a test sets it. The flags match what the step's `shell: bash`
+# expands to in Actions.
 record() {
     HEAD_SHA=$HEAD RUN_URL=https://example.test/run JOB_STATUS="${JOB_STATUS:-success}" \
-        GATE2_PASS="$1" GATE3_CONCLUSION="$2" GATE3_PASS="${3:-}" \
+        GATE2_PASS="$1" GATE3_PASS="${2:-}" \
         bash --noprofile --norc -e -o pipefail "$RECORD_STEP"
 }
 
@@ -53,38 +54,34 @@ status_post_key() {
 
 @test "a PR that clears the gates records success on its head commit" {
     : >"$GH_STUB_DIR/$(status_post_key)"
-    for gate3 in 'skipped:' 'success:true'; do
-        : >"$GH_STUB_LOG"
-        : >"$GITHUB_OUTPUT"
-        record true "${gate3%%:*}" "${gate3#*:}"
-        log_has_call 'api' '-X POST' "statuses/$HEAD" 'state=success' \
-            'context=dependabot-auto-merge/eligibility'
-        [ "$(out eligible)" = "true" ]
-    done
+    record true true
+    log_has_call 'api' '-X POST' "statuses/$HEAD" 'state=success' \
+        'context=dependabot-auto-merge/eligibility'
+    [ "$(out eligible)" = "true" ]
 }
 
 @test "a PR that fails the gates withdraws success recorded for the same commit" {
     : >"$GH_STUB_DIR/$(status_post_key)"
     statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
-    for verdict in 'true:success:false' 'false:skipped:' ':skipped:' 'true:failure:'; do
+    # Gate 2 passed and Gate 3 failed, Gate 2 failed, an errored run that
+    # reported neither, and Gate 3 errored before writing a pass.
+    for verdict in 'true:false' 'false:' ':' 'true:'; do
         : >"$GH_STUB_LOG"
         : >"$GITHUB_OUTPUT"
-        IFS=: read -r gate2 gate3 gate3_pass <<<"$verdict"
-        record "$gate2" "$gate3" "$gate3_pass"
+        IFS=: read -r gate2 gate3_pass <<<"$verdict"
+        record "$gate2" "$gate3_pass"
         log_has_call '-X POST' "statuses/$HEAD" 'state=failure'
         [ "$(log_count 'state=success')" -eq 0 ]
         [ "$(out eligible)" = "false" ]
     done
 }
 
-@test "a cancelled or failed run records no success, even past Gate 2" {
-    # A cancel between Gate 2 and Gate 3 leaves Gate 3 skipped, the same
-    # conclusion an indirect dependency gets.
+@test "a cancelled or failed run records no success, even past the gates" {
     : >"$GH_STUB_DIR/$(status_post_key)"
     statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
     for job in cancelled failure; do
         : >"$GH_STUB_LOG"
-        JOB_STATUS=$job record true skipped
+        JOB_STATUS=$job record true true
         [ "$(log_count 'state=success')" -eq 0 ]
         log_has_call '-X POST' "statuses/$HEAD" 'state=failure'
     done
@@ -97,7 +94,7 @@ status_post_key() {
     statuses_fixture "$HEAD" \
         "$(commit_status success 'github-actions[bot]')" \
         "$(commit_status failure 'github-actions[bot]')"
-    record false skipped
+    record false
     log_has_call '-X POST' "statuses/$HEAD" 'state=failure'
 }
 
@@ -105,21 +102,21 @@ status_post_key() {
     # Writing failure on every ineligible commit would put a red status on
     # every routine Dependabot PR. There is nothing to withdraw here.
     statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]' ci/build)"
-    record false skipped
+    record false
     [ "$(log_count '-X POST')" -eq 0 ]
     [ "$(out eligible)" = "false" ]
 }
 
 @test "withdrawal ignores a success status someone else wrote" {
     statuses_fixture "$HEAD" "$(commit_status success trina)"
-    record false skipped
+    record false
     [ "$(log_count '-X POST')" -eq 0 ]
 }
 
 @test "a status lookup failure withdraws anyway" {
     : >"$GH_STUB_DIR/$(status_post_key)"
     echo "gh: HTTP 403" >"$GH_STUB_DIR/GET_repos_acme_widgets_commits_${HEAD}_statuses_per_page_100.err"
-    run record false skipped
+    run record false
     [ "$status" -eq 0 ]
     grep -qF '::warning::' <<<"$output"
     log_has_call '-X POST' "statuses/$HEAD" 'state=failure'
@@ -128,7 +125,7 @@ status_post_key() {
 @test "a status write failure fails the step" {
     # No POST fixture: the stub answers 404. No verdict is written either,
     # so revoke-auto-merge treats the PR as not eligible.
-    run record true skipped
+    run record true true
     [ "$status" -ne 0 ]
     [ "$(out eligible)" = "" ]
 }
