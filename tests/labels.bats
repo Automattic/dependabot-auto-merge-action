@@ -120,6 +120,7 @@ merge_env() {
     export REVIEW_LABEL=sirt-review-required
     export AGE_DAYS=7
     export MERGE_METHOD=squash
+    export MERGE_STATE_RETRY_SECONDS=0
 }
 
 mixed_pr_list_fixture() {
@@ -134,12 +135,15 @@ mixed_pr_list_fixture() {
    "labels": [{"name": "auto-merge-pending"}]}
 ]
 EOF
-    # Every PR carries passing evidence, so only the label and age
-    # selection under test decides what merges. tests/scheduled-merge.bats
-    # covers the evidence check.
-    local sha
+    # Every PR carries passing evidence and is ready to merge, so only the
+    # label and age selection under test decides what merges.
+    # tests/scheduled-merge.bats covers the evidence and merge state checks.
+    local sha n
     for sha in a101 a102 a103; do
         statuses_fixture "$sha" "$(commit_status success 'github-actions[bot]')"
+    done
+    for n in 101 102 103; do
+        echo '{"mergeable_state":"clean"}' >"$GH_STUB_DIR/GET_repos_acme_widgets_pulls_$n"
     done
 }
 
@@ -189,10 +193,10 @@ review_labelled_pr_fixture() {
 @test "a merge failure still fails the step" {
     merge_env
     mixed_pr_list_fixture
-    echo "GraphQL: Pull request is in clean status" >"$GH_STUB_DIR/pr_merge.err"
+    echo "GraphQL: Head branch was modified. Review and try the merge again." >"$GH_STUB_DIR/pr_merge.err"
     run run_merge_step
     [ "$status" -eq 1 ]
     # grep rather than [[ ]]: under macOS bash 3.2 a failed [[ ]] mid-test
     # cannot fail a bats test (errexit/ERR fire only for simple commands).
-    grep -qF '::error::Failed to enable auto-merge on PR #101' <<<"$output"
+    grep -qF '::error::Failed to merge PR #101' <<<"$output"
 }

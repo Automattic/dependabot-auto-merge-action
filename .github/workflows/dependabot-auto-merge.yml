@@ -58,9 +58,6 @@ jobs:
     # merge path runs. `gh pr merge --auto` fails (or silently never queues)
     # when "Allow auto-merge" is off or the default branch has no required
     # status checks — fail fast here with actionable errors instead.
-    #
-    # Same event filter as evaluate-pr, so an event that evaluate-pr ignores
-    # does not spend a preflight run either.
     preflight:
         name: Preflight — repo auto-merge configuration
         runs-on: ubuntu-latest
@@ -154,12 +151,13 @@ jobs:
         runs-on: ubuntu-latest
         needs: preflight
         if: inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
-        # One evaluation per PR at a time, so a run that withdraws evidence
-        # and disables auto-merge is never interleaved with one that grants
-        # them. Not cancel-in-progress, because cancelling a run part-way
-        # could stop it before it withdraws. A newer event waits, and
-        # GitHub keeps only the newest waiting run, which carries the latest
-        # payload.
+        # One evaluation per PR at a time. record-eligibility reads the
+        # existing statuses before it writes, so two runs at the same head
+        # could interleave and leave a success that the later verdict should
+        # have withdrawn. Not cancel-in-progress, because cancelling a run
+        # part-way could stop it before it withdraws. A newer event waits,
+        # and GitHub keeps only the newest waiting run, which carries the
+        # latest payload.
         concurrency:
             group: dependabot-auto-merge-evaluate-pr-${{ github.event.pull_request.number }}
             cancel-in-progress: false
@@ -594,9 +592,6 @@ jobs:
                           -f description="$2" -f target_url="$RUN_URL" >/dev/null
                   }
 
-                  # The verdict is also an output, so revoke-auto-merge acts on
-                  # the same decision instead of re-deriving it.
-                  #
                   # A pass also needs the job to be healthy. A run cancelled
                   # between Gate 2 and Gate 3 marks Gate 3 skipped, which
                   # reads like an indirect dependency, and always() still
@@ -606,11 +601,9 @@ jobs:
                       [ "$GATE2_PASS" = "true" ] &&
                       { [ "$GATE3_CONCLUSION" = "skipped" ] || [ "$GATE3_PASS" = "true" ]; }; then
                       post_status success "Passed the auto-merge gates at this commit"
-                      echo "eligible=true" >> "$GITHUB_OUTPUT"
                       echo "Recorded eligibility for $HEAD_SHA."
                       exit 0
                   fi
-                  echo "eligible=false" >> "$GITHUB_OUTPUT"
 
                   if STATUSES=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" 2>&1) &&
                       LATEST=$(echo "$STATUSES" | jq -r --arg context "$CONTEXT" --arg creator "$CREATOR" \
@@ -633,81 +626,6 @@ jobs:
                   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            # Withdraw an auto-merge this workflow queued once the latest
-            # evaluation no longer supports it. Review routing only changes
-            # labels, and a queued auto-merge would otherwise merge the PR
-            # anyway. GitHub disables auto-merge on
-            # some head changes, but not reliably enough to count on.
-            #
-            # A queued auto-merge stands only when the PR clears the gates
-            # and the age gate, which is what the scheduled merge would
-            # queue anyway. A fast-track by a person skips this step. Every
-            # other verdict disables it, including a young PR that passes
-            # the gates and a run that errored before a verdict. An
-            # auto-merge a person enabled is left alone: only users with
-            # write access can do that, so it is their authorization, not
-            # this workflow's.
-            #
-            # Runs after record-eligibility on purpose. Evidence goes first,
-            # and the scheduled merge re-checks evidence after it queues,
-            # so neither order of the two jobs leaves a merge queued.
-            - name: Revoke a queued auto-merge the evaluation no longer supports
-              id: revoke-auto-merge
-              if: always() && steps.fast-track.outputs.active != 'true'
-              # Explicit so the step runs under `-e -o pipefail` and the bats
-              # suite can drive the extracted script with exactly these flags.
-              shell: bash
-              run: |
-                  # The login the merge steps enable auto-merge as.
-                  BOT='github-actions[bot]'
-
-                  # ELIGIBLE is record-eligibility's verdict. Anything but
-                  # true, including no output from a step that never ran,
-                  # counts as not eligible.
-                  AGED=$(jq -n --arg created "$PR_CREATED_AT" --argjson age "$AGE_DAYS" \
-                      '((now - ($created | fromdateiso8601)) / 86400) >= $age' 2>/dev/null || echo false)
-
-                  if [ "$ELIGIBLE" = "true" ] && [ "$AGED" = "true" ]; then
-                      echo "The PR clears the gates and the age gate, so a queued auto-merge stands."
-                      exit 0
-                  fi
-
-                  if [ "$ELIGIBLE" = "true" ]; then
-                      REASON="it passes the gates but has not cleared the $AGE_DAYS-day age gate, and no person has enabled auto-merge on it"
-                  else
-                      REASON="the latest evaluation did not pass the gates"
-                  fi
-
-                  # Empty means nothing is queued. A queued merge with no
-                  # readable enabler is treated as this workflow's.
-                  if PR_JSON=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" 2>&1) &&
-                      ENABLED_BY=$(echo "$PR_JSON" | jq -r \
-                          'if .auto_merge == null then "" else (.auto_merge.enabled_by.login // "?") end' 2>&1); then
-                      if [ -z "$ENABLED_BY" ]; then
-                          echo "No auto-merge is queued on PR #$PR_NUMBER."
-                          exit 0
-                      fi
-                      if [ "$ENABLED_BY" != "$BOT" ] && [ "$ENABLED_BY" != "?" ]; then
-                          echo "Auto-merge on PR #$PR_NUMBER was enabled by @$ENABLED_BY, not this workflow, so it stays."
-                          exit 0
-                      fi
-                  else
-                      echo "::warning::Cannot read the auto-merge state of PR #$PR_NUMBER, so disabling it in case this workflow queued it. $(echo "$PR_JSON" | head -c 300 | tr '\n' ' ')"
-                  fi
-
-                  gh pr merge --disable-auto "$PR_URL"
-                  echo "Disabled the queued auto-merge on PR #$PR_NUMBER because $REASON."
-                  gh pr comment "$PR_URL" --body "Auto-merge was disabled on this PR because $REASON. Evaluated commit: \`$HEAD_SHA\`. Workflow run: $RUN_URL"
-              env:
-                  ELIGIBLE: ${{ steps.record-eligibility.outputs.eligible }}
-                  PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
-                  AGE_DAYS: ${{ inputs.age-days }}
-                  PR_NUMBER: ${{ github.event.pull_request.number }}
-                  PR_URL: ${{ github.event.pull_request.html_url }}
-                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
             # Labeling step failed — notify so the failure doesn't go unnoticed.
             - name: Notify on labeling failure
               if: failure()
@@ -717,7 +635,7 @@ jobs:
                   PR_URL: ${{ github.event.pull_request.html_url }}
 
     # Runs daily. Finds PRs labelled with the pending label that have cleared
-    # the age gate and enables auto-merge on them. PRs also carrying the
+    # the age gate and merges the ones GitHub would merge now. PRs also carrying the
     # review label are excluded: a stale pending label from before a PR was
     # routed to review must never keep it in the merge set.
     #
@@ -758,8 +676,7 @@ jobs:
 
                   # A PR whose auto-merge is already enabled needs nothing
                   # from this job. A person enabling it is a fast-track, and
-                  # queueing again would put this workflow's name on their
-                  # merge, which the next evaluation could then revoke.
+                  # GitHub merges it when its requirements are met.
                   echo "$PENDING" | jq -r \
                       '.[] | select(.autoMergeRequest != null)
                        | "Skipping PR #\(.number): auto-merge is already enabled by \(.autoMergeRequest.enabledBy.login // "?")."'
@@ -777,31 +694,37 @@ jobs:
                   CONTEXT='dependabot-auto-merge/eligibility'
                   CREATOR='github-actions[bot]'
 
-                  # Set STATE to the latest eligibility verdict recorded for
-                  # commit $1, empty when there is none. Statuses come newest
-                  # first, so the first match is the latest. Returns non-zero,
-                  # with the error in STATE, when the lookup fails.
-                  evidence_state() {
-                      local statuses
-                      if ! statuses=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$1/statuses?per_page=100" 2>&1); then
-                          STATE=$statuses
-                          return 1
-                      fi
-                      STATE=$(echo "$statuses" | jq -r --arg context "$CONTEXT" --arg creator "$CREATOR" \
-                          '[.[][] | select(.context == $context and .creator.login == $creator)] | first | .state // ""' 2>&1)
+                  # Print the merge state GitHub reports for PR $1, in lower
+                  # case (clean, blocked, behind and so on). GitHub computes it
+                  # on demand and answers unknown until it has, so an unknown
+                  # is read again a few times before it counts.
+                  merge_state() {
+                      local state tries=0
+                      while :; do
+                          state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$1" --jq '.mergeable_state') || return 1
+                          if [ "$state" != "unknown" ] || [ "$tries" -ge 3 ]; then
+                              break
+                          fi
+                          tries=$((tries + 1))
+                          sleep "$MERGE_STATE_RETRY_SECONDS"
+                      done
+                      echo "$state"
                   }
 
                   FAILED=0
                   while read -r PR_NUM HEAD_SHA <&3; do
                       [ -n "$PR_NUM" ] || continue
 
-                      # Evidence for an earlier head does not count: the
-                      # lookup is by the head commit as listed now. A failed
-                      # lookup blocks the merge and fails the job, as a failed
-                      # merge does. Missing or withdrawn evidence only skips
-                      # the PR, since that is the answer, not an error.
-                      if ! evidence_state "$HEAD_SHA"; then
-                          echo "::error::Cannot verify eligibility evidence for PR #$PR_NUM at $HEAD_SHA, so it was not merged. $(echo "$STATE" | head -c 500 | tr '\n' ' ')"
+                      # Statuses come newest first, so the first match is the
+                      # latest verdict. Evidence for an earlier head does not
+                      # count: the lookup is by the head commit as listed now.
+                      # A failed lookup blocks the merge and fails the job, as
+                      # a failed merge does. Missing or withdrawn evidence only
+                      # skips the PR, since that is the answer, not an error.
+                      if ! STATUSES=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" 2>&1) ||
+                          ! STATE=$(echo "$STATUSES" | jq -r --arg context "$CONTEXT" --arg creator "$CREATOR" \
+                              '[.[][] | select(.context == $context and .creator.login == $creator)] | first | .state // ""' 2>&1); then
+                          echo "::error::Cannot verify eligibility evidence for PR #$PR_NUM at $HEAD_SHA, so it was not merged. $(echo "$STATUSES" | head -c 500 | tr '\n' ' ')"
                           FAILED=1
                           continue
                       fi
@@ -810,27 +733,32 @@ jobs:
                           continue
                       fi
 
-                      # Pinned to the commit whose evidence was just checked,
-                      # so a push since then makes GitHub refuse the merge.
-                      echo "Enabling auto-merge on PR #$PR_NUM"
-                      if ! ERR=$(gh pr merge "$PR_NUM" --auto --"$MERGE_METHOD" --match-head-commit "$HEAD_SHA" --repo "$GITHUB_REPOSITORY" 2>&1 >/dev/null); then
-                          echo "::error::Failed to enable auto-merge on PR #$PR_NUM — $(echo "$ERR" | head -c 500 | tr '\n' ' ')"
+                      # Merge directly, and only a PR GitHub would merge now.
+                      # These are the states gh itself treats as mergeable at
+                      # once. Anything else, such as a required check still
+                      # running or a required review missing, is not an error.
+                      # The PR is skipped and the next run tries again. The
+                      # workflow never leaves auto-merge enabled, so nothing it
+                      # queued can outlive the evidence it was queued on.
+                      if ! MERGE_STATE=$(merge_state "$PR_NUM" 2>&1); then
+                          echo "::error::Cannot read the merge state of PR #$PR_NUM, so it was not merged. $(echo "$MERGE_STATE" | head -c 500 | tr '\n' ' ')"
                           FAILED=1
                           continue
                       fi
+                      case "$MERGE_STATE" in
+                          clean | has_hooks | unstable) ;;
+                          *)
+                              echo "Skipping PR #$PR_NUM for now. GitHub reports its merge state as ${MERGE_STATE:-empty}, so its branch rules are not met yet. The next scheduled run tries again."
+                              continue
+                              ;;
+                      esac
 
-                      # An evaluation can withdraw the evidence and disable
-                      # auto-merge between the check above and the merge call,
-                      # which would re-queue what it just revoked. Evaluation
-                      # withdraws evidence before it disables, so checking
-                      # again now catches every such interleaving. A failed
-                      # check disables too.
-                      if ! evidence_state "$HEAD_SHA" || [ "$STATE" != "success" ]; then
-                          echo "::warning::Eligibility evidence for PR #$PR_NUM changed while auto-merge was being enabled, so it was disabled again."
-                          if ! ERR=$(gh pr merge "$PR_NUM" --disable-auto --repo "$GITHUB_REPOSITORY" 2>&1 >/dev/null); then
-                              echo "::error::Failed to disable auto-merge on PR #$PR_NUM after its evidence was withdrawn. Disable it by hand. $(echo "$ERR" | head -c 500 | tr '\n' ' ')"
-                              FAILED=1
-                          fi
+                      # Pinned to the commit whose evidence was just checked,
+                      # so a push since then makes GitHub refuse the merge.
+                      echo "Merging PR #$PR_NUM"
+                      if ! ERR=$(gh pr merge "$PR_NUM" --"$MERGE_METHOD" --match-head-commit "$HEAD_SHA" --repo "$GITHUB_REPOSITORY" 2>&1 >/dev/null); then
+                          echo "::error::Failed to merge PR #$PR_NUM — $(echo "$ERR" | head -c 500 | tr '\n' ' ')"
+                          FAILED=1
                       fi
                   done 3<<<"$CANDIDATES"
                   exit $FAILED
@@ -839,4 +767,5 @@ jobs:
                   REVIEW_LABEL: ${{ inputs.review-label }}
                   AGE_DAYS: ${{ inputs.age-days }}
                   MERGE_METHOD: ${{ inputs.merge-method }}
+                  MERGE_STATE_RETRY_SECONDS: 5
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

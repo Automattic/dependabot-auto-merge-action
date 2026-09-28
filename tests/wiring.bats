@@ -67,7 +67,7 @@ setup_file() {
     grep -qx '    statuses: write' "$WORKFLOW"
 }
 
-# --- revocation (QAO-768) -------------------------------------------------
+# --- merge boundary (QAO-768) --------------------------------------------
 
 # Print the lines of job $1, from its key up to the next job's key.
 job_block() {
@@ -96,17 +96,10 @@ job_block() {
     grep -qE '^            cancel-in-progress: false$' <<<"$block"
 }
 
-@test "every evaluation that did not fast-track can revoke a queued auto-merge" {
-    run extract_if revoke-auto-merge
-    [ "$output" = "always() && steps.fast-track.outputs.active != 'true'" ]
-}
-
-@test "evidence is withdrawn before a queued auto-merge is disabled" {
-    # The scheduled merge re-checks evidence after queueing. That only
-    # closes the race if evaluation withdraws the evidence first.
-    record=$(grep -n '^ *id: record-eligibility$' "$WORKFLOW" | cut -d: -f1)
-    revoke=$(grep -n '^ *id: revoke-auto-merge$' "$WORKFLOW" | cut -d: -f1)
-    [ -n "$record" ]
-    [ -n "$revoke" ]
-    [ "$record" -lt "$revoke" ]
+@test "nothing in the workflow enables or disables auto-merge" {
+    # The scheduled merge merges directly. Only a person turns auto-merge on.
+    # Only real calls count. Preflight's messages still name `--auto`,
+    # because a person's fast-track needs the repository setting.
+    grep -qE 'gh pr merge "' "$WORKFLOW"
+    ! grep -E 'gh pr merge "' "$WORKFLOW" | grep -qE -- '--auto|--disable-auto'
 }
