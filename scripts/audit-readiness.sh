@@ -1251,9 +1251,17 @@ apply_filters() {
 }
 
 render_table() {
+    # A not-applicable repo still has settings that are technically missing, but
+    # listing them implies work that does not need doing: Dependabot has nothing
+    # to scan there. Say that instead, or the longest column in the report is
+    # made of findings nobody should act on.
     jq -r '
-        [.repo, .verdict, (.owner.team // "(unassigned)"), ("w" + (.wave.band | tostring)),
-         (if (.blockers | length) > 0 then (.blockers | join(","))
+        [.repo,
+         .verdict,
+         (.owner.team // "(unassigned)"),
+         (if .wave.band == null then "-" else ("w" + (.wave.band | tostring)) end),
+         (if .verdict == "na" then "no dependencies to scan"
+          elif (.blockers | length) > 0 then (.blockers | join(","))
           elif (.unknowns | length) > 0 then ("?" + (.unknowns | join(",")))
           else "-" end)]
         | @tsv

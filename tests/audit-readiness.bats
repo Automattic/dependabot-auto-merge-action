@@ -940,6 +940,22 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "a not-applicable repo is not listed as having blockers to fix" {
+    # Its settings really are missing, but Dependabot has nothing to scan there,
+    # so listing them implies work that does not need doing.
+    repo_set '. * {depYml: null, depYaml: null, caller: null, autoMergeAllowed: false,
+                   root: {entries: [{name: "README.md", type: "blob"}]}}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"README.md"}]}
+EOF
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format table
+    [ "$status" -eq 0 ]
+    [[ $output == *"no dependencies to scan"* ]]
+    [[ $output != *"auto_merge"* ]]
+    # And the wave column reads as blank rather than the literal "wnull".
+    [[ $output != *"wnull"* ]]
+}
+
 @test "--format csv emits the documented header" {
     repo_set
     run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format csv
