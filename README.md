@@ -33,6 +33,7 @@ permissions:
     pull-requests: write
     contents: write
     security-events: read
+    statuses: write
 
 jobs:
     dependabot-auto-merge:
@@ -41,6 +42,7 @@ jobs:
             pull-requests: write
             contents: write
             security-events: read
+            statuses: write
         with:
             event-name: ${{ github.event_name }}
 ```
@@ -231,9 +233,12 @@ permissions:
     pull-requests: write   # label and comment on PRs, read auto-merge state
     contents: write        # enable auto-merge
     security-events: read  # read Dependabot alerts API
+    statuses: write        # record and read eligibility evidence
 ```
 
 These are the minimum required. The fast-track check reads the PR's auto-merge state through the pulls API, which `pull-requests` covers. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
+
+**`statuses: write` is a breaking change for callers pinned at v1.5 or earlier.** Add it to both `permissions` blocks when you re-pin. Without it GitHub refuses to start the reusable workflow, because a called workflow cannot hold a permission its caller did not grant. The workflow writes a `dependabot-auto-merge/eligibility` commit status when a PR passes the gates, and the scheduled merge will not act on a PR without one. See [How it works](#scheduled-merge-job-triggers-on-schedule) for why a label is not enough.
 
 ### When GITHUB_TOKEN returns 403 on the Dependabot alerts API
 
@@ -252,6 +257,7 @@ jobs:
             pull-requests: write
             contents: write
             security-events: read
+            statuses: write
         with:
             event-name: ${{ github.event_name }}
         secrets:
@@ -275,6 +281,16 @@ What to do: check the advisory yourself. If it is a real high-severity fix, enab
 The workflow posts the comment when it next runs on the PR. It runs at once only if the caller workflow lists `auto_merge_enabled` under the `pull_request_target` types, as the template above does. Without it, the comment and the marker label arrive on the PR's next event, such as a Dependabot rebase. The auto-merge itself is GitHub's and does not wait for the workflow.
 
 If a run did happen and its evaluation job reports "Cannot read the auto-merge state", it stopped before acting on anything. Re-run it once the API is reachable.
+
+### The scheduled job skips a PR labelled `auto-merge-pending`
+
+The run shows a warning naming the PR and its head commit. The scheduled merge needs a `success` status in the `dependabot-auto-merge/eligibility` context on the PR's current head, and the label alone is not enough. Common causes:
+
+- The pending label was applied by hand. That is expected to be refused.
+- Dependabot pushed a new commit and that commit's evaluation has not passed, or failed before it finished. Check the evaluation run for that push.
+- The PR was labelled pending before you upgraded to a version that records evidence, so no status exists yet.
+
+What to do: trigger a fresh evaluation. Any new PR event does it, such as applying a label or asking Dependabot to rebase. If the gates pass, the status is written and the next scheduled run merges the PR.
 
 ### A PR carries both `auto-merge-pending` and `sirt-review-required`
 
@@ -306,15 +322,23 @@ Runs on every opened/updated/labelled Dependabot PR, and when a person enables a
 4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
 5. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
 6. Apply `review-label` and remove `pending-label` if any gate fails; apply `pending-label` and remove `review-label` if all pass. The two labels are mutually exclusive states — a re-evaluated PR always ends up with exactly one.
+7. **Record the verdict on the head commit.** A pass writes a `success` commit status with the context `dependabot-auto-merge/eligibility` on the commit just evaluated. Any other outcome, including a run that errored before Gate 2 reported, writes `failure` over an earlier `success` on the same commit. A commit with no earlier `success` gets no status at all, so routine updates do not show a red status.
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
 Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set. That exclusion ignores case, matching how Actions, `gh pr edit` and `gh pr list --label` compare labels, so a `review-label` input whose casing differs from the repository label still excludes the PR.
+
+The labels only choose candidates. They are not proof a PR passed, because a triage user can apply `pending-label` or remove `review-label`, and evaluation never touches the labels of a routine version update. Each candidate merges only when the latest `dependabot-auto-merge/eligibility` status from `github-actions[bot]` on its current head commit is `success`. That status comes from evaluate-pr alone. Creating one takes `statuses: write`, which triage users do not have, and it belongs to one commit, so evidence for an earlier head does not carry over to a new one. A candidate with no evidence, or withdrawn evidence, is skipped with a warning. A failed status lookup skips the PR and fails the job, as a failed merge does.
+
+Two other designs were considered. A check run from a dedicated job would need `checks: read` to read back on private repos, a new permission all the same, and its name carries the caller's job name as a prefix that this workflow cannot know. Re-running the gates in the scheduled job is not possible, because `dependabot/fetch-metadata` only runs on a pull request event.
+
+Limits of the evidence: any other workflow in your repo that holds `statuses: write` and uses `GITHUB_TOKEN` also writes as `github-actions[bot]`, so it could write this context. Only people who can already change workflows can set that up.
 
 ## Security notes
 
 - The workflow only acts on PRs authored by `app/dependabot`.
 - The fast-track label never enables auto-merge. A person bypasses the gates by enabling auto-merge themselves, which GitHub allows only for write, maintain, or admin and records on the PR timeline.
 - Every fast-track leaves an audit comment on the PR as well, so gate bypasses are attributable after the fact.
+- The scheduled merge trusts a commit status on the PR's current head, not its labels. Triage users can change labels but cannot write statuses.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
 - `security-events: read` is required to call the Dependabot Alerts API — for indirect dependency lookups, and to recover a real score for unscored advisories on direct ones.

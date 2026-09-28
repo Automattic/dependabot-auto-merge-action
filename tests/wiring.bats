@@ -44,3 +44,25 @@ setup_file() {
 @test "the documented caller subscribes to auto-merge being enabled" {
     grep -qF 'types: [opened, synchronize, reopened, labeled, auto_merge_enabled]' "$REPO_ROOT/README.md"
 }
+
+# --- eligibility evidence (QAO-766) ---------------------------------------
+
+@test "every evaluation that did not fast-track records its verdict" {
+    # always(), so an evaluation that errors part-way still withdraws
+    # evidence an earlier run recorded for the same commit.
+    run extract_if record-eligibility
+    [ "$output" = "always() && steps.fast-track.outputs.active != 'true'" ]
+}
+
+@test "a recorded pass depends on the job status" {
+    # The script checks JOB_STATUS, so it has to be wired to job.status.
+    grep -qF 'JOB_STATUS: ${{ job.status }}' "$WORKFLOW"
+}
+
+@test "the scheduled merge runs under pipefail" {
+    grep -A4 '^ *id: scheduled-merge$' "$WORKFLOW" | grep -q '^ *shell: bash$'
+}
+
+@test "the workflow token can write commit statuses" {
+    grep -qx '    statuses: write' "$WORKFLOW"
+}
