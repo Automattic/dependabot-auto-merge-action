@@ -56,13 +56,16 @@ jobs:
 EOF
 }
 
-# Repo and organisation secret listings. Values are never readable through the
-# API; names are, which is all the check needs.
+# Repo and organisation secret listings for repo $2, acme/widgets by default.
+# Values are never readable through the API; names are, which is all the check
+# needs.
 secrets_fixture() {
-    local names=${1:-QUALITYOPS_DEPENDABOT_ALERTS_TOKEN}
+    local names=${1:-QUALITYOPS_DEPENDABOT_ALERTS_TOKEN} key
+    key=${2:-acme/widgets}
+    key=${key//\//_}
     jq -cn --arg n "$names" '{secrets: ($n | split(",") | map(select(length > 0) | {name: .}))}' \
-        | fixture GET_repos_acme_widgets_actions_secrets_per_page_100
-    fixture GET_repos_acme_widgets_actions_organization_secrets_per_page_100 <<<'{"secrets":[]}'
+        | fixture "GET_repos_${key}_actions_secrets_per_page_100"
+    fixture "GET_repos_${key}_actions_organization_secrets_per_page_100" <<<'{"secrets":[]}'
 }
 
 # A repo where every check passes. Tests patch this with a jq expression to
@@ -966,6 +969,8 @@ EOF
 @test "--status filters the rendered view without changing the artifact" {
     repo_set_many '. * {nameWithOwner: "acme/one"}' \
                   '. * {nameWithOwner: "acme/two", autoMergeAllowed: false}'
+    # acme/one needs its token secret listed, or it reads unknown, not ready.
+    secrets_fixture QUALITYOPS_DEPENDABOT_ALERTS_TOKEN acme/one
     run "$SCRIPT" --repo acme/one --repo acme/two --out-dir "$OUT" --format table --status ready
     [ "$status" -eq 0 ]
     [[ $output == *"acme/one"* ]]
