@@ -1132,12 +1132,23 @@ assemble() {
               }
             }
 
+          # A placeholder node carries nulls, and a null boolean is falsy, so
+          # every GraphQL-derived check would read `fail` for a repository the
+          # sweep never returned. Only what the REST probe found is real here,
+          # so the rest go back to unknown before blockers are derived.
+          | (if .sweep_incomplete then
+               .checks |= with_entries(
+                 if (.value.source // "" | startswith("graphql"))
+                 then .value = {status: "unknown",
+                                detail: "the sweep never returned this repository, so nothing could be read",
+                                source: "sweep_incomplete"}
+                 else . end)
+             else . end)
+
           # Verdict, in this order so `unknown` can never be laundered into `fail`.
           | . as $rec
           | ([$rec.checks | to_entries[] | select(.value.status == "fail") | .key]) as $blockers
           | ([$rec.checks | to_entries[] | select(.value.status == "unknown") | .key]) as $unknowns
-          # bootstrap.sh fixes these four itself, idempotently. The rest need a
-          # decision or a file, so they are what a team actually has to act on.
           # bootstrap.sh fixes these four. The alerts token is deliberately not
           # among them: it is one central secret, not per-repo work.
           | (["auto_merge", "labels", "vuln_alerts", "required_checks"]) as $bootstrappable

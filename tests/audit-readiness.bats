@@ -818,6 +818,32 @@ EOF
     [ "$output" = "unknown true" ]
 }
 
+@test "a repo the sweep dropped is not accused of failing checks nobody read" {
+    # The placeholder is all nulls and a null boolean is falsy, so every
+    # GraphQL-derived check would otherwise read as a confident failure.
+    viewer_fixture
+    secrets_fixture
+    fixture graphql_OrgProbe <<<'{"data":{"organization":{"login":"acme"}}}'
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            organization: {repositories: {
+                              pageInfo: {hasNextPage: false, endCursor: null},
+                              totalCount: 2, nodes: [.]}}}}'         | fixture graphql_RepoPage
+    fixture graphql_RepoNames <<'EOF'
+{"data":{"rateLimit":{"cost":1,"remaining":4999},"organization":{"repositories":{
+  "pageInfo":{"hasNextPage":false,"endCursor":null},
+  "nodes":[{"nameWithOwner":"acme/widgets"},{"nameWithOwner":"acme/vanished"}]}}}}
+EOF
+    fixture graphql_DependabotPRs <<<'{"data":{"rateLimit":{"cost":1,"remaining":4999},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    run jq -r 'select(.repo == "acme/vanished")
+               | [.checks.auto_merge.status, .checks.vuln_alerts.status, .checks.labels.status]
+               | join(",")' "$OUT/repos.jsonl"
+    [ "$output" = "unknown,unknown,unknown" ]
+    run jq -r 'select(.repo == "acme/vanished") | .blockers | length' "$OUT/repos.jsonl"
+    [ "$output" = "0" ]
+}
+
 @test "run.json records what the sweep expected against what it got" {
     viewer_fixture
     secrets_fixture
