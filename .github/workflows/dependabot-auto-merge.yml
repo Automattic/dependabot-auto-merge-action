@@ -596,7 +596,14 @@ jobs:
 
                   # The verdict is also an output, so revoke-auto-merge acts on
                   # the same decision instead of re-deriving it.
-                  if [ "$GATE2_PASS" = "true" ] &&
+                  #
+                  # A pass also needs the job to be healthy. A run cancelled
+                  # between Gate 2 and Gate 3 marks Gate 3 skipped, which
+                  # reads like an indirect dependency, and always() still
+                  # runs this step. Checked here rather than in `if:` so a
+                  # cancelled or failed run still withdraws.
+                  if [ "$JOB_STATUS" = "success" ] &&
+                      [ "$GATE2_PASS" = "true" ] &&
                       { [ "$GATE3_CONCLUSION" = "skipped" ] || [ "$GATE3_PASS" = "true" ]; }; then
                       post_status success "Passed the auto-merge gates at this commit"
                       echo "eligible=true" >> "$GITHUB_OUTPUT"
@@ -618,6 +625,7 @@ jobs:
                   fi
                   post_status failure "Not eligible for auto-merge at this commit"
               env:
+                  JOB_STATUS: ${{ job.status }}
                   GATE2_PASS: ${{ steps.gate2.outputs.pass }}
                   GATE3_CONCLUSION: ${{ steps.gate3.conclusion }}
                   GATE3_PASS: ${{ steps.gate3.outputs.pass }}
@@ -724,6 +732,10 @@ jobs:
         steps:
             - name: Merge PRs past age gate
               id: scheduled-merge
+              # Explicit so the step runs under `-e -o pipefail`. Without
+              # pipefail a failed `gh pr list` feeds jq nothing, and the job
+              # goes green having merged nothing.
+              shell: bash
               run: |
                   # Collect PR numbers first, then iterate in the main shell: a
                   # piped `while read` runs in a subshell, where FAILED would be

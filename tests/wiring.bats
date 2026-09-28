@@ -54,6 +54,15 @@ setup_file() {
     [ "$output" = "always() && steps.fast-track.outputs.active != 'true'" ]
 }
 
+@test "a recorded pass depends on the job status" {
+    # The script checks JOB_STATUS, so it has to be wired to job.status.
+    grep -qF 'JOB_STATUS: ${{ job.status }}' "$WORKFLOW"
+}
+
+@test "the scheduled merge runs under pipefail" {
+    grep -A4 '^ *id: scheduled-merge$' "$WORKFLOW" | grep -q '^ *shell: bash$'
+}
+
 @test "the workflow token can write commit statuses" {
     grep -qx '    statuses: write' "$WORKFLOW"
 }

@@ -51,6 +51,11 @@ run_step() {
     bash --noprofile --norc -e "$1"
 }
 
+# Run the scheduled merge step with the flags its `shell: bash` expands to.
+run_merge_step() {
+    bash --noprofile --norc -e -o pipefail "$MERGE_STEP"
+}
+
 # --- pass -> review -------------------------------------------------------
 
 @test "routing to review sheds the pending label in the same edit" {
@@ -141,7 +146,7 @@ EOF
 @test "scheduled merge skips PRs that also carry the review label" {
     merge_env
     mixed_pr_list_fixture
-    run_step "$MERGE_STEP"
+    run_merge_step
     # 101 (pending only, old) merges; 102 is the ticket case — past the age
     # gate and still carrying a stale pending label, but routed to review —
     # and 103 is too young.
@@ -169,7 +174,7 @@ review_labelled_pr_fixture() {
 @test "scheduled merge skips a review label whose casing differs on the PR" {
     merge_env
     review_labelled_pr_fixture SIRT-Review-Required
-    run_step "$MERGE_STEP"
+    run_merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
 }
 
@@ -177,7 +182,7 @@ review_labelled_pr_fixture() {
     merge_env
     export REVIEW_LABEL=SIRT-Review-Required
     review_labelled_pr_fixture sirt-review-required
-    run_step "$MERGE_STEP"
+    run_merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
 }
 
@@ -185,7 +190,7 @@ review_labelled_pr_fixture() {
     merge_env
     mixed_pr_list_fixture
     echo "GraphQL: Pull request is in clean status" >"$GH_STUB_DIR/pr_merge.err"
-    run bash --noprofile --norc -e "$MERGE_STEP"
+    run run_merge_step
     [ "$status" -eq 1 ]
     # grep rather than [[ ]]: under macOS bash 3.2 a failed [[ ]] mid-test
     # cannot fail a bats test (errexit/ERR fire only for simple commands).
