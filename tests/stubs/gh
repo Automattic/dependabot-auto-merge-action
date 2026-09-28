@@ -9,6 +9,7 @@
 # "<METHOD>_<path with non-alphanumerics mapped to _>":
 #   <key>       body printed to stdout, exit 0 (empty file = bodiless success)
 #   <key>.err   contents printed to stderr, exit 1
+#   <key>.next  served in place of <key> from the call after <key> is served
 #   neither     "HTTP 404"-style error to stderr, exit 1 (matches how the
 #               bootstrap script distinguishes absent resources)
 #
@@ -92,6 +93,11 @@ if [[ -f $GH_STUB_DIR/$key ]]; then
         jq -r "$jq_filter" <"$GH_STUB_DIR/$key"
     else
         cat "$GH_STUB_DIR/$key"
+    fi
+    # <key>.next replaces <key> once served, so a test can change what the
+    # API reports between two reads of the same path.
+    if [[ -f $GH_STUB_DIR/$key.next ]]; then
+        mv "$GH_STUB_DIR/$key.next" "$GH_STUB_DIR/$key"
     fi
 elif [[ -f $GH_STUB_DIR/$key.err ]]; then
     cat "$GH_STUB_DIR/$key.err" >&2
