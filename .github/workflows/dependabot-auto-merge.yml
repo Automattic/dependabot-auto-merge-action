@@ -765,7 +765,12 @@ jobs:
                   # the same decision instead of re-deriving it. Gate 3 runs
                   # for every PR that clears Gate 2, so only its own pass
                   # counts. A skipped Gate 3 is never read as a passed one.
-                  if [ "$GATE2_PASS" = "true" ] && [ "$GATE3_PASS" = "true" ]; then
+                  #
+                  # A pass also needs the job to be healthy. always() runs
+                  # this step after a cancel or a failure too. Checked here
+                  # rather than in `if:` so such a run still withdraws.
+                  if [ "$JOB_STATUS" = "success" ] &&
+                      [ "$GATE2_PASS" = "true" ] && [ "$GATE3_PASS" = "true" ]; then
                       post_status success "Passed the auto-merge gates at this commit"
                       echo "eligible=true" >> "$GITHUB_OUTPUT"
                       echo "Recorded eligibility for $HEAD_SHA."
@@ -786,6 +791,7 @@ jobs:
                   fi
                   post_status failure "Not eligible for auto-merge at this commit"
               env:
+                  JOB_STATUS: ${{ job.status }}
                   GATE2_PASS: ${{ steps.gate2.outputs.pass }}
                   GATE3_PASS: ${{ steps.gate3.outputs.pass }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -891,6 +897,10 @@ jobs:
         steps:
             - name: Merge PRs past age gate
               id: scheduled-merge
+              # Explicit so the step runs under `-e -o pipefail`. Without
+              # pipefail a failed `gh pr list` feeds jq nothing, and the job
+              # goes green having merged nothing.
+              shell: bash
               run: |
                   # Collect PR numbers first, then iterate in the main shell: a
                   # piped `while read` runs in a subshell, where FAILED would be

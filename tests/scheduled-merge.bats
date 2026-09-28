@@ -50,8 +50,9 @@ pending_pr_fixture() {
         >"$GH_STUB_DIR/pr_list"
 }
 
+# The flags match what the step's `shell: bash` expands to in Actions.
 merge_step() {
-    bash --noprofile --norc -e "$MERGE_STEP"
+    bash --noprofile --norc -e -o pipefail "$MERGE_STEP"
 }
 
 @test "a forged pending label with no evidence does not merge" {
@@ -109,6 +110,15 @@ merge_step() {
     [ "$status" -eq 1 ]
     [ "$(log_count 'pr merge')" -eq 0 ]
     grep -qF '::error::' <<<"$output"
+}
+
+@test "a failed PR list fails the step" {
+    # Under pipefail. Without it jq reads nothing, and the job goes green
+    # having merged nothing.
+    echo "gh: HTTP 502" >"$GH_STUB_DIR/pr_list.err"
+    run merge_step
+    [ "$status" -ne 0 ]
+    [ "$(log_count 'pr merge')" -eq 0 ]
 }
 
 @test "a legitimately eligible PR merges" {

@@ -39,10 +39,11 @@ HEAD=1111111111111111111111111111111111111111
 
 # Run the record step for $HEAD with Gate 2's pass output as $1 and Gate 3's
 # pass output as $2. Gate 3 runs for every PR that clears Gate 2, so its own
-# pass is the only thing that counts. The flags match what the step's
-# `shell: bash` expands to in Actions.
+# pass is the only thing that counts. The job status is $JOB_STATUS, success
+# unless a test sets it. The flags match what the step's `shell: bash`
+# expands to in Actions.
 record() {
-    HEAD_SHA=$HEAD RUN_URL=https://example.test/run \
+    HEAD_SHA=$HEAD RUN_URL=https://example.test/run JOB_STATUS="${JOB_STATUS:-success}" \
         GATE2_PASS="$1" GATE3_PASS="${2:-}" \
         bash --noprofile --norc -e -o pipefail "$RECORD_STEP"
 }
@@ -73,6 +74,28 @@ status_post_key() {
         [ "$(log_count 'state=success')" -eq 0 ]
         [ "$(out eligible)" = "false" ]
     done
+}
+
+@test "a cancelled or failed run records no success, even past the gates" {
+    : >"$GH_STUB_DIR/$(status_post_key)"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    for job in cancelled failure; do
+        : >"$GH_STUB_LOG"
+        JOB_STATUS=$job record true true
+        [ "$(log_count 'state=success')" -eq 0 ]
+        log_has_call '-X POST' "statuses/$HEAD" 'state=failure'
+    done
+}
+
+@test "withdrawal reads the newest status, not the oldest" {
+    # Newest first, as the API returns them. Reading the oldest would see
+    # the failure and leave the newer success in place.
+    : >"$GH_STUB_DIR/$(status_post_key)"
+    statuses_fixture "$HEAD" \
+        "$(commit_status success 'github-actions[bot]')" \
+        "$(commit_status failure 'github-actions[bot]')"
+    record false
+    log_has_call '-X POST' "statuses/$HEAD" 'state=failure'
 }
 
 @test "a routine update with no evidence gets no status" {
