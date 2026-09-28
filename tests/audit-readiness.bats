@@ -791,6 +791,70 @@ EOF
     [[ $output == *"everyone"* ]]
 }
 
+# --- sweep reconciliation -----------------------------------------------------
+
+@test "a repo the sweep silently dropped is still reported, as unknown" {
+    # A partial GraphQL error nulls a node and `select(. != null)` drops it
+    # without trace. Observed live: google-listings-and-ads was present in one
+    # run and gone from the next, both reporting a plausible total. A repo that
+    # vanishes from a rollout is the worst thing this tool can do.
+    viewer_fixture
+    secrets_fixture
+    fixture graphql_OrgProbe <<<'{"data":{"organization":{"login":"acme"}}}'
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            organization: {repositories: {
+                              pageInfo: {hasNextPage: false, endCursor: null},
+                              totalCount: 2, nodes: [.]}}}}'         | fixture graphql_RepoPage
+    fixture graphql_RepoNames <<'EOF'
+{"data":{"rateLimit":{"cost":1,"remaining":4999},"organization":{"repositories":{
+  "pageInfo":{"hasNextPage":false,"endCursor":null},
+  "nodes":[{"nameWithOwner":"acme/widgets"},{"nameWithOwner":"acme/vanished"}]}}}}
+EOF
+    fixture graphql_DependabotPRs <<<'{"data":{"rateLimit":{"cost":1,"remaining":4999},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 2 ]
+    run jq -r 'select(.repo == "acme/vanished") | "\(.verdict) \(.sweep_incomplete)"' "$OUT/repos.jsonl"
+    [ "$output" = "unknown true" ]
+}
+
+@test "run.json records what the sweep expected against what it got" {
+    viewer_fixture
+    secrets_fixture
+    fixture graphql_OrgProbe <<<'{"data":{"organization":{"login":"acme"}}}'
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            organization: {repositories: {
+                              pageInfo: {hasNextPage: false, endCursor: null},
+                              totalCount: 2, nodes: [.]}}}}'         | fixture graphql_RepoPage
+    fixture graphql_RepoNames <<'EOF'
+{"data":{"rateLimit":{"cost":1,"remaining":4999},"organization":{"repositories":{
+  "pageInfo":{"hasNextPage":false,"endCursor":null},
+  "nodes":[{"nameWithOwner":"acme/widgets"},{"nameWithOwner":"acme/vanished"}]}}}}
+EOF
+    fixture graphql_DependabotPRs <<<'{"data":{"rateLimit":{"cost":1,"remaining":4999},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .org_total "$OUT/run.json")" = "2" ]
+    [ "$(jq -r .swept "$OUT/run.json")" = "1" ]
+    [ "$(jq -r .sweep_missing "$OUT/run.json")" = "1" ]
+}
+
+@test "a complete sweep costs no extra listing call" {
+    viewer_fixture
+    secrets_fixture
+    fixture graphql_OrgProbe <<<'{"data":{"organization":{"login":"acme"}}}'
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            organization: {repositories: {
+                              pageInfo: {hasNextPage: false, endCursor: null},
+                              totalCount: 1, nodes: [.]}}}}'         | fixture graphql_RepoPage
+    fixture graphql_DependabotPRs <<<'{"data":{"rateLimit":{"cost":1,"remaining":4999},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .sweep_missing "$OUT/run.json")" = "0" ]
+    # No RepoNames fixture exists, so reconciliation must not have run at all.
+    [ "$(grep -c RepoNames "$GH_STUB_LOG" || true)" -eq 0 ]
+}
+
 # --- scope, output and concurrency --------------------------------------------
 
 @test "an n/a repo is kept out of the wave bands" {

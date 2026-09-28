@@ -292,6 +292,20 @@ query_repo_set() {
     printf '}\n'
 }
 
+query_repo_names() {
+    cat <<'EOF'
+query RepoNames($org: String!, $endCursor: String) {
+  rateLimit { cost remaining }
+  organization(login: $org) {
+    repositories(first: 100, after: $endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { nameWithOwner }
+    }
+  }
+}
+EOF
+}
+
 query_team_list() {
     cat <<'EOF'
 query TeamList($org: String!, $endCursor: String) {
@@ -424,6 +438,8 @@ phase_repos() {
             die 1 "repository sweep failed even at page size $PAGE_SIZE: $(api_err)"
         fi
 
+        jq -r '.data.organization.repositories.totalCount // empty' <<<"$body" >"$WORK/total-count"
+
         record_graphql_errors "$body" "$offset"
         jq -c '.data.organization.repositories.nodes[] | select(. != null)' <<<"$body" >>"$WORK/nodes.jsonl"
 
@@ -434,6 +450,56 @@ phase_repos() {
         remaining=$(jq -r '.data.rateLimit.remaining // empty' <<<"$body")
         check_brake "$remaining" || { note "rate limit floor reached during the repository sweep"; break; }
     done
+}
+
+# --- phase 1b: reconcile the sweep against the org's own count ----------------
+
+phase_reconcile() {
+    [[ -n $ORG ]] || return 0
+    local expected received
+    expected=$(cat "$WORK/total-count" 2>/dev/null)
+    received=$(wc -l <"$WORK/nodes.jsonl" | tr -d ' ')
+    printf '%s' "${received:-0}" >"$WORK/received-count"
+    [[ -n $expected ]] || return 0
+    [[ $received -lt $expected ]] || return 0
+
+    note "the sweep returned $received of $expected repositories; finding the missing ones"
+
+    local body cursor="" has_next=true
+    : >"$WORK/all-names"
+    while [[ $has_next == true ]]; do
+        if [[ -z $cursor ]]; then
+            body=$(api graphql -f query="$(query_repo_names)" -f org="$ORG") || break
+        else
+            body=$(api graphql -f query="$(query_repo_names)" -f org="$ORG" -f endCursor="$cursor") || break
+        fi
+        jq -r '.data.organization.repositories.nodes[]?.nameWithOwner' <<<"$body" >>"$WORK/all-names"
+        has_next=$(jq -r '.data.organization.repositories.pageInfo.hasNextPage' <<<"$body")
+        cursor=$(jq -r '.data.organization.repositories.pageInfo.endCursor' <<<"$body")
+    done
+
+    jq -r '.nameWithOwner' "$WORK/nodes.jsonl" | sort -u >"$WORK/have-names"
+    sort -u "$WORK/all-names" >"$WORK/want-names"
+
+    # A placeholder node keeps the repo visible and lets every check resolve to
+    # unknown, which is the honest answer: we never managed to read it.
+    local missing=0 r
+    while read -r r; do
+        [[ -n $r ]] || continue
+        jq -cn --arg r "$r" '{
+            nameWithOwner: $r,
+            isArchived: false, isFork: false, isDisabled: false, isEmpty: null,
+            isPrivate: null, pushedAt: null,
+            autoMergeAllowed: null, squashMergeAllowed: null,
+            mergeCommitAllowed: null, rebaseMergeAllowed: null,
+            viewerPermission: null, hasVulnerabilityAlertsEnabled: null,
+            sweep_incomplete: true
+        }' >>"$WORK/nodes.jsonl"
+        missing=$((missing + 1))
+    done < <(comm -23 "$WORK/want-names" "$WORK/have-names")
+
+    printf '%s' "$missing" >"$WORK/missing-count"
+    [[ $missing -eq 0 ]] || note "$missing repositories were not returned by the sweep and are reported as unknown"
 }
 
 # --- phase 2: team ownership --------------------------------------------------
@@ -912,6 +978,7 @@ assemble() {
                 empty: $n.isEmpty, visibility: (if $n.isPrivate then "PRIVATE" else "PUBLIC" end)
               },
               access: {viewer_permission: $perm, write_access: $trusted},
+              sweep_incomplete: (($n.sweep_incomplete // false) == true),
               owner: ($teams[$repo] // {team: null, source: "unmapped", candidates: []}),
               ecosystems: {
                 npm: (manifests($n) | any(. == "package.json")),
@@ -1092,7 +1159,8 @@ assemble() {
               # the same answer, and calling the second one not-applicable
               # would quietly drop a repo we never managed to look at.
               verdict: (
-                if (($applicable | not) and ($rec.checks.dependabot_config.status == "unknown")) then "unknown"
+                if $rec.sweep_incomplete then "unknown"
+                elif (($applicable | not) and ($rec.checks.dependabot_config.status == "unknown")) then "unknown"
                 elif ($applicable | not) then "na"
                 elif ($blockers | length) > 0 then "blocked"
                 elif ($unknowns | length) > 0 then "unknown"
@@ -1519,6 +1587,7 @@ else
 fi
 
 phase_repos
+phase_reconcile
 phase_teams
 phase_activity
 phase_narrow
@@ -1539,10 +1608,14 @@ jq -n \
     --arg audited_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson records "$RECORDS" \
     --argjson unprobed "$UNPROBED" \
+    --argjson expected "$(cat "$WORK/total-count" 2>/dev/null || echo null)" \
+    --argjson swept "$(cat "$WORK/received-count" 2>/dev/null || echo null)" \
+    --argjson sweep_missing "$(cat "$WORK/missing-count" 2>/dev/null || echo 0)" \
     --argjson braked "$(braked && echo true || echo false)" \
     --arg page_size "$PAGE_SIZE" \
     '{org: $org, audited_at: $audited_at, records: $records,
-      rate_limited: $braked, unprobed: $unprobed, page_size: ($page_size | tonumber)}' \
+      rate_limited: $braked, unprobed: $unprobed, page_size: ($page_size | tonumber),
+      org_total: $expected, swept: $swept, sweep_missing: $sweep_missing}' \
     >"$OUT_DIR/run.json"
 
 printf '\n'
