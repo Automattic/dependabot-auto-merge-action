@@ -32,6 +32,7 @@ setup() {
     export REVIEW_LABEL=sirt-review-required
     export AGE_DAYS=7
     export MERGE_METHOD=squash
+    export MERGE_STATE_RETRY_SECONDS=0
     mkdir -p "$GH_STUB_DIR"
     : >"$GH_STUB_LOG"
     PATH="$REPO_ROOT/tests/stubs:$PATH"
@@ -40,12 +41,23 @@ setup() {
 HEAD=1111111111111111111111111111111111111111
 OLD_HEAD=0000000000000000000000000000000000000000
 
-# One old, pending-labelled PR 301 whose head is $1.
+# One old, pending-labelled PR 301 whose head is $1, with auto-merge
+# already enabled by $2 when given. GitHub reports it clean unless a test
+# says otherwise.
 pending_pr_fixture() {
-    jq -n --arg head "$1" \
+    jq -n --arg head "$1" --arg by "${2:-}" \
         '[{number: 301, createdAt: "2020-01-01T00:00:00Z", headRefOid: $head,
-           labels: [{name: "auto-merge-pending"}]}]' \
+           labels: [{name: "auto-merge-pending"}],
+           autoMergeRequest: (if $by == "" then null else {enabledBy: {login: $by}} end)}]' \
         >"$GH_STUB_DIR/pr_list"
+    merge_state_fixture clean
+}
+
+PULL_KEY=GET_repos_acme_widgets_pulls_301
+
+# The merge state the pulls API reports for PR 301.
+merge_state_fixture() {
+    jq -n --arg state "$1" '{mergeable_state: $state}' >"$GH_STUB_DIR/$PULL_KEY"
 }
 
 # The flags match what the step's `shell: bash` expands to in Actions.
@@ -130,6 +142,18 @@ merge_step() {
     log_has_call 'pr list' '--author app/dependabot' '--label auto-merge-pending'
 }
 
+@test "a PR whose auto-merge a person already enabled is skipped" {
+    # Their fast-track is theirs. GitHub merges it once its requirements
+    # are met, so this job has nothing to add.
+    pending_pr_fixture "$HEAD" ada
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    run merge_step
+    [ "$status" -eq 0 ]
+    [ "$(log_count 'pr merge')" -eq 0 ]
+    grep -qF 'Skipping PR #301' <<<"$output"
+    grep -qF '@ada' <<<"$output" || grep -qF 'enabled by ada' <<<"$output"
+}
+
 @test "evidence does not bypass the age gate" {
     jq -n --arg head "$HEAD" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '[{number: 302, createdAt: $now, headRefOid: $head,
@@ -138,4 +162,73 @@ merge_step() {
     statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
     merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
+}
+
+# --- the merge boundary (QAO-768) -----------------------------------------
+
+@test "the merge is direct and pinned to the head commit whose evidence was checked" {
+    pending_pr_fixture "$HEAD"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    merge_step
+    log_has_call 'pr merge 301' '--squash' "--match-head-commit $HEAD"
+    # The workflow never leaves auto-merge enabled behind it.
+    [ "$(log_count '--auto')" -eq 0 ]
+}
+
+@test "the states gh treats as mergeable at once merge" {
+    for state in clean has_hooks unstable; do
+        : >"$GH_STUB_LOG"
+        pending_pr_fixture "$HEAD"
+        merge_state_fixture "$state"
+        statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+        merge_step
+        [ "$(log_count 'pr merge 301')" -eq 1 ]
+    done
+}
+
+@test "a PR GitHub would not merge yet is skipped and the job stays green" {
+    # A required check still running, a required review missing, a branch
+    # behind or in conflict. The next run tries again.
+    for state in blocked behind dirty draft; do
+        : >"$GH_STUB_LOG"
+        pending_pr_fixture "$HEAD"
+        merge_state_fixture "$state"
+        statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+        run merge_step
+        [ "$status" -eq 0 ]
+        [ "$(log_count 'pr merge')" -eq 0 ]
+        grep -qF "Skipping PR #301 for now" <<<"$output"
+    done
+}
+
+@test "an unknown merge state is read again before it counts" {
+    # GitHub answers unknown until it has computed the state.
+    pending_pr_fixture "$HEAD"
+    merge_state_fixture unknown
+    jq -n '{mergeable_state: "clean"}' >"$GH_STUB_DIR/$PULL_KEY.next"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    merge_step
+    [ "$(log_count 'pulls/301')" -eq 2 ]
+    [ "$(log_count 'pr merge 301')" -eq 1 ]
+}
+
+@test "a merge state that stays unknown skips the PR" {
+    pending_pr_fixture "$HEAD"
+    merge_state_fixture unknown
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    run merge_step
+    [ "$status" -eq 0 ]
+    [ "$(log_count 'pulls/301')" -eq 4 ]
+    [ "$(log_count 'pr merge')" -eq 0 ]
+}
+
+@test "a merge state lookup failure blocks the merge and fails the step" {
+    pending_pr_fixture "$HEAD"
+    rm "$GH_STUB_DIR/$PULL_KEY"
+    echo "gh: HTTP 502" >"$GH_STUB_DIR/$PULL_KEY.err"
+    statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]')"
+    run merge_step
+    [ "$status" -ne 0 ]
+    [ "$(log_count 'pr merge')" -eq 0 ]
+    grep -qF '::error::Cannot read the merge state of PR #301' <<<"$output"
 }

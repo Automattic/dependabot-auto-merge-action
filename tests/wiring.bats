@@ -66,3 +66,40 @@ setup_file() {
 @test "the workflow token can write commit statuses" {
     grep -qx '    statuses: write' "$WORKFLOW"
 }
+
+# --- merge boundary (QAO-768) --------------------------------------------
+
+# Print the lines of job $1, from its key up to the next job's key.
+job_block() {
+    awk -v job="$1" '
+        $0 ~ "^    " job ":$" { injob = 1; next }
+        injob && /^    [A-Za-z0-9_-]+:$/ { exit }
+        injob { print }
+    ' "$WORKFLOW"
+}
+
+@test "no event is filtered on the label it removes" {
+    # The fast-track label is a marker, so its removal means nothing and
+    # the jobs must not read the removed label at all.
+    for job in preflight evaluate-pr; do
+        ! grep -qF "github.event.label" <<<"$(job_block "$job")"
+    done
+}
+
+@test "evaluations of the same PR never run at the same time" {
+    block=$(job_block evaluate-pr)
+    grep -qE '^        concurrency:$' <<<"$block"
+    grep -qF 'group: ' <<<"$block"
+    grep -qF 'github.event.pull_request.number' <<<"$(grep -F 'group: ' <<<"$block")"
+    # false: a newer evaluation waits for the running one instead of
+    # cancelling it half-way through withdrawing evidence.
+    grep -qE '^            cancel-in-progress: false$' <<<"$block"
+}
+
+@test "nothing in the workflow enables or disables auto-merge" {
+    # The scheduled merge merges directly. Only a person turns auto-merge on.
+    # Only real calls count. Preflight's messages still name `--auto`,
+    # because a person's fast-track needs the repository setting.
+    grep -qE 'gh pr merge "' "$WORKFLOW"
+    ! grep -E 'gh pr merge "' "$WORKFLOW" | grep -qE -- '--auto|--disable-auto'
+}
