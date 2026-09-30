@@ -378,44 +378,80 @@ preflight() {
 # boolean is Boolean!, so a permission failure cannot arrive as null — it
 # arrives here, nulling its node. Unattributed, one repo in a page of 25 would
 # vanish silently.
+#
+# Errors are matched to repos by name, never by position: nulled nodes are
+# dropped before the records are built, so a position would land on the next
+# repo. In --repo mode the alias r_N names REPOS[N], passed as $2. In an org
+# page the error names a node index, and the name is read from that node. A
+# nulled node has no name to read, and the reconcile phase reports it as
+# unknown instead.
 record_graphql_errors() {
-    local body=$1 offset=$2
-    jq -c --argjson offset "$offset" '
-        (.errors // [])[]
+    local body=$1 names=${2:-[]}
+    jq -c --argjson names "$names" '
+        . as $body
+        | (.errors // [])[]
         | select(.path != null)
         | . as $e
-        | (
-            ($e.path | map(select(type == "string") | capture("^r_(?<n>[0-9]+)$") | .n | tonumber) | first)
-            // ($e.path | map(select(type == "number")) | first)
-          ) as $idx
+        | ($e.path | map(select(type == "string") | capture("^r_(?<n>[0-9]+)$") | .n | tonumber) | first) as $alias
+        | ($e.path | map(select(type == "number")) | first) as $pos
+        | (if $alias != null then $names[$alias]
+           elif $pos != null then ($body.data.organization.repositories.nodes[$pos].nameWithOwner // null)
+           else null end) as $repo
         | ($e.path | map(select(type == "string")) | last) as $field
-        | select($idx != null)
-        | {node_index: ($idx + $offset), field: $field, reason: ($e.message // "graphql error")}
+        | select($repo != null)
+        | {repo: $repo, field: $field, reason: ($e.message // "graphql error")}
     ' <<<"$body" >>"$WORK/errors.jsonl" 2>/dev/null || true
 }
 
+# A node for a repository nothing could be read from. It keeps the repo visible
+# and lets every check resolve to unknown, which is the honest answer.
+placeholder_node() {
+    jq -cn --arg r "$1" '{
+        nameWithOwner: $r,
+        isArchived: false, isFork: false, isDisabled: false, isEmpty: null,
+        isPrivate: null, pushedAt: null,
+        autoMergeAllowed: null, squashMergeAllowed: null,
+        mergeCommitAllowed: null, rebaseMergeAllowed: null,
+        viewerPermission: null, hasVulnerabilityAlertsEnabled: null,
+        sweep_incomplete: true
+    }'
+}
+
 phase_repos() {
-    local body cursor="" page=0 has_next=true remaining offset=0 degraded
+    local body cursor="" page=0 has_next=true remaining degraded
 
     if [[ ${#REPOS[@]} -gt 0 ]]; then
-        local doc
+        local doc names i
         doc=$(query_repo_set)
-        body=$(api graphql -f query="$doc") || {
+        # gh exits non-zero when any alias errors, but still prints the data
+        # for the rest, so the body is kept and judged on its own.
+        body=$(api graphql -f query="$doc") || true
+        jq -e '.data | type == "object"' >/dev/null 2>&1 <<<"$body" ||
             die 1 "repository sweep failed: $(api_err)"
-        }
-        record_graphql_errors "$body" 0
-        jq -c '.data | to_entries[] | select(.key | startswith("r_")) | .value | select(. != null)' \
-            <<<"$body" >>"$WORK/nodes.jsonl"
+        names=$(printf '%s\n' "${REPOS[@]}" | jq -R . | jq -sc .)
+        record_graphql_errors "$body" "$names"
+        # A repo that does not exist or cannot be read nulls its alias. It is
+        # reported as unknown rather than dropped from the report.
+        for i in "${!REPOS[@]}"; do
+            if jq -e --arg k "r_$i" '.data[$k] != null' >/dev/null 2>&1 <<<"$body"; then
+                jq -c --arg k "r_$i" '.data[$k]' <<<"$body" >>"$WORK/nodes.jsonl"
+            else
+                placeholder_node "${REPOS[$i]}" >>"$WORK/nodes.jsonl"
+            fi
+        done
         return 0
     fi
 
     while [[ $has_next == true ]]; do
         local doc
         doc=$(query_repo_page)
+        # gh exits non-zero when any repo in the page cannot be read, but
+        # still prints the others. Keep the body and judge it below, or one
+        # unreadable repo would shrink the page until the sweep gave up.
         if [[ -z $cursor ]]; then
-            body=$(api graphql -f query="$doc" -f org="$ORG") || body=""
+            body=$(api graphql -f query="$doc" -f org="$ORG") || true
         else
-            body=$(api graphql -f query="$doc" -f org="$ORG" -f endCursor="$cursor") || body=""
+            body=$(api graphql -f query="$doc" -f org="$ORG" -f endCursor="$cursor") || true
         fi
 
         # Too large a page fails two ways and only one of them is loud. With
@@ -440,10 +476,9 @@ phase_repos() {
 
         jq -r '.data.organization.repositories.totalCount // empty' <<<"$body" >"$WORK/total-count"
 
-        record_graphql_errors "$body" "$offset"
+        record_graphql_errors "$body"
         jq -c '.data.organization.repositories.nodes[] | select(. != null)' <<<"$body" >>"$WORK/nodes.jsonl"
 
-        offset=$((offset + PAGE_SIZE))
         page=$((page + 1))
         has_next=$(jq -r '.data.organization.repositories.pageInfo.hasNextPage' <<<"$body")
         cursor=$(jq -r '.data.organization.repositories.pageInfo.endCursor' <<<"$body")
@@ -481,20 +516,10 @@ phase_reconcile() {
     jq -r '.nameWithOwner' "$WORK/nodes.jsonl" | sort -u >"$WORK/have-names"
     sort -u "$WORK/all-names" >"$WORK/want-names"
 
-    # A placeholder node keeps the repo visible and lets every check resolve to
-    # unknown, which is the honest answer: we never managed to read it.
     local missing=0 r
     while read -r r; do
         [[ -n $r ]] || continue
-        jq -cn --arg r "$r" '{
-            nameWithOwner: $r,
-            isArchived: false, isFork: false, isDisabled: false, isEmpty: null,
-            isPrivate: null, pushedAt: null,
-            autoMergeAllowed: null, squashMergeAllowed: null,
-            mergeCommitAllowed: null, rebaseMergeAllowed: null,
-            viewerPermission: null, hasVulnerabilityAlertsEnabled: null,
-            sweep_incomplete: true
-        }' >>"$WORK/nodes.jsonl"
+        placeholder_node "$r" >>"$WORK/nodes.jsonl"
         missing=$((missing + 1))
     done < <(comm -23 "$WORK/want-names" "$WORK/have-names")
 
@@ -779,18 +804,20 @@ probe_repo() {
         # Listing repository secrets needs admin. Not knowing is not a failure.
         token_status=unknown
         token_detail="cannot list repository secrets (needs admin); could not confirm '$want_secret'"
+    elif jq -e --arg n "$want_secret" '(.secrets // []) | any(.name == $n)' >/dev/null 2>&1 <<<"$repo_secrets"; then
+        token_status=pass
+        token_detail="secret '$want_secret' exists"
+    elif ! org_secrets=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100"); then
+        # The secret may be shared from the organisation. Without that list
+        # its absence is not known, so this is not a failure either.
+        token_status=unknown
+        token_detail="no repository secret named '$want_secret', and cannot list the organisation secrets shared with it; could not confirm one"
+    elif jq -e --arg n "$want_secret" '(.secrets // []) | any(.name == $n)' >/dev/null 2>&1 <<<"$org_secrets"; then
+        token_status=pass
+        token_detail="organisation secret '$want_secret' is shared with this repository"
     else
-        org_secrets=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100" || printf '{"secrets":[]}')
-        if jq -e --arg n "$want_secret" '
-                [(.repo.secrets // [])[], (.org.secrets // [])[]]
-                | any(.name == $n)
-            ' >/dev/null 2>&1 <<<"$(jq -n --argjson repo "$repo_secrets" --argjson org "${org_secrets:-\{\}}" '{repo: $repo, org: $org}' 2>/dev/null || printf '{}')"; then
-            token_status=pass
-            token_detail="secret '$want_secret' exists"
-        else
-            token_status=fail
-            token_detail="no secret named '$want_secret'; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
-        fi
+        token_status=fail
+        token_detail="no secret named '$want_secret'; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
     fi
 
     jq -cn --arg r "$repo" \
@@ -858,8 +885,8 @@ assemble() {
         --slurpfile nodes "$WORK/nodes.jsonl" \
         --slurpfile narrow "$WORK/narrow.jsonl" \
         --slurpfile errs "$WORK/errors.jsonl" \
-        --argjson teams "$(cat "$WORK/teams.json")" \
-        --argjson activity "$(cat "$WORK/activity.json")" \
+        --slurpfile teams_in "$WORK/teams.json" \
+        --slurpfile activity_in "$WORK/activity.json" \
         --arg merge_method "$MERGE_METHOD" \
         --arg ft "$FAST_TRACK_LABEL" \
         --arg pend "$PENDING_LABEL" \
@@ -870,8 +897,12 @@ assemble() {
         --argjson include_advisory_forks "$INCLUDE_ADVISORY_FORKS" \
         --arg audited_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '
-        def narrow_for($repo): ($narrow | map(select(.repo == $repo)) | first);
-        def err_fields($idx): ($errs | map(select(.node_index == $idx) | .field) | unique);
+        # Read from files rather than passed as arguments: on a large org
+        # either one outgrows the 128 KB Linux allows a single argument.
+        $teams_in[0] as $teams
+        | $activity_in[0] as $activity
+        | def narrow_for($repo): ($narrow | map(select(.repo == $repo)) | first);
+        def err_fields($repo): ($errs | map(select(.repo == $repo) | .field) | unique);
 
         def has_label($set; $want):
             (($set.nodes // []) | map(.name | ascii_downcase) | index($want | ascii_downcase)) != null;
@@ -939,11 +970,10 @@ assemble() {
 
         [ $nodes
           | to_entries[]
-          | .key as $idx
           | .value as $n
           | select($n != null)
           | ($n.nameWithOwner) as $repo
-          | err_fields($idx) as $errfields
+          | err_fields($repo) as $errfields
           | ($n.viewerPermission // "READ") as $perm
           | (["ADMIN","MAINTAIN","WRITE"] | index($perm)) as $write_access
           | ($write_access != null) as $trusted

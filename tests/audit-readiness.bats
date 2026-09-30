@@ -60,7 +60,8 @@ EOF
 # Values are never readable through the API; names are, which is all the check
 # needs.
 secrets_fixture() {
-    local names=${1:-QUALITYOPS_DEPENDABOT_ALERTS_TOKEN} key
+    # ${1-...}, not ${1:-...}: an explicit "" means no repository secrets.
+    local names=${1-QUALITYOPS_DEPENDABOT_ALERTS_TOKEN} key
     key=${2:-acme/widgets}
     key=${key//\//_}
     jq -cn --arg n "$names" '{secrets: ($n | split(",") | map(select(length > 0) | {name: .}))}' \
@@ -275,6 +276,71 @@ rec() {
     [ "$(rec .verdict)" = "blocked" ]
     [ "$(rec '.blockers | length')" -eq 1 ]
     [ "$(rec '.unknowns | length')" -eq 1 ]
+}
+
+@test "a partial GraphQL response keeps every repo and matches errors by name" {
+    # gh exits 1 when any alias errors but still prints the rest. acme/gone
+    # cannot be read at all, and acme/two has one field it cannot read. By
+    # position that error would land on acme/three once acme/gone is dropped.
+    viewer_fixture
+    local r
+    for r in acme/gone acme/two acme/three; do secrets_fixture "" "$r"; done
+    for r in acme/two acme/three; do
+        fixture "GET_repos_${r//\//_}_actions_organization_secrets_per_page_100" \
+            <<<'{"secrets":[{"name":"QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"}]}'
+    done
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            r_0: null,
+                            r_1: (. * {nameWithOwner: "acme/two", hasVulnerabilityAlertsEnabled: null}),
+                            r_2: (. * {nameWithOwner: "acme/three"})},
+                     errors: [{message: "Could not resolve to a Repository", path: ["r_0"]},
+                              {message: "Resource not accessible",
+                               path: ["r_1", "hasVulnerabilityAlertsEnabled"]}]}' \
+        | fixture graphql_RepoSet
+    echo 1 >"$GH_STUB_DIR/graphql_RepoSet.exit"
+    run "$SCRIPT" --repo acme/gone --repo acme/two --repo acme/three --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 3 ]
+    run jq -r '"\(.repo) \(.verdict) \(.checks.vuln_alerts.status)"' "$OUT/repos.jsonl"
+    grep -qx 'acme/gone unknown unknown' <<<"$output"
+    grep -qx 'acme/two unknown unknown' <<<"$output"
+    grep -qx 'acme/three ready pass' <<<"$output"
+}
+
+@test "an org page with one unreadable repo is kept rather than shrunk" {
+    viewer_fixture
+    local r
+    for r in acme/two acme/three acme/gone; do
+        secrets_fixture QUALITYOPS_DEPENDABOT_ALERTS_TOKEN "$r"
+    done
+    fixture graphql_OrgProbe <<<'{"data":{"organization":{"login":"acme"}}}'
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            organization: {repositories: {
+                              pageInfo: {hasNextPage: false, endCursor: null},
+                              totalCount: 3,
+                              nodes: [null,
+                                      (. * {nameWithOwner: "acme/two", hasVulnerabilityAlertsEnabled: null}),
+                                      (. * {nameWithOwner: "acme/three"})]}}},
+                     errors: [{message: "Resource not accessible",
+                               path: ["organization", "repositories", "nodes", 0, "autoMergeAllowed"]},
+                              {message: "Resource not accessible",
+                               path: ["organization", "repositories", "nodes", 1, "hasVulnerabilityAlertsEnabled"]}]}' \
+        | fixture graphql_RepoPage
+    echo 1 >"$GH_STUB_DIR/graphql_RepoPage.exit"
+    fixture graphql_RepoNames <<'EOF'
+{"data":{"rateLimit":{"cost":1,"remaining":4999},"organization":{"repositories":{
+  "pageInfo":{"hasNextPage":false,"endCursor":null},
+  "nodes":[{"nameWithOwner":"acme/gone"},{"nameWithOwner":"acme/two"},{"nameWithOwner":"acme/three"}]}}}}
+EOF
+    fixture graphql_DependabotPRs <<<'{"data":{"rateLimit":{"cost":1,"remaining":4999},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}'
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl
+    [ "$status" -eq 0 ]
+    [ "$(log_count 'graphql')" -ge 1 ]
+    [ "$(log_count 'RepoPage')" -eq 1 ]
+    run jq -r '"\(.repo) \(.checks.vuln_alerts.status)"' "$OUT/repos.jsonl"
+    grep -qx 'acme/gone unknown' <<<"$output"
+    grep -qx 'acme/two unknown' <<<"$output"
+    grep -qx 'acme/three pass' <<<"$output"
 }
 
 @test "one broken node does not lose the others in the same page" {
@@ -587,6 +653,24 @@ EOF
     secrets_fixture ""
     fixture GET_repos_acme_widgets_actions_organization_secrets_per_page_100 \
         <<<'{"secrets":[{"name":"QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"}]}'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "an unreadable organisation secret list reports unknown, not fail" {
+    repo_set
+    secrets_fixture ""
+    rm "$GH_STUB_DIR/GET_repos_acme_widgets_actions_organization_secrets_per_page_100"
+    echo "gh: HTTP 403" >"$GH_STUB_DIR/GET_repos_acme_widgets_actions_organization_secrets_per_page_100.err"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "unknown" ]
+    [ "$(rec '.blockers | index("alerts_token")')" = "null" ]
+}
+
+@test "a repository secret passes without reading the organisation list" {
+    repo_set
+    rm "$GH_STUB_DIR/GET_repos_acme_widgets_actions_organization_secrets_per_page_100"
+    echo "gh: HTTP 403" >"$GH_STUB_DIR/GET_repos_acme_widgets_actions_organization_secrets_per_page_100.err"
     run_audit
     [ "$(rec .checks.alerts_token.status)" = "pass" ]
 }
