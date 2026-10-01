@@ -210,6 +210,8 @@ It also reports risks, which never change a verdict: a strict required-status-ch
 
 Filters apply to the views, not the artifact: `--team`, `--status`, `--wave`, `--has-dependabot-config`.
 
+The run exits 1 when it cannot vouch for its own coverage: the rate brake tripped, a repository could not be probed (worker errors are copied to `probe-errors.log` in the output directory), or, with `--org`, the organisation's own repository listing could not be read to check the sweep against. The records are still written, and anything not read is `unknown`.
+
 ### Team ownership
 
 With `--org`, the audit guesses an owning team for each repository: the smallest team holding admin or maintain, after dropping bot teams by name and org-wide teams by size (`--max-team-size`, default 25% of the in-scope repositories). Use `--explain-owners` to see why each team was kept or dropped, and [`scripts/audit-team-overrides.tsv`](scripts/audit-team-overrides.tsv) to correct the cases it gets wrong. A repository the heuristic cannot place is reported as unassigned, never guessed.
@@ -315,7 +317,7 @@ jobs:
 
 Store it as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`. An organisation secret is the least work across many repositories: set it once, and each caller picks it up with the two lines above.
 
-`scripts/audit-readiness.sh` checks this. It reads the secret name out of your caller workflow's `secrets.token` line and confirms a secret by that name exists, at repo or organisation level. Values are never readable, only names, and listing repository secrets needs admin, so without it the check reports `unknown` rather than a failure.
+`scripts/audit-readiness.sh` checks this. It reads the secret name from the `token` line in the job that calls this workflow and confirms a secret by that name exists, at repo or organisation level. A caller that passes no token fails the check, because the workflow then falls back to `GITHUB_TOKEN`. Values are never readable, only names, and listing repository secrets needs admin, so without it the check reports `unknown` rather than a failure. The same goes for an organisation secret list it cannot read.
 
 ## Troubleshooting
 

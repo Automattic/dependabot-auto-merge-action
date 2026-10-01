@@ -8,7 +8,9 @@
 # that costs trust with the teams who own these repos.
 set -euo pipefail
 
-SELF=${BASH_SOURCE[0]}
+# Absolute, because the probe workers are exec'd by xargs, which cannot run a
+# bare name like "audit-readiness.sh" from the current directory.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # Teams that exist to hold automation, not to own repositories. Size-based
 # exclusion catches the org-wide teams on its own; these are small enough to
@@ -279,10 +281,13 @@ EOF
 
 # One aliased selection per repo, so --repo mode touches no organization node
 # and works for a caller with no org read at all.
+# REPOS[$1] up to but not including REPOS[$2]. The alias carries the index
+# into REPOS, so an error on r_N always names REPOS[N].
 query_repo_set() {
-    local i=0 r owner name
+    local i=$1 end=$2 r owner name
     printf 'query RepoSet {\n  rateLimit { cost remaining resetAt }\n'
-    for r in "${REPOS[@]}"; do
+    while [[ $i -lt $end ]]; do
+        r=${REPOS[$i]}
         owner=${r%%/*}
         name=${r#*/}
         printf '  r_%d: repository(owner: %s, name: %s) {\n%s\n  }\n' \
@@ -403,6 +408,45 @@ record_graphql_errors() {
     ' <<<"$body" >>"$WORK/errors.jsonl" 2>/dev/null || true
 }
 
+# Print the secret the caller passes as `token` to the reusable workflow,
+# nothing when the calling job passes none, or "?" when that job cannot be
+# found. Only the job that calls dependabot-auto-merge.yml counts, since a
+# `token:` in another job does not reach it, and the value may be quoted.
+# The job is the nearest line above `uses:` indented less than it, and runs
+# until the next line indented no more than the job key.
+caller_token_secret() {
+    awk '
+        { line[NR] = $0 }
+        END {
+            for (i = 1; i <= NR; i++) if (line[i] ~ /dependabot-auto-merge\.yml@/) { u = i; break }
+            if (!u) { print "?"; exit }
+            ui = match(line[u], /[^ ]/) - 1
+            for (i = u - 1; i >= 1; i--) {
+                if (line[i] ~ /^[ ]*(#|$)/) continue
+                ji = match(line[i], /[^ ]/) - 1
+                if (ji < ui) { j = i; break }
+            }
+            if (!j) { print "?"; exit }
+            for (i = j + 1; i <= NR; i++) {
+                if (line[i] ~ /^[ ]*(#|$)/) continue
+                if (match(line[i], /[^ ]/) - 1 <= ji) break
+                if (line[i] ~ /^[ ]*token[ ]*:[ ]*["\047]?\$\{\{[ ]*secrets\.[A-Za-z0-9_]+/) {
+                    s = line[i]
+                    sub(/.*secrets\./, "", s)
+                    sub(/[^A-Za-z0-9_].*/, "", s)
+                    print s
+                    exit
+                }
+            }
+        }'
+}
+
+# Whether the secrets list on stdin names $1.
+secret_listed() { jq -e --arg n "$1" '(.secrets // []) | any(.name == $n)' >/dev/null 2>&1; }
+
+# Whether the secrets list on stdin is one page of a longer list.
+secret_list_partial() { jq -e '(.total_count // 0) > ((.secrets // []) | length)' >/dev/null 2>&1; }
+
 # A node for a repository nothing could be read from. It keeps the repo visible
 # and lets every check resolve to unknown, which is the honest answer.
 placeholder_node() {
@@ -421,23 +465,41 @@ phase_repos() {
     local body cursor="" page=0 has_next=true remaining degraded
 
     if [[ ${#REPOS[@]} -gt 0 ]]; then
-        local doc names i
-        doc=$(query_repo_set)
-        # gh exits non-zero when any alias errors, but still prints the data
-        # for the rest, so the body is kept and judged on its own.
-        body=$(api graphql -f query="$doc") || true
-        jq -e '.data | type == "object"' >/dev/null 2>&1 <<<"$body" ||
-            die 1 "repository sweep failed: $(api_err)"
+        local doc names i start=0 end
         names=$(printf '%s\n' "${REPOS[@]}" | jq -R . | jq -sc .)
-        record_graphql_errors "$body" "$names"
-        # A repo that does not exist or cannot be read nulls its alias. It is
-        # reported as unknown rather than dropped from the report.
-        for i in "${!REPOS[@]}"; do
-            if jq -e --arg k "r_$i" '.data[$k] != null' >/dev/null 2>&1 <<<"$body"; then
-                jq -c --arg k "r_$i" '.data[$k]' <<<"$body" >>"$WORK/nodes.jsonl"
-            else
-                placeholder_node "${REPOS[$i]}" >>"$WORK/nodes.jsonl"
+        # In chunks of PAGE_SIZE, because one query over every repo is refused
+        # with a 502 at around 16 repositories, the same limit the org sweep
+        # pages around.
+        while [[ $start -lt ${#REPOS[@]} ]]; do
+            end=$((start + PAGE_SIZE))
+            [[ $end -le ${#REPOS[@]} ]] || end=${#REPOS[@]}
+            doc=$(query_repo_set "$start" "$end")
+            # gh exits non-zero when any alias errors, but still prints the
+            # data for the rest, so the body is kept and judged on its own.
+            body=$(api graphql -f query="$doc") || true
+            if ! jq -e '.data | type == "object"' >/dev/null 2>&1 <<<"$body"; then
+                if [[ $PAGE_SIZE -gt 3 ]]; then
+                    PAGE_SIZE=$((PAGE_SIZE / 2))
+                    note "GraphQL query was refused; retrying with $PAGE_SIZE repositories per query"
+                    continue
+                fi
+                die 1 "repository sweep failed: $(api_err)"
             fi
+            record_graphql_errors "$body" "$names"
+            # A repo that does not exist or cannot be read nulls its alias. It
+            # is reported as unknown rather than dropped from the report.
+            i=$start
+            while [[ $i -lt $end ]]; do
+                if jq -e --arg k "r_$i" '.data[$k] != null' >/dev/null 2>&1 <<<"$body"; then
+                    jq -c --arg k "r_$i" '.data[$k]' <<<"$body" >>"$WORK/nodes.jsonl"
+                else
+                    placeholder_node "${REPOS[$i]}" >>"$WORK/nodes.jsonl"
+                fi
+                i=$((i + 1))
+            done
+            start=$end
+            remaining=$(jq -r '.data.rateLimit.remaining // empty' <<<"$body")
+            check_brake "$remaining" || { note "rate limit floor reached during the repository sweep"; break; }
         done
         return 0
     fi
@@ -474,8 +536,6 @@ phase_repos() {
             die 1 "repository sweep failed even at page size $PAGE_SIZE: $(api_err)"
         fi
 
-        jq -r '.data.organization.repositories.totalCount // empty' <<<"$body" >"$WORK/total-count"
-
         record_graphql_errors "$body"
         jq -c '.data.organization.repositories.nodes[] | select(. != null)' <<<"$body" >>"$WORK/nodes.jsonl"
 
@@ -487,34 +547,41 @@ phase_repos() {
     done
 }
 
-# --- phase 1b: reconcile the sweep against the org's own count ----------------
+# --- phase 1b: reconcile the sweep against the org's own list ----------------
 
+# Compares names, not counts. Paging can repeat a repo and skip another while
+# the counts still agree, and totalCount can change between pages. So the
+# sweep is deduplicated by name, and every name in the org's own listing that
+# the sweep did not return becomes a placeholder reported as unknown. If that
+# listing cannot be read to the end, the run stops rather than report a sweep
+# it cannot vouch for.
 phase_reconcile() {
     [[ -n $ORG ]] || return 0
-    local expected received
-    expected=$(cat "$WORK/total-count" 2>/dev/null)
-    received=$(wc -l <"$WORK/nodes.jsonl" | tr -d ' ')
-    printf '%s' "${received:-0}" >"$WORK/received-count"
-    [[ -n $expected ]] || return 0
-    [[ $received -lt $expected ]] || return 0
 
-    note "the sweep returned $received of $expected repositories; finding the missing ones"
+    jq -c -s 'unique_by(.nameWithOwner)[]' "$WORK/nodes.jsonl" >"$WORK/nodes.dedup" &&
+        mv "$WORK/nodes.dedup" "$WORK/nodes.jsonl"
+    jq -r '.nameWithOwner' "$WORK/nodes.jsonl" | sort -u >"$WORK/have-names"
+    wc -l <"$WORK/have-names" | tr -d ' ' >"$WORK/received-count"
 
     local body cursor="" has_next=true
     : >"$WORK/all-names"
     while [[ $has_next == true ]]; do
         if [[ -z $cursor ]]; then
-            body=$(api graphql -f query="$(query_repo_names)" -f org="$ORG") || break
+            body=$(api graphql -f query="$(query_repo_names)" -f org="$ORG") ||
+                die 1 "cannot list the organisation's repositories to check the sweep: $(api_err)"
         else
-            body=$(api graphql -f query="$(query_repo_names)" -f org="$ORG" -f endCursor="$cursor") || break
+            body=$(api graphql -f query="$(query_repo_names)" -f org="$ORG" -f endCursor="$cursor") ||
+                die 1 "cannot list the organisation's repositories to check the sweep: $(api_err)"
         fi
+        jq -e '.data.organization.repositories.nodes | type == "array"' >/dev/null 2>&1 <<<"$body" ||
+            die 1 "cannot list the organisation's repositories to check the sweep: $(api_err)"
         jq -r '.data.organization.repositories.nodes[]?.nameWithOwner' <<<"$body" >>"$WORK/all-names"
         has_next=$(jq -r '.data.organization.repositories.pageInfo.hasNextPage' <<<"$body")
         cursor=$(jq -r '.data.organization.repositories.pageInfo.endCursor' <<<"$body")
     done
 
-    jq -r '.nameWithOwner' "$WORK/nodes.jsonl" | sort -u >"$WORK/have-names"
     sort -u "$WORK/all-names" >"$WORK/want-names"
+    wc -l <"$WORK/want-names" | tr -d ' ' >"$WORK/total-count"
 
     local missing=0 r
     while read -r r; do
@@ -791,30 +858,42 @@ probe_repo() {
     # configuration, so a repo without this secret loses every
     # indirect-dependency security PR. Secret *values* are never readable;
     # names are, which is enough to tell "wired" from "not wired".
-    local want_secret repo_secrets org_secrets
-    # The caller names the secret in a `secrets:` block, so the name sits on the
-    # `token:` line rather than after a literal "secrets.token". capture()
-    # raises on no match, hence the `?`.
-    want_secret=$(jq -r '((.caller.text // "")
-        | capture("(^|\\n)\\s*token\\s*:\\s*\\$\\{\\{\\s*secrets\\.(?<n>[A-Za-z0-9_]+)")?
-        | .n) // empty' <<<"$node" 2>/dev/null)
-    [[ -n $want_secret ]] || want_secret=$ALERTS_TOKEN_SECRET
+    local want_secret repo_secrets org_secrets caller_text
+    caller_text=$(jq -r '.caller.text // empty' <<<"$node" 2>/dev/null)
+    if [[ -n $caller_text ]]; then
+        want_secret=$(caller_token_secret <<<"$caller_text")
+    else
+        # Not adopted yet. Check for the secret the rollout will wire up.
+        want_secret=$ALERTS_TOKEN_SECRET
+    fi
 
-    if ! repo_secrets=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
+    if [[ $want_secret == "?" ]]; then
+        token_status=unknown
+        token_detail="cannot find the job that calls the workflow in the caller, so cannot tell which secret it passes"
+    elif [[ -z $want_secret ]]; then
+        token_status=fail
+        token_detail="the caller passes no token secret, so the workflow falls back to GITHUB_TOKEN, which cannot read the Dependabot alerts API"
+    elif ! repo_secrets=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
         # Listing repository secrets needs admin. Not knowing is not a failure.
         token_status=unknown
         token_detail="cannot list repository secrets (needs admin); could not confirm '$want_secret'"
-    elif jq -e --arg n "$want_secret" '(.secrets // []) | any(.name == $n)' >/dev/null 2>&1 <<<"$repo_secrets"; then
+    elif secret_listed "$want_secret" <<<"$repo_secrets"; then
         token_status=pass
         token_detail="secret '$want_secret' exists"
+    elif secret_list_partial <<<"$repo_secrets"; then
+        token_status=unknown
+        token_detail="the repository has more than 100 secrets and only the first 100 were read; could not confirm '$want_secret'"
     elif ! org_secrets=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100"); then
         # The secret may be shared from the organisation. Without that list
         # its absence is not known, so this is not a failure either.
         token_status=unknown
         token_detail="no repository secret named '$want_secret', and cannot list the organisation secrets shared with it; could not confirm one"
-    elif jq -e --arg n "$want_secret" '(.secrets // []) | any(.name == $n)' >/dev/null 2>&1 <<<"$org_secrets"; then
+    elif secret_listed "$want_secret" <<<"$org_secrets"; then
         token_status=pass
         token_detail="organisation secret '$want_secret' is shared with this repository"
+    elif secret_list_partial <<<"$org_secrets"; then
+        token_status=unknown
+        token_detail="more than 100 organisation secrets are shared with this repository and only the first 100 were read; could not confirm '$want_secret'"
     else
         token_status=fail
         token_detail="no secret named '$want_secret'; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
@@ -843,8 +922,14 @@ phase_narrow() {
     # Every in-scope repo is probed, because the alerts-token check applies to
     # all of them. The probe decides which of its three REST questions a given
     # repo actually needs, so one the bulk sweep already answered stays cheap.
-    jq -r '
-        select(.isArchived == false and .isFork == false and .isDisabled == false)
+    #
+    # The scope matches the in_scope rule in assemble, so a repo brought in by
+    # --include-archived or --include-forks is probed like any other.
+    jq -r --argjson ia "$INCLUDE_ARCHIVED" --argjson ifk "$INCLUDE_FORKS" --argjson iaf "$INCLUDE_ADVISORY_FORKS" '
+        select(.isDisabled != true)
+        | select($ia or .isArchived != true)
+        | select($ifk or .isFork != true)
+        | select($iaf or (.nameWithOwner | test("-ghsa-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$") | not))
         | .nameWithOwner
     ' "$WORK/nodes.jsonl" | sort -u >"$WORK/todo"
 
@@ -872,7 +957,9 @@ phase_narrow() {
         # exceed PIPE_BUF, and interleaved stdout writes are not atomic.
         # The parent concatenates in sorted order, so --jobs never changes
         # the output bytes.
-        xargs -P "$JOBS" -n 1 "$SELF" --probe-repo <"$WORK/todo" >/dev/null 2>&1 || true
+        # A worker that fails leaves no record. The summary counts those as
+        # unprobed and the run fails, so its stderr is kept for diagnosis.
+        xargs -P "$JOBS" -n 1 "$SELF" --probe-repo <"$WORK/todo" >/dev/null 2>>"$WORK/probe-errors.log" || true
         cat "$WORK"/probes/*.json 2>/dev/null >>"$WORK/narrow.jsonl" || true
     fi
 }
@@ -1073,10 +1160,13 @@ assemble() {
                     check("fail"; ".github/dependabot.yaml present but Dependabot only reads .yml — rename it"; "graphql")
                   elif ($nr.dependabot_config != null) then
                     check($nr.dependabot_config.status; $nr.dependabot_config.detail; "rest")
-                  elif ($manifest | not) then
-                    check("na"; "no npm or Composer manifest found"; "graphql")
                   else
-                    check("unknown"; "could not determine whether a config is needed"; "graphql")
+                    # The probe answers this for every repo without a config,
+                    # so no answer means it never ran here: the rate brake,
+                    # a failed worker, or a repo outside the probe scope. Not
+                    # finding a manifest in the root says nothing about the
+                    # subdirectories, so this is unknown, never na.
+                    check("unknown"; "this repository was not probed, so nested manifests were not looked for"; "graphql")
                   end),
 
                 caller_workflow: (
@@ -1646,11 +1736,10 @@ mkdir -p "$OUT_DIR"
 assemble >"$OUT_DIR/repos.jsonl"
 
 RECORDS=$(wc -l <"$OUT_DIR/repos.jsonl" | tr -d ' ')
-UNPROBED=0
-if braked; then
-    UNPROBED=$(( $(wc -l <"$WORK/todo" 2>/dev/null || echo 0) - $(wc -l <"$WORK/narrow.jsonl" | tr -d ' ') ))
-    [[ $UNPROBED -lt 0 ]] && UNPROBED=0
-fi
+# Every repo in todo should have a probe record. Counted whether or not the
+# brake tripped, because a worker can also fail without leaving one.
+UNPROBED=$(comm -23 <(sort -u "$WORK/todo" 2>/dev/null) \
+    <(jq -r '.repo' "$WORK/narrow.jsonl" 2>/dev/null | sort -u) | grep -c . || true)
 
 jq -n \
     --arg org "$ORG" \
@@ -1673,6 +1762,13 @@ printf 'Wrote %s/repos.jsonl (%s records) and %s/run.json\n' "$OUT_DIR" "$RECORD
 
 if braked; then
     printf 'rate limit floor reached — %d repositories were not probed; re-run to complete them\n' "$UNPROBED" >&2
+    exit 1
+fi
+
+if [[ $UNPROBED -gt 0 ]]; then
+    cp "$WORK/probe-errors.log" "$OUT_DIR/probe-errors.log" 2>/dev/null || : >"$OUT_DIR/probe-errors.log"
+    printf '%d repositories could not be probed and are reported unknown; worker errors are in %s/probe-errors.log\n' \
+        "$UNPROBED" "$OUT_DIR" >&2
     exit 1
 fi
 

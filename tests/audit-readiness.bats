@@ -343,6 +343,61 @@ EOF
     grep -qx 'acme/three pass' <<<"$output"
 }
 
+@test "--repo mode queries in chunks rather than all at once" {
+    # One query over every repo is refused with a 502 at around 16.
+    local patches=() args=() i
+    for i in $(seq 0 15); do
+        patches+=(". * {nameWithOwner: \"acme/r$i\"}")
+        args+=(--repo "acme/r$i")
+    done
+    repo_set_many "${patches[@]}"
+    run "$SCRIPT" "${args[@]}" --out-dir "$OUT" --format jsonl
+    [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 16 ]
+    [ "$(log_count 'RepoSet')" -eq 2 ]
+}
+
+@test "a repo the probe never reached is unknown, not n/a" {
+    # The first probe's REST headers trip the rate brake, so acme/two is never
+    # probed. No root manifest says nothing about its subdirectories.
+    repo_set_many '. * {nameWithOwner: "acme/one", depYml: null, depYaml: null, caller: null,
+                        root: {entries: [{name: "README.md", type: "blob"}]}}' \
+                  '. * {nameWithOwner: "acme/two", depYml: null, depYaml: null, caller: null,
+                        root: {entries: [{name: "README.md", type: "blob"}]}}'
+    secrets_fixture QUALITYOPS_DEPENDABOT_ALERTS_TOKEN acme/one
+    fixture GET_repos_acme_one_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"README.md"}]}
+EOF
+    GH_STUB_RATELIMIT=10 run "$SCRIPT" --repo acme/one --repo acme/two --out-dir "$OUT" \
+        --format jsonl --rate-floor 100 --jobs 1
+    [ "$status" -ne 0 ]
+    [ "$(jq -r 'select(.repo == "acme/two") | .verdict' "$OUT/repos.jsonl")" = "unknown" ]
+    [ "$(jq -r 'select(.repo == "acme/two") | .checks.dependabot_config.status' "$OUT/repos.jsonl")" = "unknown" ]
+    [ "$(jq -r .unprobed "$OUT/run.json")" = "1" ]
+}
+
+@test "--include-archived probes the archived repos it brings in" {
+    repo_set '. * {isArchived: true, depYml: null, depYaml: null}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"package.json"}]}
+EOF
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --include-archived
+    [ "$(log_count 'git/trees')" -eq 1 ]
+    [ "$(rec .checks.dependabot_config.status)" = "pass" ]
+}
+
+@test "the workers run when the script is called by a bare name" {
+    # xargs cannot exec "audit-readiness.sh" from the current directory.
+    repo_set '. * {depYml: null, depYaml: null}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<'EOF'
+{"truncated":false,"tree":[{"type":"blob","path":"package.json"}]}
+EOF
+    cd "$(dirname "$SCRIPT")"
+    run bash "$(basename "$SCRIPT")" --repo acme/widgets --out-dir "$OUT" --format jsonl --jobs 2
+    [ "$status" -eq 0 ]
+    [ "$(log_count 'git/trees')" -eq 1 ]
+    [ "$(jq -r .unprobed "$OUT/run.json")" = "0" ]
+}
+
 @test "one broken node does not lose the others in the same page" {
     repo_set_many '. * {nameWithOwner: "acme/one"}' \
                   '. * {nameWithOwner: "acme/two", autoMergeAllowed: false}' \
@@ -683,8 +738,8 @@ EOF
     [ "$(rec .checks.alerts_token.secret)" = "MY_OWN_TOKEN" ]
 }
 
-@test "a caller with no secrets block falls back to the configured name" {
-    repo_set '.caller.text |= sub("\n    secrets:\n      token: \\$\\{\\{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN \\}\\}"; "")'
+@test "a repo not adopted yet is checked for the configured secret name" {
+    repo_set '.caller = null'
     secrets_fixture "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
     run_audit
     [ "$(rec .checks.alerts_token.secret)" = "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN" ]
@@ -692,11 +747,44 @@ EOF
 }
 
 @test "--alerts-token-secret changes the name looked for" {
-    repo_set '.caller.text |= sub("\n    secrets:\n      token: \\$\\{\\{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN \\}\\}"; "")'
+    repo_set '.caller = null'
     secrets_fixture "WOO_ALERTS_TOKEN"
     run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --alerts-token-secret WOO_ALERTS_TOKEN
     [ "$status" -eq 0 ]
     [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "an adopted caller that passes no token fails, whatever secrets exist" {
+    # The workflow then falls back to GITHUB_TOKEN.
+    repo_set '.caller.text |= sub("\n    secrets:\n      token: \\$\\{\\{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN \\}\\}"; "")'
+    secrets_fixture "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    grep -qF 'passes no token secret' <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "a quoted token secret is read" {
+    repo_set '.caller.text |= sub("token: \\$\\{\\{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN \\}\\}"; "token: \"${{ secrets.MY_OWN_TOKEN }}\"")'
+    secrets_fixture "MY_OWN_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.secret)" = "MY_OWN_TOKEN" ]
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "a token in another job does not count for the calling job" {
+    repo_set '.caller.text |= sub("jobs:\n"; "jobs:\n  other:\n    uses: acme/other/.github/workflows/x.yml@main\n    secrets:\n      token: ${{ secrets.SOMETHING_ELSE }}\n")'
+    secrets_fixture "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.secret)" = "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN" ]
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "a secret missing from the first page of a longer list is unknown" {
+    repo_set
+    jq -n '{total_count: 150, secrets: [{name: "OTHER"}]}' \
+        | fixture GET_repos_acme_widgets_actions_secrets_per_page_100
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "unknown" ]
 }
 
 @test "secrets we cannot list are unknown, not a missing token" {
@@ -780,7 +868,16 @@ org_fixtures() {
                               pageInfo: {hasNextPage: false, endCursor: null},
                               totalCount: 1, nodes: [.]}}}}' \
         | fixture graphql_RepoPage
+    repo_names_fixture acme/widgets
     fixture graphql_DependabotPRs <<<'{"data":{"rateLimit":{"cost":1,"remaining":4999},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}'
+}
+
+# The org's own repository listing, one page, naming each of $@.
+repo_names_fixture() {
+    printf '%s\n' "$@" | jq -R '{nameWithOwner: .}' | jq -s '
+        {data: {rateLimit: {cost: 1, remaining: 4999}, organization: {repositories: {
+          pageInfo: {hasNextPage: false, endCursor: null}, nodes: .}}}}' \
+        | fixture graphql_RepoNames
 }
 
 # $1 is a jq array of {slug,size}; $2 maps slug -> permission for acme/widgets.
@@ -952,20 +1049,39 @@ EOF
     [ "$(jq -r .sweep_missing "$OUT/run.json")" = "1" ]
 }
 
-@test "a complete sweep costs no extra listing call" {
+@test "the sweep is reconciled by name even when the counts agree" {
+    # Paging repeated acme/b and skipped acme/d, but four nodes arrived for a
+    # totalCount of four. Counting would call that complete.
     viewer_fixture
     secrets_fixture
     fixture graphql_OrgProbe <<<'{"data":{"organization":{"login":"acme"}}}'
     base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
                             organization: {repositories: {
+                              pageInfo: {hasNextPage: true, endCursor: "c1"},
+                              totalCount: 4,
+                              nodes: [(. * {nameWithOwner: "acme/a"}), (. * {nameWithOwner: "acme/b"})]}}}}' \
+        | fixture graphql_RepoPage.1
+    base_node | jq '{data: {rateLimit: {cost: 1, remaining: 4999},
+                            organization: {repositories: {
                               pageInfo: {hasNextPage: false, endCursor: null},
-                              totalCount: 1, nodes: [.]}}}}'         | fixture graphql_RepoPage
+                              totalCount: 4,
+                              nodes: [(. * {nameWithOwner: "acme/b"}), (. * {nameWithOwner: "acme/c"})]}}}}' \
+        | fixture graphql_RepoPage.2
+    repo_names_fixture acme/a acme/b acme/c acme/d
     fixture graphql_DependabotPRs <<<'{"data":{"rateLimit":{"cost":1,"remaining":4999},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}'
     run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl
-    [ "$status" -eq 0 ]
-    [ "$(jq -r .sweep_missing "$OUT/run.json")" = "0" ]
-    # No RepoNames fixture exists, so reconciliation must not have run at all.
-    [ "$(grep -c RepoNames "$GH_STUB_LOG" || true)" -eq 0 ]
+    [ "$(jq -s 'map(.repo) | sort | join(",")' -r "$OUT/repos.jsonl")" = "acme/a,acme/b,acme/c,acme/d" ]
+    [ "$(jq -r 'select(.repo == "acme/d") | .verdict' "$OUT/repos.jsonl")" = "unknown" ]
+    [ "$(jq -r .swept "$OUT/run.json")" = "3" ]
+    [ "$(jq -r .sweep_missing "$OUT/run.json")" = "1" ]
+}
+
+@test "a sweep that cannot be checked against the org's listing fails the run" {
+    org_fixtures
+    rm "$GH_STUB_DIR/graphql_RepoNames"
+    run "$SCRIPT" --org acme --out-dir "$OUT" --format jsonl
+    [ "$status" -ne 0 ]
+    grep -qF "cannot list the organisation's repositories" <<<"$output"
 }
 
 # --- scope, output and concurrency --------------------------------------------
