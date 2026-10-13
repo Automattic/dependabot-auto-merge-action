@@ -7,6 +7,9 @@ on:
             - '.github/workflows/**'
             - 'scripts/**'
             - 'tests/**'
+            # The telemetry contract lives here and the bats suite checks it,
+            # so a change to the schema or the validator has to run the suite.
+            - 'docs/telemetry/**'
             - 'src/**'
             - 'bin/**'
             - 'composer.json'
