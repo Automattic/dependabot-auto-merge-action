@@ -26,6 +26,38 @@ extract_run() {
     ' "$WORKFLOW"
 }
 
+# Print the `if:` condition of the step whose id is $1, one line per line of
+# a folded `if: |` block, dedented to column 0. Reads $WORKFLOW. A script
+# test cannot notice a step that stops checking the output it depends on,
+# and several of the workflow's security boundaries are `if:` expressions
+# rather than scripts, so the wiring suite reads the conditions directly.
+extract_if() {
+    awk -v id="$1" '
+        function flush() {
+            if (hit) printf "%s", cond
+            hit = 0; cond = ""; inif = 0
+        }
+        /^ +steps:$/ { match($0, /^ +/); stepind = RLENGTH + 4; flush(); next }
+        stepind && match($0, /^ +- /) && RLENGTH - 2 == stepind { flush() }
+        stepind && $0 ~ "^ +id: " id "$" { hit = 1 }
+        inif {
+            match($0, /^ */)
+            if ($0 !~ /^[[:space:]]*$/ && RLENGTH > ifind) {
+                if (!bodyind) bodyind = RLENGTH
+                cond = cond substr($0, bodyind + 1) "\n"
+                next
+            }
+            inif = 0
+        }
+        stepind && match($0, /^ +if: /) && RLENGTH - 4 == stepind + 2 {
+            ifind = RLENGTH - 4
+            value = substr($0, RLENGTH + 1)
+            if (value == "|") { inif = 1; bodyind = 0 } else { cond = value "\n" }
+        }
+        END { flush() }
+    ' "$WORKFLOW"
+}
+
 # Count the lines of $GH_STUB_LOG containing the fixed string $1. `|| true`
 # because callers compare the count with `[ ]`: grep's no-match exit status
 # would otherwise abort the test before the comparison runs.
