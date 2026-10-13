@@ -11,6 +11,8 @@
 #   <key>.err   contents printed to stderr, exit 1
 #   <key>.exit  with <key>, exit with this code after printing the body, as
 #               gh does for a GraphQL response that carries errors
+#   <key>.delay with <key>, sleep this many seconds before answering, so a
+#               test can signal the run while a call is in flight
 #   neither     "HTTP 404"-style error to stderr, exit 1 (matches how the
 #               bootstrap script distinguishes absent resources)
 #
@@ -140,6 +142,10 @@ emit_headers() {
     fi
     printf '\n'
 }
+
+if [[ -f $GH_STUB_DIR/$key.delay ]]; then
+    sleep "$(cat "$GH_STUB_DIR/$key.delay")"
+fi
 
 if [[ -f $GH_STUB_DIR/$key ]]; then
     emit_headers
