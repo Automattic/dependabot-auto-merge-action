@@ -398,6 +398,26 @@ EOF
     [ "$(jq -r .unprobed "$OUT/run.json")" = "0" ]
 }
 
+@test "a run stopped part-way leaves the previous artifact intact" {
+    # The tree call takes two seconds, long enough to signal the run while
+    # it is probing.
+    repo_set '. * {depYml: null, depYaml: null}'
+    fixture GET_repos_acme_widgets_git_trees_main_recursive_1 <<<'{"truncated":false,"tree":[]}'
+    echo 2 >"$GH_STUB_DIR/GET_repos_acme_widgets_git_trees_main_recursive_1.delay"
+    mkdir -p "$OUT"
+    echo '{"repo":"acme/previous"}' >"$OUT/repos.jsonl"
+    "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --jobs 1 >/dev/null 2>&1 &
+    local pid=$! i status=0
+    for i in $(seq 1 50); do
+        grep -qF 'git/trees' "$GH_STUB_LOG" 2>/dev/null && break
+        sleep 0.1
+    done
+    kill -TERM "$pid"
+    wait "$pid" || status=$?
+    [ "$status" -eq 143 ]
+    [ "$(cat "$OUT/repos.jsonl")" = '{"repo":"acme/previous"}' ]
+}
+
 @test "one broken node does not lose the others in the same page" {
     repo_set_many '. * {nameWithOwner: "acme/one"}' \
                   '. * {nameWithOwner: "acme/two", autoMergeAllowed: false}' \

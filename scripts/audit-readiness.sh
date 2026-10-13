@@ -130,7 +130,12 @@ cleanup() {
     [[ $WORK_OWNED == true && -n $WORK ]] && rm -rf "$WORK"
     return 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# Stop on a signal. A cleanup that returns lets the run carry on into
+# assembly with whatever was probed so far, and overwrite the last good
+# repos.jsonl with it.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- output helpers -----------------------------------------------------------
 
@@ -1733,7 +1738,10 @@ phase_narrow
 
 ASSEMBLE_EXPECT_REF=$EXPECT_REF
 mkdir -p "$OUT_DIR"
-assemble >"$OUT_DIR/repos.jsonl"
+# Written beside the target and moved into place, so the previous run's
+# artifact survives anything that stops this one part-way.
+assemble >"$OUT_DIR/repos.jsonl.tmp"
+mv "$OUT_DIR/repos.jsonl.tmp" "$OUT_DIR/repos.jsonl"
 
 RECORDS=$(wc -l <"$OUT_DIR/repos.jsonl" | tr -d ' ')
 # Every repo in todo should have a probe record. Counted whether or not the
@@ -1754,7 +1762,8 @@ jq -n \
     '{org: $org, audited_at: $audited_at, records: $records,
       rate_limited: $braked, unprobed: $unprobed, page_size: ($page_size | tonumber),
       org_total: $expected, swept: $swept, sweep_missing: $sweep_missing}' \
-    >"$OUT_DIR/run.json"
+    >"$OUT_DIR/run.json.tmp"
+mv "$OUT_DIR/run.json.tmp" "$OUT_DIR/run.json"
 
 printf '\n'
 render "$OUT_DIR/repos.jsonl"
