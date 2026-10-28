@@ -14,8 +14,8 @@
 # The paths also match differently. A known advisory pins the lookup to
 # that GHSA ID. With no advisory known, any open alert that applies to an
 # updated dependency counts. On both paths an alert applies only when it
-# names the same package in the same ecosystem, sits on a manifest in the
-# updated directory, and is fixed by the version the PR moves to.
+# names the same package in the same ecosystem, sits on a manifest in or
+# below the updated directory, and is fixed by the version the PR moves to.
 
 load helpers
 
@@ -207,15 +207,27 @@ no_match() {
     done
 }
 
-@test "an alert on a manifest outside the updated directory does not qualify" {
-    alerts_fixture "$(alert manifest=packages/api/package-lock.json)"
-    run fallback false "$LODASH"
-    no_match
+@test "an alert on a manifest in a subfolder of the updated directory qualifies" {
+    # pip reads requirements/base.txt for a PR on `/`. Missing it would
+    # leave a security fix unlabelled and treated as a routine update.
+    for manifest in packages/api/package-lock.json requirements/base.txt; do
+        : >"$GITHUB_OUTPUT"
+        alerts_fixture "$(alert manifest="$manifest")"
+        fallback false "$LODASH"
+        [ "$(out pass)" = "true" ]
+    done
+}
 
-    # The reverse too. A root alert is not fixed by an update to a nested
-    # lockfile. A prefix match would let `/` claim every manifest in the repo.
+@test "an alert on a manifest outside the updated directory does not qualify" {
+    # A root alert is not fixed by an update to a nested lockfile, and a
+    # sibling directory shares only a name prefix.
     : >"$GITHUB_OUTPUT"
     alerts_fixture "$(alert manifest=package-lock.json)"
+    run fallback false "$(dependencies "$(dependency directory=/packages/api)")"
+    no_match
+
+    : >"$GITHUB_OUTPUT"
+    alerts_fixture "$(alert manifest=packages/api-legacy/package-lock.json)"
     run fallback false "$(dependencies "$(dependency directory=/packages/api)")"
     no_match
 }

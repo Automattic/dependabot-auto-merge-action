@@ -47,8 +47,7 @@ on:
 permissions:
     pull-requests: write
     contents: write
-    # Dependabot alerts, for fetch-metadata's alert lookup and the Gate 1
-    # fallback. security-events does not cover them: with it alone the REST
+    # Dependabot alerts, for the Gate 1 lookup. security-events does not cover them: with it alone the REST
     # list is a 403 and the GraphQL field returns no alerts.
     vulnerability-alerts: read
     # evaluate-pr records its verdict as a commit status, and the scheduled
@@ -167,14 +166,13 @@ jobs:
         steps:
             - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
               id: meta
-              # Both lookups are opt-in. Without them ghsa-id and cvss stay
-              # empty and every compatibility score reads 0, so Gate 1 never
-              # sees an advisory and Gate 3 never sees a score. The alert
-              # lookup reads Dependabot alerts, so it takes the same token as
-              # the fallback. fetch-metadata fails the step when that token
-              # cannot read them.
+              # The compatibility lookup is opt-in. Without it every score
+              # reads 0 and Gate 3 never sees a real one. The alert lookup
+              # stays off by omission, since fetch-metadata treats any
+              # non-empty value as on. Gate 1 reads Dependabot alerts only
+              # through the fallback below, which checks that an alert is
+              # open and applies to the update.
               with:
-                  alert-lookup: true
                   compat-lookup: true
                   github-token: ${{ secrets.token || github.token }}
 
@@ -264,11 +262,10 @@ jobs:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             # Gate 1: must be a security advisory, not a routine version bump.
-            # fetch-metadata's alert lookup matches the first updated
-            # dependency's previous version to an alert on its manifest. That
-            # can succeed for a direct or an indirect dependency, and fail for
-            # either, so an empty ghsa-id says nothing about which one this PR
-            # updates. Gate 3 reads dependency-type for that instead.
+            # fetch-metadata runs without its alert lookup, so ghsa-id and
+            # cvss are empty and the alerts API fallback decides. An empty
+            # ghsa-id says nothing about whether the PR updates a direct or
+            # an indirect dependency. Gate 3 reads dependency-type for that.
             # The score is classified here as well: a zero-like or unparseable
             # CVSS means GitHub sent no real severity, and `cvss-usable=false`
             # tells the fallback to try the alerts API for a real one.
@@ -348,11 +345,12 @@ jobs:
                   # no advisory database ecosystem maps to nothing and never
                   # matches.
                   #
-                  # Directory. The manifest has to sit directly in the updated
-                  # directory. A prefix match would let `/` claim every
-                  # manifest in the repository. GitHub Actions is the one
-                  # exception, where Dependabot reads a directory's workflows
-                  # from its `.github/workflows`.
+                  # Directory. The manifest may sit in the updated directory or
+                  # anywhere below it, since an ecosystem such as pip reads
+                  # `requirements/base.txt` for a PR on `/`. This can send a
+                  # routine PR to review when an alert sits in an unrelated
+                  # subfolder, which is the safe way to be wrong. GitHub
+                  # Actions also counts a directory's `.github/workflows`.
                   #
                   # Version. Ecosystems order pre-releases and qualifiers
                   # differently (semver, PEP 440 and Maven all disagree), so
@@ -388,6 +386,8 @@ jobs:
                                    (trim_slashes | split("/") | .[:-1] | join("/")) as $parent
                                    | ($dir | trim_slashes) as $want
                                    | $parent == $want
+                                     or $want == ""
+                                     or ($parent | startswith($want + "/"))
                                      or ($manager == "github_actions"
                                          and $parent == ([$want, ".github/workflows"]
                                                          | map(select(. != "")) | join("/")))
@@ -562,8 +562,8 @@ jobs:
             # Runs for every PR that clears Gate 2 and decides inside the
             # script whether the check applies, from dependency-type. Which
             # Gate 1 path found the advisory says nothing about that, because
-            # the alert lookup can name an advisory for an indirect dependency
-            # and miss one for a direct dependency. Skipping the step instead
+            # an alert can match an indirect dependency and miss a direct
+            # one. Skipping the step instead
             # would count as a pass for the pending label, so an `if:` that
             # wrongly skips it fails open.
             - name: Gate 3 — compatibility score (≥ ${{ inputs.compatibility-threshold }}%)

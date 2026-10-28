@@ -52,20 +52,20 @@ gate1() {
     ! grep -q '^cvss' "$GITHUB_OUTPUT"
 }
 
-# fetch-metadata leaves ghsa-id, alert-state and cvss empty, and every
-# compatibility score at 0, unless the two opt-in lookups are on. Without
-# them Gate 1 never sees an advisory and Gate 3 never sees a score, so both
-# gates quietly stop meaning what the README says they do.
-@test "the metadata step enables the alert and compatibility lookups" {
+# fetch-metadata leaves every compatibility score at 0 unless the opt-in
+# compat lookup is on, and Gate 3 would never see a real score. The alert
+# lookup stays off: fetch-metadata only checks that the value is non-empty,
+# so even `false` would turn it on, and the lookup can pass Gate 1 on a
+# dismissed alert. The alerts fallback checks that an alert is open.
+@test "the metadata step enables the compatibility lookup and leaves the alert lookup off" {
     with=$(extract_key meta with)
-    grep -qxF 'alert-lookup: true' <<<"$with"
     grep -qxF 'compat-lookup: true' <<<"$with"
+    ! grep -q 'alert-lookup' <<<"$with"
 }
 
-# The alert lookup reads Dependabot alerts. It has to use the same token as
-# the fallback, or a caller who configured `secrets.token` still reads them
-# with a GITHUB_TOKEN that may lack the permission.
-@test "the alert lookup uses the same token as the alerts fallback" {
+# fetch-metadata should use the same token as the fallback, so a caller who
+# configured `secrets.token` gets one token throughout.
+@test "the metadata step uses the same token as the alerts fallback" {
     token=$(extract_key meta with | sed -n 's/^github-token: //p')
     fallback_token=$(extract_key gate1-fallback env | sed -n 's/^GH_TOKEN: //p')
     [ -n "$token" ]
