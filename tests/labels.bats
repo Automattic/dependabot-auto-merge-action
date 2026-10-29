@@ -51,6 +51,11 @@ run_step() {
     bash --noprofile --norc -e "$1"
 }
 
+# Run the scheduled merge step with the flags its `shell: bash` expands to.
+run_merge_step() {
+    bash --noprofile --norc -e -o pipefail "$MERGE_STEP"
+}
+
 # --- pass -> review -------------------------------------------------------
 
 @test "routing to review sheds the pending label in the same edit" {
@@ -121,20 +126,27 @@ mixed_pr_list_fixture() {
     NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     cat >"$GH_STUB_DIR/pr_list" <<EOF
 [
-  {"number": 101, "createdAt": "2020-01-01T00:00:00Z",
+  {"number": 101, "createdAt": "2020-01-01T00:00:00Z", "headRefOid": "a101",
    "labels": [{"name": "auto-merge-pending"}]},
-  {"number": 102, "createdAt": "2020-01-01T00:00:00Z",
+  {"number": 102, "createdAt": "2020-01-01T00:00:00Z", "headRefOid": "a102",
    "labels": [{"name": "auto-merge-pending"}, {"name": "sirt-review-required"}]},
-  {"number": 103, "createdAt": "$NOW",
+  {"number": 103, "createdAt": "$NOW", "headRefOid": "a103",
    "labels": [{"name": "auto-merge-pending"}]}
 ]
 EOF
+    # Every PR carries passing evidence, so only the label and age
+    # selection under test decides what merges. tests/scheduled-merge.bats
+    # covers the evidence check.
+    local sha
+    for sha in a101 a102 a103; do
+        statuses_fixture "$sha" "$(commit_status success 'github-actions[bot]')"
+    done
 }
 
 @test "scheduled merge skips PRs that also carry the review label" {
     merge_env
     mixed_pr_list_fixture
-    run_step "$MERGE_STEP"
+    run_merge_step
     # 101 (pending only, old) merges; 102 is the ticket case — past the age
     # gate and still carrying a stale pending label, but routed to review —
     # and 103 is too young.
@@ -148,9 +160,10 @@ EOF
 # One old, pending-labelled PR that also carries $1 as its review label.
 review_labelled_pr_fixture() {
     jq -n --arg review "$1" \
-        '[{number: 201, createdAt: "2020-01-01T00:00:00Z",
+        '[{number: 201, createdAt: "2020-01-01T00:00:00Z", headRefOid: "a201",
            labels: [{name: "auto-merge-pending"}, {name: $review}]}]' \
         >"$GH_STUB_DIR/pr_list"
+    statuses_fixture a201 "$(commit_status success 'github-actions[bot]')"
 }
 
 # Every other label comparison in the chain ignores case, so a caller whose
@@ -161,7 +174,7 @@ review_labelled_pr_fixture() {
 @test "scheduled merge skips a review label whose casing differs on the PR" {
     merge_env
     review_labelled_pr_fixture SIRT-Review-Required
-    run_step "$MERGE_STEP"
+    run_merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
 }
 
@@ -169,7 +182,7 @@ review_labelled_pr_fixture() {
     merge_env
     export REVIEW_LABEL=SIRT-Review-Required
     review_labelled_pr_fixture sirt-review-required
-    run_step "$MERGE_STEP"
+    run_merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
 }
 
@@ -177,7 +190,7 @@ review_labelled_pr_fixture() {
     merge_env
     mixed_pr_list_fixture
     echo "GraphQL: Pull request is in clean status" >"$GH_STUB_DIR/pr_merge.err"
-    run bash --noprofile --norc -e "$MERGE_STEP"
+    run run_merge_step
     [ "$status" -eq 1 ]
     # grep rather than [[ ]]: under macOS bash 3.2 a failed [[ ]] mid-test
     # cannot fail a bats test (errexit/ERR fire only for simple commands).

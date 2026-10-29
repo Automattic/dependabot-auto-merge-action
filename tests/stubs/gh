@@ -87,7 +87,10 @@ while [[ $# -gt 0 ]]; do
             jq_filter=$2
             shift 2
             ;;
-        --input)
+        # Flags that take a value. Without this the value (`state=success`,
+        # say) would be read as the path and every such call would 404.
+        # -f and -F are handled below, since they can carry a GraphQL query.
+        --input | --field | --raw-field | -H | --header)
             shift 2
             ;;
         -f | -F)
