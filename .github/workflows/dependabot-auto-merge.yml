@@ -28,7 +28,7 @@ on:
                 type: string
                 default: 'squash'
             fast-track-label:
-                description: 'Label that bypasses all gates and enables immediate auto-merge.'
+                description: 'Marker label applied when a person enables auto-merge on a PR, which bypasses the gates. Applying the label by hand does nothing.'
                 type: string
                 default: 'security-fast-track'
             review-label:
@@ -151,56 +151,85 @@ jobs:
             - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
               id: meta
 
-            # Human override: a reviewer has verified this is a legitimate security
-            # fix. Bypass all automated gates and enable auto-merge immediately.
-            - name: Fast-track — human-verified override (bypasses all gates)
+            # A person who can merge fast-tracks a PR with GitHub's own
+            # "Enable auto-merge" button. GitHub checks their permission and
+            # records them on the timeline, so this workflow only has to
+            # notice. The pulls API says who enabled it. A real login that is
+            # not github-actions[bot] is a person's decision, and the gates
+            # below stay out of it. The bot is this workflow's own scheduled
+            # merge, and an unreadable enabler is treated the same way, so
+            # both still go through the gates. A failed read fails the step,
+            # because nothing downstream may act on a guess.
+            - name: Detect a fast-track (auto-merge enabled by a person)
               id: fast-track
-              if: contains(github.event.pull_request.labels.*.name, inputs.fast-track-label)
+              # Explicit so the step runs under `-e -o pipefail` and the bats
+              # suite can drive the extracted script with exactly these flags.
+              shell: bash
               run: |
-                  gh pr merge --auto --"$MERGE_METHOD" "$PR_URL"
+                  if ! PR_JSON=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" 2>&1); then
+                      echo "::error::Cannot read the auto-merge state of PR #$PR_NUMBER. $(echo "$PR_JSON" | head -c 300 | tr '\n' ' ')"
+                      exit 1
+                  fi
+                  ENABLED_BY=$(echo "$PR_JSON" | jq -r \
+                      'if .auto_merge == null then "" else (.auto_merge.enabled_by.login // "?") end')
+
+                  if [ -n "$ENABLED_BY" ] && [ "$ENABLED_BY" != "github-actions[bot]" ] && [ "$ENABLED_BY" != "?" ]; then
+                      echo "active=true" >> "$GITHUB_OUTPUT"
+                      echo "enabled-by=$ENABLED_BY" >> "$GITHUB_OUTPUT"
+                      echo "Auto-merge on PR #$PR_NUMBER was enabled by @$ENABLED_BY, so the gates are bypassed."
+                  else
+                      echo "active=false" >> "$GITHUB_OUTPUT"
+                      case "$ENABLED_BY" in
+                          '') echo "No auto-merge is queued on PR #$PR_NUMBER, so the gates run." ;;
+                          '?') echo "Auto-merge on PR #$PR_NUMBER has no readable enabler, so the gates run." ;;
+                          *) echo "Auto-merge on PR #$PR_NUMBER was queued by this workflow, so the gates run." ;;
+                      esac
+                  fi
               env:
-                  MERGE_METHOD: ${{ inputs.merge-method }}
-                  PR_URL: ${{ github.event.pull_request.html_url }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            # Audit trail: the fast-track path enables auto-merge silently, so
-            # record who applied the label, when, and the workflow run on the PR.
-            # The hidden marker makes this exactly-once: repeated synchronize
-            # events find it in an existing comment and skip.
-            - name: Fast-track — post audit comment (once)
-              if: steps.fast-track.conclusion == 'success'
+            # Audit trail: the button leaves a timeline entry, but the gates
+            # it bypassed are this workflow's, so record the bypass on the PR
+            # where a reviewer reads it, and apply the fast-track label as a
+            # marker so fast-tracked PRs turn up in a label search. The hidden
+            # marker makes the comment exactly-once: later events find it in
+            # an existing comment and skip. The comments are read into a
+            # variable first, because a grep that stops at the first match
+            # cuts a paginated read short and reads as "no marker".
+            - name: Fast-track (audit comment once, and mark the PR)
+              id: fast-track-audit
+              if: steps.fast-track.outputs.active == 'true'
+              shell: bash
               run: |
                   MARKER='<!-- dependabot-auto-merge:fast-track-audit -->'
 
-                  if gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
-                      --jq '.[].body' | grep -qF "$MARKER"; then
-                      echo "Fast-track audit comment already exists — skipping."
-                      exit 0
+                  if ! BODIES=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+                      --jq '.[].body' 2>&1); then
+                      echo "::error::Cannot read the comments on PR #$PR_NUMBER. $(echo "$BODIES" | head -c 300 | tr '\n' ' ')"
+                      exit 1
                   fi
-
-                  if [ "$EVENT_ACTION" = "labeled" ] && [ "$LABEL_NAME" = "$FAST_TRACK_LABEL" ]; then
-                      APPLIED_BY="@$SENDER"
-                  else
-                      APPLIED_BY="not recorded — the label was already present when this $EVENT_ACTION event ran"
+                  if grep -qF "$MARKER" <<<"$BODIES"; then
+                      echo "Fast-track audit comment already exists, skipping."
+                      exit 0
                   fi
 
                   TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
                   BODY=$(cat <<EOF
                   $MARKER
-                  **Fast-track audit** — auto-merge was enabled on this PR via the **$FAST_TRACK_LABEL** label, bypassing all gates.
+                  **Fast-track audit.** Auto-merge was enabled on this PR by a person, not this workflow, so every gate was bypassed.
 
-                  - **Label applied by:** $APPLIED_BY
+                  - **Enabled by:** @$ENABLED_BY
                   - **When (UTC):** $TIMESTAMP
                   - **Workflow run:** $RUN_URL
                   EOF
                   )
 
                   gh pr comment "$PR_URL" --body "$BODY"
+                  gh pr edit "$PR_URL" --add-label "$FAST_TRACK_LABEL"
               env:
-                  EVENT_ACTION: ${{ github.event.action }}
-                  LABEL_NAME: ${{ github.event.label.name }}
-                  SENDER: ${{ github.event.sender.login }}
+                  ENABLED_BY: ${{ steps.fast-track.outputs.enabled-by }}
                   FAST_TRACK_LABEL: ${{ inputs.fast-track-label }}
                   PR_NUMBER: ${{ github.event.pull_request.number }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
@@ -215,7 +244,7 @@ jobs:
             # tells the fallback to try the alerts API for a real one.
             - name: Gate 1 — security advisory check
               id: gate1
-              if: steps.fast-track.conclusion == 'skipped'
+              if: steps.fast-track.outputs.active != 'true'
               # Explicit so the step runs under `-e -o pipefail` and the bats
               # suite can drive the extracted script with exactly these flags.
               shell: bash
@@ -267,7 +296,7 @@ jobs:
             - name: Gate 1 fallback — Dependabot alerts API
               id: gate1-fallback
               if: |
-                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.fast-track.outputs.active != 'true' &&
                   (steps.gate1.outputs.pass == 'false' || steps.gate1.outputs.cvss-usable == 'false')
               # Explicit so the step runs under `-e -o pipefail` and the bats
               # suite can drive the extracted script with exactly these flags.
@@ -340,7 +369,7 @@ jobs:
             - name: Resolve effective CVSS
               id: cvss
               if: |
-                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.fast-track.outputs.active != 'true' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true')
               # Explicit so the step runs under `-e -o pipefail` (the bare
               # default is `bash -e` only) and the bats suite can drive the
@@ -403,7 +432,7 @@ jobs:
             - name: Gate 2 — severity check (CVSS ≥ ${{ inputs.cvss-threshold }})
               id: gate2
               if: |
-                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.fast-track.outputs.active != 'true' &&
                   steps.cvss.outputs.available == 'true'
               run: |
                   if (( $(echo "$CVSS >= $THRESHOLD" | bc -l) )); then
@@ -426,7 +455,7 @@ jobs:
             - name: Gate 3 — compatibility score (≥ ${{ inputs.compatibility-threshold }}%)
               id: gate3
               if: |
-                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.fast-track.outputs.active != 'true' &&
                   steps.gate2.outputs.pass == 'true' &&
                   steps.gate1.outputs.pass == 'true' &&
                   steps.meta.outputs.compatibility-score != ''
@@ -447,7 +476,7 @@ jobs:
             - name: Label — ${{ inputs.review-label }}
               id: label-review
               if: |
-                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.fast-track.outputs.active != 'true' &&
                   (steps.gate1.outputs.pass == 'true' || steps.gate1-fallback.outputs.pass == 'true') &&
                   (steps.cvss.outputs.available == 'false' ||
                    steps.gate2.outputs.pass == 'false' ||
@@ -504,7 +533,7 @@ jobs:
             - name: Label — ${{ inputs.pending-label }} (awaiting age gate)
               id: label-pending
               if: |
-                  steps.fast-track.conclusion == 'skipped' &&
+                  steps.fast-track.outputs.active != 'true' &&
                   steps.gate2.outputs.pass == 'true' &&
                   (steps.gate3.conclusion == 'skipped' || steps.gate3.outputs.pass == 'true') &&
                   (!contains(github.event.pull_request.labels.*.name, inputs.pending-label) ||

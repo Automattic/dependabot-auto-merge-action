@@ -38,7 +38,7 @@ configured_repo_fixtures() {
     fixture GET_repos_acme_widgets_rules_branches_main <<'EOF'
 [{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"ci"}]}}]
 EOF
-    fixture GET_repos_acme_widgets_labels_security_fast_track <<<'{"color":"0075ca","description":"Bypass all gates and enable auto-merge immediately"}'
+    fixture GET_repos_acme_widgets_labels_security_fast_track <<<'{"color":"0075ca","description":"Marks a PR where a person enabled auto-merge, bypassing the gates"}'
     fixture GET_repos_acme_widgets_labels_auto_merge_pending <<<'{"color":"e4e669","description":"Passed all gates; awaiting age gate"}'
     fixture GET_repos_acme_widgets_labels_sirt_review_required <<<'{"color":"d93f0b","description":"Requires human security review"}'
     fixture GET_repos_acme_widgets_vulnerability_alerts </dev/null
