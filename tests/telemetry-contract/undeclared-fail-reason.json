@@ -1,0 +1,14 @@
+{
+  "undeclared_fail_reason": {
+    "feature": "dependabot_auto_merge",
+    "source": "dependabot-auto-merge",
+    "outcome": "scheduled_merge_failed",
+    "job": "scheduled_merge",
+    "repo": "Automattic/some-repo",
+    "github_host": "github.com",
+    "ci_provider": "github_actions",
+    "build_url": "https://github.com/Automattic/some-repo/actions/runs/1",
+    "pr": "500",
+    "fail_reason": "something_else"
+  }
+}
