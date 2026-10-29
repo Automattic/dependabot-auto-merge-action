@@ -174,6 +174,53 @@ Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fu
 
 Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**). Gate 1 reads them twice, once through fetch-metadata's alert lookup and again through the Dependabot alerts API when that lookup names no advisory or an unscored one. In practice the second read finds the advisory: fetch-metadata v3.1.0 matches an alert only when its vulnerable requirement reads `= <version>`, and GitHub now reports the bare version, so the lookup names nothing and the fallback carries the gate.
 
+## Auditing readiness across an organisation
+
+[`scripts/audit-readiness.sh`](scripts/audit-readiness.sh) reports which repositories are ready for this workflow and what each one is missing. It is the read-only inverse of `bootstrap.sh`: it never issues a non-GET request, so it is safe to hand to anyone who wants to check their own repositories before agreeing to anything.
+
+```bash
+./scripts/audit-readiness.sh --repo owner/repo
+./scripts/audit-readiness.sh --org my-org --format summary --format team
+```
+
+`--repo` is repeatable and needs no organisation read access, so a team lead can audit exactly their own repositories. `--org` sweeps a whole organisation.
+
+### Every check reports one of four states
+
+| State | Meaning |
+|-------|---------|
+| `pass` | configured |
+| `fail` | positively observed as not configured |
+| `unknown` | your token cannot see it |
+| `na` | the repo has no npm or Composer manifest, so the check cannot apply |
+
+**`unknown` is not `fail`.** Several of the settings this audit reads are only visible to a token with write or admin access, and classic branch protection details need admin outright. A repo you cannot fully see is reported `unknown`, never as broken. A repo is `ready` only when nothing failed and nothing is unknown.
+
+### What it checks
+
+1. `Allow auto-merge` is enabled.
+2. The default branch has at least one required status check. This reproduces the preflight job's logic exactly, rulesets first and classic branch protection as the fallback, so a repo the audit calls `ready` is one preflight will not fail.
+3. The three labels exist, compared case-insensitively because the Actions runtime is.
+4. Dependabot vulnerability alerts are enabled.
+5. `.github/dependabot.yml` exists. A `.github/dependabot.yaml` is a failure, because Dependabot only reads `.yml`.
+6. The caller workflow is present and well formed: both triggers, `labeled` in `types`, a commit SHA rather than a tag, and complete `permissions` in both the workflow-level and job-level blocks.
+7. The repo allows the merge method the workflow is configured to use. Nothing else catches this, and a repo with squash disabled passes preflight and then fails at `gh pr merge --auto --squash`.
+
+It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, label colour drift, and "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside.
+
+### Output
+
+`--out-dir` (default `.audit`) always receives `repos.jsonl`, one JSON record per repository, plus a `run.json` describing the run. `--format` selects the rendered views: `table`, `team`, `summary`, `csv` or `jsonl`, and is repeatable. `--from-jsonl` re-renders a previous run's artifact and issues no API call at all.
+
+Filters apply to the views, not the artifact: `--team`, `--status`, `--wave`, `--has-dependabot-config`.
+
+The run exits 1 when it cannot vouch for its own coverage: the rate brake tripped, a repository could not be probed (worker errors are copied to `probe-errors.log` in the output directory), or, with `--org`, the organisation's own repository listing could not be read to check the sweep against. The records are still written, and anything not read is `unknown`.
+
+### Team ownership
+
+With `--org`, the audit guesses an owning team for each repository: the smallest team holding admin or maintain, after dropping bot teams by name and org-wide teams by size (`--max-team-size`, default 25% of the in-scope repositories). Use `--explain-owners` to see why each team was kept or dropped, and [`scripts/audit-team-overrides.tsv`](scripts/audit-team-overrides.tsv) to correct the cases it gets wrong. A repository the heuristic cannot place is reported as unassigned, never guessed.
+
+
 ## Inputs
 
 | Input | Type | Default | Description |
@@ -231,7 +278,7 @@ The calling job must declare:
 ```yaml
 permissions:
     pull-requests: write   # label and comment on PRs, read auto-merge state
-    contents: write        # enable auto-merge
+    contents: write        # merge PRs
     vulnerability-alerts: read  # read Dependabot alerts
     statuses: write        # record and read eligibility evidence
 ```
@@ -268,7 +315,9 @@ jobs:
             token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
 ```
 
-Store the PAT as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`.
+Store it as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`. An organisation secret is the least work across many repositories: set it once, and each caller picks it up with the two lines above.
+
+`scripts/audit-readiness.sh` checks this. It reads the secret name from the `token` line in the job that calls this workflow and confirms a secret by that name exists, at repo or organisation level. A caller that passes no token fails the check, because the workflow then falls back to `GITHUB_TOKEN`. Values are never readable, only names, and listing repository secrets needs admin, so without it the check reports `unknown` rather than a failure. The same goes for an organisation secret list it cannot read.
 
 ## Troubleshooting
 
@@ -285,12 +334,6 @@ What to do: check the advisory yourself. If it is a real high-severity fix, enab
 The workflow posts the comment when it next runs on the PR. It runs at once only if the caller workflow lists `auto_merge_enabled` under the `pull_request_target` types, as the template above does. Without it, the comment and the marker label arrive on the PR's next event, such as a Dependabot rebase. The auto-merge itself is GitHub's and does not wait for the workflow.
 
 If a run did happen and its evaluation job reports "Cannot read the auto-merge state", it stopped before acting on anything. Re-run it once the API is reachable.
-
-### Auto-merge was disabled on a PR
-
-The workflow leaves a comment naming the reason and the commit it evaluated. It withdraws an auto-merge it queued itself when the latest evaluation finds the PR fails the gates, or passes them but is younger than `age-days`. An auto-merge a person enabled is never touched.
-
-What to do: if the PR should merge now, have someone with write access or higher enable auto-merge on it. Otherwise nothing. A PR that passes the gates is queued again by the scheduled merge once it clears the age gate.
 
 ### The scheduled job skips a PR labelled `auto-merge-pending`
 
@@ -352,17 +395,14 @@ Runs on every opened/updated/labelled Dependabot PR, and when a person enables a
 5. **Gate 3.** Require compatibility score ≥ `compatibility-threshold`% for every direct dependency in the PR. Whether a PR has any is read from fetch-metadata's `dependency-type`, never from which Gate 1 path found the advisory. A PR of only indirect dependencies passes this gate, since fetch-metadata cannot score them. A missing score routes the PR to `review-label`.
 6. Apply `review-label` and remove `pending-label` if any gate fails; apply `pending-label` and remove `review-label` if all pass. The two labels are mutually exclusive states — a re-evaluated PR always ends up with exactly one.
 7. **Record the verdict on the head commit.** A pass writes a `success` commit status with the context `dependabot-auto-merge/eligibility` on the commit just evaluated. Any other outcome, including a run that errored before Gate 2 reported, writes `failure` over an earlier `success` on the same commit. A commit with no earlier `success` gets no status at all, so routine updates do not show a red status.
-8. **Revoke a queued auto-merge the verdict no longer supports.** If this workflow queued an auto-merge, it stays queued only when the PR clears the gates and is older than `age-days`, which is what the scheduled merge would queue anyway. Otherwise it is disabled with `gh pr merge --disable-auto` and a comment says why. That covers a PR routed to review after its merge was queued and a run that errored before a verdict. An auto-merge a person enabled by hand is left alone, since only users with write access can do that. GitHub disables auto-merge on some head changes by itself, but the workflow does not rely on it.
-
-The scheduled merge pins the merge to the head commit whose evidence it just checked with `--match-head-commit`, so a commit pushed in between makes GitHub refuse the merge. It also skips any PR whose auto-merge is already enabled, so a person's fast-track is never queued again under this workflow's name.
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
-Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set. That exclusion ignores case, matching how Actions, `gh pr edit` and `gh pr list --label` compare labels, so a `review-label` input whose casing differs from the repository label still excludes the PR.
+Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and merges each one GitHub would merge now — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set. That exclusion ignores case, matching how Actions, `gh pr edit` and `gh pr list --label` compare labels, so a `review-label` input whose casing differs from the repository label still excludes the PR.
 
 The labels only choose candidates. They are not proof a PR passed, because a triage user can apply `pending-label` or remove `review-label`, and evaluation never touches the labels of a routine version update. Each candidate merges only when the latest `dependabot-auto-merge/eligibility` status from `github-actions[bot]` on its current head commit is `success`. That status comes from evaluate-pr alone. Creating one takes `statuses: write`, which triage users do not have, and it belongs to one commit, so evidence for an earlier head does not carry over to a new one. A candidate with no evidence, or withdrawn evidence, is skipped with a warning. A failed status lookup skips the PR and fails the job, as a failed merge does.
 
-After queueing a merge the job checks the evidence again and disables the merge if it is gone. An evaluation withdraws evidence before it disables auto-merge, so this closes the window where the scheduled merge could re-queue a merge an evaluation had just revoked.
+The job merges directly rather than enabling auto-merge, so nothing it starts can outlive the evidence it checked. It reads the PR's merge state from the pulls API and merges only a PR that is `clean`, `has_hooks` or `unstable`, the states `gh` itself treats as mergeable at once. Any other state, such as `blocked` while a required check runs or a required review is missing, skips the PR until the next run. The merge is pinned to the head commit whose evidence was just checked with `--match-head-commit`, so a commit pushed in between makes GitHub refuse it. A PR whose auto-merge a person already enabled is skipped, since GitHub merges it on its own.
 
 Two other designs were considered. A check run from a dedicated job would need `checks: read` to read back on private repos, a new permission all the same, and its name carries the caller's job name as a prefix that this workflow cannot know. Re-running the gates in the scheduled job is not possible, because `dependabot/fetch-metadata` only runs on a pull request event.
 
@@ -374,7 +414,7 @@ Limits of the evidence: any other workflow in your repo that holds `statuses: wr
 - The fast-track label never enables auto-merge. A person bypasses the gates by enabling auto-merge themselves, which GitHub allows only for write, maintain, or admin and records on the PR timeline.
 - Every fast-track leaves an audit comment on the PR as well, so gate bypasses are attributable after the fact.
 - The scheduled merge trusts a commit status on the PR's current head, not its labels. Triage users can change labels but cannot write statuses.
-- A queued auto-merge is withdrawn when a later evaluation rejects the PR, and the scheduled merge refuses a head commit that was not the one evaluated.
+- The scheduled merge never enables auto-merge, and it refuses a head commit that was not the one evaluated.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
 - `vulnerability-alerts: read` is required to read Dependabot alerts, both in fetch-metadata's alert lookup and in the Gate 1 fallback. Where `GITHUB_TOKEN` cannot hold that permission, pass `secrets.token`.
 - The `token` secret reaches `dependabot/fetch-metadata`, a pinned third-party action, as well as the workflow's own `gh` calls. Scope it to Dependabot alerts and pull requests, read only.

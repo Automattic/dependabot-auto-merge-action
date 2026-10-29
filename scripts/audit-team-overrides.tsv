@@ -1,0 +1,13 @@
+# Team ownership overrides for scripts/audit-readiness.sh.
+#
+# The audit guesses an owning team: the smallest team holding admin or
+# maintain on the repo, after dropping bot teams by name and org-wide teams by
+# size. The guess is right often enough to be useful and wrong often enough to
+# need this file. A row here wins outright, and the record says so
+# (owner.source == "override").
+#
+# Format: <owner/repo><TAB><team-slug><TAB><optional note>
+# Blank lines and lines starting with # are ignored. Tabs, not spaces.
+#
+# TSV rather than YAML because jq is the only parser this toolchain can
+# assume, the same reason tests/Fixtures/golden/manifest.tsv is a TSV.

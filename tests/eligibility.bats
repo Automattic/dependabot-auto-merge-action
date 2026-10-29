@@ -57,7 +57,6 @@ status_post_key() {
     record true true
     log_has_call 'api' '-X POST' "statuses/$HEAD" 'state=success' \
         'context=dependabot-auto-merge/eligibility'
-    [ "$(out eligible)" = "true" ]
 }
 
 @test "a PR that fails the gates withdraws success recorded for the same commit" {
@@ -72,7 +71,6 @@ status_post_key() {
         record "$gate2" "$gate3_pass"
         log_has_call '-X POST' "statuses/$HEAD" 'state=failure'
         [ "$(log_count 'state=success')" -eq 0 ]
-        [ "$(out eligible)" = "false" ]
     done
 }
 
@@ -104,7 +102,6 @@ status_post_key() {
     statuses_fixture "$HEAD" "$(commit_status success 'github-actions[bot]' ci/build)"
     record false
     [ "$(log_count '-X POST')" -eq 0 ]
-    [ "$(out eligible)" = "false" ]
 }
 
 @test "withdrawal ignores a success status someone else wrote" {
@@ -123,9 +120,7 @@ status_post_key() {
 }
 
 @test "a status write failure fails the step" {
-    # No POST fixture: the stub answers 404. No verdict is written either,
-    # so revoke-auto-merge treats the PR as not eligible.
+    # No POST fixture: the stub answers 404.
     run record true true
     [ "$status" -ne 0 ]
-    [ "$(out eligible)" = "" ]
 }
