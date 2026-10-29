@@ -42,7 +42,11 @@ setup() {
     : >"$GH_STUB_LOG"
     PATH="$BATS_TEST_DIRNAME/stubs:$PATH"
     export PR_URL="https://github.com/acme/widgets/pull/6715"
+    export PR_NUMBER=6715
+    export GITHUB_REPOSITORY=acme/widgets
 }
+
+COMMENTS_KEY="GET_repos_acme_widgets_issues_6715_comments_per_page_100"
 
 # Run the extracted step in $1 with the flags a plain `run:` step expands to
 # in Actions: bash --noprofile --norc -e (no pipefail — only steps declaring
@@ -88,6 +92,44 @@ run_merge_step() {
     [ "$(log_count 'pr comment')" -eq 1 ]
     [ "$(log_count 'security-review')" -eq 1 ]
     [ "$(log_count '@security')" -eq 1 ]
+}
+
+# Dependabot opens a PR and labels it within a second, so the workflow runs
+# once for `opened` and once for each `labeled` event, and every run that
+# reaches this step used to post its own comment. PR 983 in
+# woocommerce-conditional-shipping-and-payments got three that way.
+@test "a repeat run does not post the routing comment again" {
+    export METADATA_AVAILABLE=false REPORTED_CVSS='' REVIEW_TEAM='' \
+        REVIEW_LABEL=sirt-review-required PENDING_LABEL=auto-merge-pending
+    run_step "$REVIEW_STEP"
+    [ "$(log_count 'pr comment')" -eq 1 ]
+    # Serve what the first run posted back as the PR's comments.
+    quoted=$(sed -n 's/^gh pr comment [^ ]* --body //p' "$GH_STUB_LOG" | head -1)
+    eval "posted=$quoted"
+    jq -n --arg body "$posted" '[{body: $body}]' >"$GH_STUB_DIR/$COMMENTS_KEY"
+    run_step "$REVIEW_STEP"
+    run_step "$REVIEW_STEP"
+    [ "$(log_count 'pr comment')" -eq 1 ]
+    # The labels are still applied each time. Only the comment is once.
+    [ "$(log_count 'pr edit')" -eq 3 ]
+}
+
+@test "a changed reason still gets its own routing comment" {
+    jq -n '[{body: "<!-- dependabot-auto-merge:review-routing:1 -->\nThis PR has been routed to the security-review path: an older reason."}]' \
+        >"$GH_STUB_DIR/$COMMENTS_KEY"
+    METADATA_AVAILABLE=false REPORTED_CVSS='' REVIEW_TEAM='' \
+        REVIEW_LABEL=sirt-review-required PENDING_LABEL=auto-merge-pending \
+        run_step "$REVIEW_STEP"
+    [ "$(log_count 'pr comment')" -eq 1 ]
+}
+
+@test "the routing comment posts when the existing comments cannot be read" {
+    echo "HTTP 502" >"$GH_STUB_DIR/$COMMENTS_KEY.err"
+    METADATA_AVAILABLE=false REPORTED_CVSS='' REVIEW_TEAM='' \
+        REVIEW_LABEL=sirt-review-required PENDING_LABEL=auto-merge-pending \
+        run_step "$REVIEW_STEP"
+    [ "$(log_count 'pr comment')" -eq 1 ]
+    [ "$(log_count 'pr edit')" -eq 1 ]
 }
 
 # Gate 3 fails in two ways that need different reviewer action. Either a
