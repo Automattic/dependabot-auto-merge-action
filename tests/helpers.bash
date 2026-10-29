@@ -119,3 +119,81 @@ out() {
         !inblock && index($0, k "=") == 1 { print substr($0, length(k) + 2) }
     ' "$GITHUB_OUTPUT"
 }
+
+# Print the value of key $2 (`if`, `with`, ...) on the step whose id is $1,
+# one line per line of the value, leading whitespace stripped. Covers both
+# the inline form and a `|` block or mapping on the following lines. The
+# gate wiring lives in `if:` expressions, which no bats suite can execute,
+# so asserting on their text is the only guard against a condition that
+# silently skips a gate.
+extract_key() {
+    awk -v id="$1" -v key="$2" '
+        $0 ~ "^ +id: " id "$" {
+            found = 1
+            match($0, /^ +/)
+            base = RLENGTH
+            next
+        }
+        found && !inkey {
+            # Blank lines inside a run block would otherwise read as the
+            # end of the step. The next step starts shallower than `id:`.
+            if ($0 ~ /^[[:space:]]*$/) next
+            match($0, /^ +/)
+            if (RLENGTH < base) exit
+            if ($0 ~ "^ +" key ":") {
+                inkey = 1
+                sub("^ +" key ": *[|]? *", "")
+                if (length($0)) print
+            }
+            next
+        }
+        inkey {
+            if ($0 ~ /^[[:space:]]*$/) next
+            match($0, /^ +/)
+            if (RLENGTH <= base) exit
+            sub(/^ +/, "")
+            print
+        }
+    ' "$WORKFLOW"
+}
+
+# Run `jq -nc` with filter $1, binding each later word as a named argument
+# the filter reads from $ARGS.named. `key=value` binds a string and
+# `key:=json` binds parsed JSON, so a fixture can override one field at a
+# time without restating the rest.
+jq_named() {
+    local filter=$1 pair
+    local args=()
+    shift
+    for pair in "$@"; do
+        case $pair in
+            *:=*) args+=(--argjson "${pair%%:=*}" "${pair#*:=}") ;;
+            *) args+=(--arg "${pair%%=*}" "${pair#*=}") ;;
+        esac
+    done
+    jq -nc "${args[@]}" "$filter"
+}
+
+# One entry of fetch-metadata's `updated-dependencies-json`, carrying the
+# keys the steps read. The defaults describe a direct lodash security update
+# in the repository root. Override any key, e.g. `dependency newVersion=1.2.3
+# compatScore:=90`. `packageEcosystem` holds Dependabot's package manager
+# name (`npm_and_yarn`), because that is what fetch-metadata reports, not the
+# alerts API ecosystem (`npm`).
+dependency() {
+    jq_named '{
+        dependencyName: "lodash",
+        dependencyType: "direct:production",
+        directory: "/",
+        packageEcosystem: "npm_and_yarn",
+        prevVersion: "4.17.20",
+        newVersion: "4.17.21",
+        compatScore: 0
+    } + $ARGS.named' "$@"
+}
+
+# The `updated-dependencies-json` array holding the given entries.
+dependencies() {
+    local IFS=,
+    printf '[%s]' "$*"
+}
