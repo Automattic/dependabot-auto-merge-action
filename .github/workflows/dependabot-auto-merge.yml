@@ -151,6 +151,16 @@ jobs:
         runs-on: ubuntu-latest
         needs: preflight
         if: inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
+        # One evaluation per PR at a time. record-eligibility reads the
+        # existing statuses before it writes, so two runs at the same head
+        # could interleave and leave a success that the later verdict should
+        # have withdrawn. Not cancel-in-progress, because cancelling a run
+        # part-way could stop it before it withdraws. A newer event waits,
+        # and GitHub keeps only the newest waiting run, which carries the
+        # latest payload.
+        concurrency:
+            group: dependabot-auto-merge-evaluate-pr-${{ github.event.pull_request.number }}
+            cancel-in-progress: false
         steps:
             - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
               id: meta
@@ -625,7 +635,7 @@ jobs:
                   PR_URL: ${{ github.event.pull_request.html_url }}
 
     # Runs daily. Finds PRs labelled with the pending label that have cleared
-    # the age gate and enables auto-merge on them. PRs also carrying the
+    # the age gate and merges the ones GitHub would merge now. PRs also carrying the
     # review label are excluded: a stale pending label from before a PR was
     # routed to review must never keep it in the merge set.
     #
@@ -657,14 +667,24 @@ jobs:
                   # edit` and `gh pr list --label` all ignore case, so a
                   # caller whose `review-label` input differs in case from the
                   # repository label still gets the PR excluded here.
-                  CANDIDATES=$(gh pr list \
+                  PENDING=$(gh pr list \
                       --repo "$GITHUB_REPOSITORY" \
                       --author "app/dependabot" \
                       --label "$PENDING_LABEL" \
                       --state open \
-                      --json number,createdAt,labels,headRefOid \
+                      --json number,createdAt,labels,headRefOid,autoMergeRequest)
+
+                  # A PR whose auto-merge is already enabled needs nothing
+                  # from this job. A person enabling it is a fast-track, and
+                  # GitHub merges it when its requirements are met.
+                  echo "$PENDING" | jq -r \
+                      '.[] | select(.autoMergeRequest != null)
+                       | "Skipping PR #\(.number): auto-merge is already enabled by \(.autoMergeRequest.enabledBy.login // "?")."'
+
+                  CANDIDATES=$(echo "$PENDING" \
                   | jq -r --argjson age "$AGE_DAYS" --arg review "$REVIEW_LABEL" \
                       '.[]
+                       | select(.autoMergeRequest == null)
                        | select([.labels[].name | ascii_downcase]
                                 | index($review | ascii_downcase) | not)
                        | select(((now - (.createdAt | fromdateiso8601)) / 86400) >= $age)
@@ -673,6 +693,23 @@ jobs:
                   # Must match what the record-eligibility step writes.
                   CONTEXT='dependabot-auto-merge/eligibility'
                   CREATOR='github-actions[bot]'
+
+                  # Print the merge state GitHub reports for PR $1, in lower
+                  # case (clean, blocked, behind and so on). GitHub computes it
+                  # on demand and answers unknown until it has, so an unknown
+                  # is read again a few times before it counts.
+                  merge_state() {
+                      local state tries=0
+                      while :; do
+                          state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$1" --jq '.mergeable_state') || return 1
+                          if [ "$state" != "unknown" ] || [ "$tries" -ge 3 ]; then
+                              break
+                          fi
+                          tries=$((tries + 1))
+                          sleep "$MERGE_STATE_RETRY_SECONDS"
+                      done
+                      echo "$state"
+                  }
 
                   FAILED=0
                   while read -r PR_NUM HEAD_SHA <&3; do
@@ -696,9 +733,31 @@ jobs:
                           continue
                       fi
 
-                      echo "Enabling auto-merge on PR #$PR_NUM"
-                      if ! ERR=$(gh pr merge "$PR_NUM" --auto --"$MERGE_METHOD" --repo "$GITHUB_REPOSITORY" 2>&1 >/dev/null); then
-                          echo "::error::Failed to enable auto-merge on PR #$PR_NUM — $(echo "$ERR" | head -c 500 | tr '\n' ' ')"
+                      # Merge directly, and only a PR GitHub would merge now.
+                      # These are the states gh itself treats as mergeable at
+                      # once. Anything else, such as a required check still
+                      # running or a required review missing, is not an error.
+                      # The PR is skipped and the next run tries again. The
+                      # workflow never leaves auto-merge enabled, so nothing it
+                      # queued can outlive the evidence it was queued on.
+                      if ! MERGE_STATE=$(merge_state "$PR_NUM" 2>&1); then
+                          echo "::error::Cannot read the merge state of PR #$PR_NUM, so it was not merged. $(echo "$MERGE_STATE" | head -c 500 | tr '\n' ' ')"
+                          FAILED=1
+                          continue
+                      fi
+                      case "$MERGE_STATE" in
+                          clean | has_hooks | unstable) ;;
+                          *)
+                              echo "Skipping PR #$PR_NUM for now. GitHub reports its merge state as ${MERGE_STATE:-empty}, so its branch rules are not met yet. The next scheduled run tries again."
+                              continue
+                              ;;
+                      esac
+
+                      # Pinned to the commit whose evidence was just checked,
+                      # so a push since then makes GitHub refuse the merge.
+                      echo "Merging PR #$PR_NUM"
+                      if ! ERR=$(gh pr merge "$PR_NUM" --"$MERGE_METHOD" --match-head-commit "$HEAD_SHA" --repo "$GITHUB_REPOSITORY" 2>&1 >/dev/null); then
+                          echo "::error::Failed to merge PR #$PR_NUM — $(echo "$ERR" | head -c 500 | tr '\n' ' ')"
                           FAILED=1
                       fi
                   done 3<<<"$CANDIDATES"
@@ -708,4 +767,5 @@ jobs:
                   REVIEW_LABEL: ${{ inputs.review-label }}
                   AGE_DAYS: ${{ inputs.age-days }}
                   MERGE_METHOD: ${{ inputs.merge-method }}
+                  MERGE_STATE_RETRY_SECONDS: 5
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
