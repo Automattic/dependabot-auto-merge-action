@@ -371,7 +371,7 @@ jobs:
                   is_unusable() {
                       [[ $1 =~ ^[0-9]*\.?[0-9]+$ ]] || return 0
                       [[ $1 =~ ^0*\.?0*$ ]] && return 0
-                      [ "$(echo "$1 > 10" | bc -l)" = "1" ]
+                      awk -v s="$1" 'BEGIN { exit !(s > 10) }'
                   }
 
                   if [ -z "$GHSA_ID" ]; then
@@ -587,7 +587,7 @@ jobs:
                   is_unusable() {
                       [[ $1 =~ ^[0-9]*\.?[0-9]+$ ]] || return 0
                       [[ $1 =~ ^0*\.?0*$ ]] && return 0
-                      [ "$(echo "$1 > 10" | bc -l)" = "1" ]
+                      awk -v s="$1" 'BEGIN { exit !(s > 10) }'
                   }
 
                   # Both sources can be populated: the fallback also runs when
@@ -636,8 +636,11 @@ jobs:
               if: |
                   steps.fast-track.outputs.active != 'true' &&
                   steps.cvss.outputs.available == 'true'
+              # awk rather than bc, which github.a8c.com's SecEx runners do
+              # not ship. Without bc the range check in is_unusable never
+              # fires, and an out-of-range score passes as usable.
               run: |
-                  if (( $(echo "$CVSS >= $THRESHOLD" | bc -l) )); then
+                  if awk -v c="$CVSS" -v t="$THRESHOLD" 'BEGIN { exit !(c >= t) }'; then
                       echo "pass=true" >> "$GITHUB_OUTPUT"
                   else
                       echo "pass=false" >> "$GITHUB_OUTPUT"
