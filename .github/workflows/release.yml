@@ -140,7 +140,7 @@ jobs:
                   fetch-depth: 0
             - name: Push the tagged commit and the tag
               env:
-                  DEPLOY_KEY: ${{ secrets.GITHUB_COM_DEPLOY_KEY }}
+                  DEPLOY_KEY: ${{ secrets.DOTCOM_DEPLOY_KEY }}
               run: |
                   KEY="$RUNNER_TEMP/github_com_deploy_key"
                   KNOWN_HOSTS="$RUNNER_TEMP/github_com_known_hosts"
