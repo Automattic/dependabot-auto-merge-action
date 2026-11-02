@@ -37,7 +37,7 @@ permissions:
 
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.6
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7
         permissions:
             pull-requests: write
             contents: write
@@ -50,7 +50,7 @@ jobs:
 Pin to the commit SHA a release tag points at, with the tag in a trailing comment — the same way this repo pins third-party actions. Tags name releases; they are not pinning targets, and none of them float. Resolve the SHA with:
 
 ```bash
-gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.6 --jq .sha
+gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.7 --jq .sha
 ```
 
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
@@ -108,10 +108,10 @@ php bin/dependabot-directories owner/repo --dry-run
 php bin/dependabot-directories owner/repo
 ```
 
-From the next tagged release onward it is also attached to the [release](https://github.com/Automattic/dependabot-auto-merge-action/releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
+From v1.6 onward it is also attached to the [release](https://github.com/Automattic/dependabot-auto-merge-action/releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
 
 ```bash
-gh release download v1.6 --pattern 'dependabot-directories.phar*'
+gh release download v1.7 --pattern 'dependabot-directories.phar*'
 shasum -a 256 -c dependabot-directories.phar.sha256
 chmod +x dependabot-directories.phar
 ./dependabot-directories.phar owner/repo --dry-run
@@ -303,7 +303,7 @@ Create a PAT, or a fine-grained token with **Dependabot alerts: Read** and **Pul
 ```yaml
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.6
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7
         permissions:
             pull-requests: write
             contents: write

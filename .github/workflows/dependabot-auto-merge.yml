@@ -4,7 +4,7 @@ on:
     workflow_call:
         secrets:
             token:
-                description: 'Token that can read Dependabot alerts, used by the fetch-metadata alert lookup (which also lists the PR commits) and the Gate 1 fallback. Pass a PAT or fine-grained token with Dependabot alerts read and Pull requests read when GITHUB_TOKEN lacks access. Defaults to GITHUB_TOKEN.'
+                description: 'Optional. Token used by the Gate 1 alerts lookup and passed to dependabot/fetch-metadata, which lists the PR commits. Defaults to GITHUB_TOKEN, which reads Dependabot alerts once the caller grants vulnerability-alerts: read. Pass a PAT or fine-grained token with Dependabot alerts read and Pull requests read only where that permission is unavailable.'
                 required: false
         inputs:
             event-name:
