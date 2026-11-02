@@ -3,6 +3,14 @@ name: Release
 # The tool ships as a PHAR attached to the release, so an operator needs php
 # and gh and nothing else — no Composer step, and nothing compiled in the
 # repository. Built here rather than committed for the same reason.
+#
+# github.a8c.com is the primary home. Pushing a tag there builds its release,
+# then publishes the tagged commit and the tag to github.com, where the same
+# tag push builds github.com's release. Each host builds its own PHAR, so the
+# two jobs below differ only in runner and setup-php source: github.a8c.com
+# allows only actions mirrored into its third-party-actions org, and a runner
+# fetches every action in a job before the first step, so one job cannot hold
+# both. Keep their remaining steps identical.
 on:
     push:
         tags:
@@ -11,9 +19,17 @@ on:
 permissions:
     contents: write
 
+# github.a8c.com runs jobs on SecEx runners, which drop outbound traffic to any
+# host not listed here. The runner reads this before the job starts, so it must
+# be a literal. github.com ignores it. The list covers setup-php's PHP and PPA
+# downloads, Composer and Packagist, and the push to github.com.
+env:
+    SECEX_EGRESS_RULES: 'github.a8c.com,*.github.a8c.com,github.com,*.github.com,*.githubusercontent.com,packagist.org,*.packagist.org,getcomposer.org,setup-php.com,ppa.setup-php.com,cdn.jsdelivr.net,ppa.launchpadcontent.net,launchpad.net,*.launchpad.net,keyserver.ubuntu.com,archive.ubuntu.com,security.ubuntu.com'
+
 jobs:
     phar:
         name: Build and attach the PHAR
+        if: github.server_url == 'https://github.com'
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,7 +57,9 @@ jobs:
               shell: bash
 
             - name: Checksum
-              run: sha256sum bin/dependabot-directories.phar > bin/dependabot-directories.phar.sha256
+              # From inside bin/, so the file names the PHAR alone and
+              # `shasum -c` passes next to a downloaded copy.
+              run: cd bin && sha256sum dependabot-directories.phar > dependabot-directories.phar.sha256
               shell: bash
 
             - name: Attach to the release
@@ -59,4 +77,79 @@ jobs:
                       bin/dependabot-directories.phar \
                       bin/dependabot-directories.phar.sha256 \
                       --clobber
+              shell: bash
+
+    phar-ghes:
+        name: Build and attach the PHAR
+        if: github.server_url != 'https://github.com'
+        runs-on: [self-hosted, secex, gha-runner-2cpu-4gb]
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            # v2.37.2, the newest release proven to install PHP on SecEx.
+            - uses: third-party-actions/shivammathur-setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
+              with:
+                  php-version: '8.2'
+                  extensions: json, mbstring, phar
+                  coverage: none
+                  ini-values: phar.readonly=0
+            - name: Install dependencies
+              run: composer install --no-interaction --no-progress --prefer-dist
+
+            - name: Build the PHAR
+              run: vendor/bin/box compile
+
+            - name: Check the PHAR reproduces a golden transcript
+              run: |
+                  ./bin/dependabot-directories.phar acme/widgets \
+                      --paths-from-file tests/Fixtures/trees/mixed-monorepo.paths \
+                      --detect-only \
+                      | diff - tests/Fixtures/golden/detect-mixed-monorepo.txt
+              shell: bash
+
+            - name: Checksum
+              run: cd bin && sha256sum dependabot-directories.phar > dependabot-directories.phar.sha256
+              shell: bash
+
+            - name: Attach to the release
+              env:
+                  GH_ENTERPRISE_TOKEN: ${{ github.token }}
+              run: |
+                  export GH_HOST="${GITHUB_SERVER_URL#https://}"
+                  if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+                      gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag
+                  fi
+                  gh release upload "${GITHUB_REF_NAME}" \
+                      bin/dependabot-directories.phar \
+                      bin/dependabot-directories.phar.sha256 \
+                      --clobber
+              shell: bash
+
+    # Publishes the release to github.com once github.a8c.com's own release
+    # exists. The deploy key is the only actor github.com's main ruleset lets
+    # push directly. The push is atomic and never forced: if github.com's main
+    # has moved on its own, both refs are refused and this job fails, which is
+    # the signal that the hosts have diverged.
+    publish-github-com:
+        name: Publish to github.com
+        needs: phar-ghes
+        if: github.server_url != 'https://github.com'
+        runs-on: [self-hosted, secex, gha-runner-1cpu-1gb]
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  fetch-depth: 0
+            - name: Push the tagged commit and the tag
+              env:
+                  DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
+              run: |
+                  KEY="$RUNNER_TEMP/github_com_deploy_key"
+                  KNOWN_HOSTS="$RUNNER_TEMP/github_com_known_hosts"
+                  printf '%s\n' "$DEPLOY_KEY" > "$KEY"
+                  chmod 600 "$KEY"
+                  # github.com's published host key, from its meta API.
+                  echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$KNOWN_HOSTS"
+                  export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
+                  git push --atomic git@github.com:Automattic/dependabot-auto-merge-action.git \
+                      "${GITHUB_SHA}:refs/heads/main" \
+                      "${GITHUB_REF}:${GITHUB_REF}"
               shell: bash

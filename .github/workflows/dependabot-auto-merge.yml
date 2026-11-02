@@ -43,6 +43,10 @@ on:
                 description: 'Optional GitHub team slug (org/team) to @-mention in review-required comments.'
                 type: string
                 default: ''
+            runner:
+                description: 'Runner labels for every job, as a JSON array, e.g. ''["self-hosted","secex","gha-runner-2cpu-4gb"]''. Empty picks ubuntu-latest on github.com and a SecEx runner on github.a8c.com.'
+                type: string
+                default: ''
 
 permissions:
     pull-requests: write
@@ -55,6 +59,13 @@ permissions:
     # can change them.
     statuses: write
 
+# github.a8c.com runs jobs on SecEx runners, which drop outbound traffic to any
+# host not listed here. The runner reads this before the job starts, so it must
+# be a literal. github.com ignores it. The badges host serves the Gate 3
+# compatibility score that fetch-metadata looks up.
+env:
+    SECEX_EGRESS_RULES: 'github.a8c.com,*.github.a8c.com,dependabot-badges.githubapp.com'
+
 jobs:
     # Verifies the repo is actually configured for auto-merge before either
     # merge path runs. `gh pr merge --auto` fails (or silently never queues)
@@ -62,15 +73,20 @@ jobs:
     # status checks — fail fast here with actionable errors instead.
     preflight:
         name: Preflight — repo auto-merge configuration
-        runs-on: ubuntu-latest
+        runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || (github.server_url == 'https://github.com' && '["ubuntu-latest"]' || '["self-hosted","secex","gha-runner-2cpu-4gb"]')) }}
         if: |
             inputs.event-name == 'schedule' ||
             (inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]')
         steps:
+            # gh talks to github.com unless told otherwise, so point it at
+            # the host this run is on. GH_ENTERPRISE_TOKEN beside each
+            # GH_TOKEN below carries the token on GitHub Enterprise Server.
+            - name: Point gh at this host
+              run: echo "GH_HOST=${GITHUB_SERVER_URL#https://}" >> "$GITHUB_ENV"
             - name: Check auto-merge setting and required status checks
               run: |
                   FAIL=0
-                  DOCS="https://github.com/Automattic/dependabot-auto-merge-action#usage"
+                  DOCS="$GITHUB_SERVER_URL/Automattic/dependabot-auto-merge-action#usage"
 
                   # --- Check 1: "Allow auto-merge" repo setting ---------------
                   # allow_auto_merge is only returned to tokens with push
@@ -145,14 +161,70 @@ jobs:
                   exit "$FAIL"
               env:
                   GH_TOKEN: ${{ github.token }}
+                  GH_ENTERPRISE_TOKEN: ${{ github.token }}
+
+    # Reads the Dependabot metadata for evaluate-pr. github.a8c.com allows only
+    # actions mirrored into its third-party-actions org, and a runner fetches
+    # every action in a job before the first step, so a step-level `if:`
+    # cannot choose between the two. Each host gets its own job instead, and
+    # only one of them runs. Both pin the same fetch-metadata commit.
+    #
+    # The compatibility lookup is opt-in. Without it every score reads 0 and
+    # Gate 3 never sees a real one. The alert lookup stays off by omission,
+    # since fetch-metadata treats any non-empty value as on. Gate 1 reads
+    # Dependabot alerts only through the fallback in evaluate-pr, which checks
+    # that an alert is open and applies to the update.
+    metadata:
+        name: Fetch Dependabot metadata
+        runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || '["ubuntu-latest"]') }}
+        needs: preflight
+        if: github.server_url == 'https://github.com' && inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
+        outputs:
+            ghsa-id: ${{ steps.meta.outputs.ghsa-id }}
+            cvss: ${{ steps.meta.outputs.cvss }}
+            dependency-type: ${{ steps.meta.outputs.dependency-type }}
+            updated-dependencies-json: ${{ steps.meta.outputs.updated-dependencies-json }}
+        steps:
+            - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+              id: meta
+              with:
+                  compat-lookup: true
+                  github-token: ${{ secrets.token || github.token }}
+
+    metadata-ghes:
+        name: Fetch Dependabot metadata
+        runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || '["self-hosted","secex","gha-runner-2cpu-4gb"]') }}
+        needs: preflight
+        if: github.server_url != 'https://github.com' && inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
+        outputs:
+            ghsa-id: ${{ steps.meta.outputs.ghsa-id }}
+            cvss: ${{ steps.meta.outputs.cvss }}
+            dependency-type: ${{ steps.meta.outputs.dependency-type }}
+            updated-dependencies-json: ${{ steps.meta.outputs.updated-dependencies-json }}
+        steps:
+            - uses: third-party-actions/dependabot-fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+              id: meta
+              with:
+                  compat-lookup: true
+                  github-token: ${{ secrets.token || github.token }}
+                  # Dependabot's commits on GitHub Enterprise Server do not
+                  # carry the signature fetch-metadata checks for on
+                  # github.com.
+                  skip-commit-verification: true
 
     # Runs on every Dependabot PR event. Checks eligibility gates and labels
     # the PR accordingly. The age gate is handled by the scheduled job below.
     evaluate-pr:
         name: Evaluate security PR eligibility
-        runs-on: ubuntu-latest
-        needs: preflight
-        if: inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
+        runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || (github.server_url == 'https://github.com' && '["ubuntu-latest"]' || '["self-hosted","secex","gha-runner-2cpu-4gb"]')) }}
+        needs: [preflight, metadata, metadata-ghes]
+        # One metadata job is always skipped, and a skipped need skips this
+        # job unless the condition says otherwise.
+        if: |
+            !failure() && !cancelled() &&
+            needs.preflight.result == 'success' &&
+            (needs.metadata.result == 'success' || needs.metadata-ghes.result == 'success') &&
+            inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
         # One evaluation per PR at a time. record-eligibility reads the
         # existing statuses before it writes, so two runs at the same head
         # could interleave and leave a success that the later verdict should
@@ -164,17 +236,31 @@ jobs:
             group: dependabot-auto-merge-evaluate-pr-${{ github.event.pull_request.number }}
             cancel-in-progress: false
         steps:
-            - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+            # gh talks to github.com unless told otherwise, so point it at
+            # the host this run is on. GH_ENTERPRISE_TOKEN beside each
+            # GH_TOKEN below carries the token on GitHub Enterprise Server.
+            - name: Point gh at this host
+              run: echo "GH_HOST=${GITHUB_SERVER_URL#https://}" >> "$GITHUB_ENV"
+
+            # Re-expose whichever metadata job ran as steps.meta, so the gates
+            # below read it the same way on both hosts.
+            - name: Collect Dependabot metadata
               id: meta
-              # The compatibility lookup is opt-in. Without it every score
-              # reads 0 and Gate 3 never sees a real one. The alert lookup
-              # stays off by omission, since fetch-metadata treats any
-              # non-empty value as on. Gate 1 reads Dependabot alerts only
-              # through the fallback below, which checks that an alert is
-              # open and applies to the update.
-              with:
-                  compat-lookup: true
-                  github-token: ${{ secrets.token || github.token }}
+              env:
+                  GHSA_ID: ${{ needs.metadata.outputs.ghsa-id || needs.metadata-ghes.outputs.ghsa-id }}
+                  CVSS: ${{ needs.metadata.outputs.cvss || needs.metadata-ghes.outputs.cvss }}
+                  DEPENDENCY_TYPE: ${{ needs.metadata.outputs.dependency-type || needs.metadata-ghes.outputs.dependency-type }}
+                  UPDATED_DEPENDENCIES_JSON: ${{ needs.metadata.outputs.updated-dependencies-json || needs.metadata-ghes.outputs.updated-dependencies-json }}
+              run: |
+                  {
+                      echo "ghsa-id=$GHSA_ID"
+                      echo "cvss=$CVSS"
+                      echo "dependency-type=$DEPENDENCY_TYPE"
+                      DELIM="EOF_$(openssl rand -hex 8)"
+                      echo "updated-dependencies-json<<$DELIM"
+                      printf '%s\n' "$UPDATED_DEPENDENCIES_JSON"
+                      echo "$DELIM"
+                  } >> "$GITHUB_OUTPUT"
 
             # A person who can merge fast-tracks a PR with GitHub's own
             # "Enable auto-merge" button. GitHub checks their permission and
@@ -213,6 +299,7 @@ jobs:
               env:
                   PR_NUMBER: ${{ github.event.pull_request.number }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_ENTERPRISE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             # Audit trail: the button leaves a timeline entry, but the gates
             # it bypassed are this workflow's, so record the bypass on the PR
@@ -260,6 +347,7 @@ jobs:
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_ENTERPRISE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             # Gate 1: must be a security advisory, not a routine version bump.
             # fetch-metadata runs without its alert lookup, so ghsa-id and
@@ -283,7 +371,7 @@ jobs:
                   is_unusable() {
                       [[ $1 =~ ^[0-9]*\.?[0-9]+$ ]] || return 0
                       [[ $1 =~ ^0*\.?0*$ ]] && return 0
-                      [ "$(echo "$1 > 10" | bc -l)" = "1" ]
+                      awk -v s="$1" 'BEGIN { exit !(s > 10) }'
                   }
 
                   if [ -z "$GHSA_ID" ]; then
@@ -473,6 +561,7 @@ jobs:
                   GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
                   GATE1_PASS: ${{ steps.gate1.outputs.pass }}
                   GH_TOKEN: ${{ secrets.token || github.token }}
+                  GH_ENTERPRISE_TOKEN: ${{ secrets.token || github.token }}
 
             # Resolve the effective CVSS from whichever source succeeded, and
             # decide in the same place whether that score is usable at all.
@@ -498,7 +587,7 @@ jobs:
                   is_unusable() {
                       [[ $1 =~ ^[0-9]*\.?[0-9]+$ ]] || return 0
                       [[ $1 =~ ^0*\.?0*$ ]] && return 0
-                      [ "$(echo "$1 > 10" | bc -l)" = "1" ]
+                      awk -v s="$1" 'BEGIN { exit !(s > 10) }'
                   }
 
                   # Both sources can be populated: the fallback also runs when
@@ -547,8 +636,11 @@ jobs:
               if: |
                   steps.fast-track.outputs.active != 'true' &&
                   steps.cvss.outputs.available == 'true'
+              # awk rather than bc, which github.a8c.com's SecEx runners do
+              # not ship. Without bc the range check in is_unusable never
+              # fires, and an out-of-range score passes as usable.
               run: |
-                  if (( $(echo "$CVSS >= $THRESHOLD" | bc -l) )); then
+                  if awk -v c="$CVSS" -v t="$THRESHOLD" 'BEGIN { exit !(c >= t) }'; then
                       echo "pass=true" >> "$GITHUB_OUTPUT"
                   else
                       echo "pass=false" >> "$GITHUB_OUTPUT"
@@ -724,6 +816,7 @@ jobs:
                   PR_NUMBER: ${{ github.event.pull_request.number }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_ENTERPRISE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             # All gates cleared — label as pending for the scheduled age-gate
             # check, shedding any review label from an earlier failing run.
@@ -747,6 +840,7 @@ jobs:
                   REVIEW_LABEL: ${{ inputs.review-label }}
                   PR_URL: ${{ github.event.pull_request.html_url }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_ENTERPRISE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             # Record the verdict as evidence the scheduled merge can trust.
             # The pending label cannot be that evidence, because a triage
@@ -813,6 +907,7 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_ENTERPRISE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             # Labeling step failed — notify so the failure doesn't go unnoticed.
             - name: Notify on labeling failure
@@ -832,10 +927,15 @@ jobs:
     # carries the success status evaluate-pr records on a pass.
     scheduled-merge:
         name: Scheduled merge of eligible PRs
-        runs-on: ubuntu-latest
+        runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || (github.server_url == 'https://github.com' && '["ubuntu-latest"]' || '["self-hosted","secex","gha-runner-2cpu-4gb"]')) }}
         needs: preflight
         if: inputs.event-name == 'schedule'
         steps:
+            # gh talks to github.com unless told otherwise, so point it at
+            # the host this run is on. GH_ENTERPRISE_TOKEN beside each
+            # GH_TOKEN below carries the token on GitHub Enterprise Server.
+            - name: Point gh at this host
+              run: echo "GH_HOST=${GITHUB_SERVER_URL#https://}" >> "$GITHUB_ENV"
             - name: Merge PRs past age gate
               id: scheduled-merge
               # Explicit so the step runs under `-e -o pipefail`. Without
@@ -957,3 +1057,4 @@ jobs:
                   MERGE_METHOD: ${{ inputs.merge-method }}
                   MERGE_STATE_RETRY_SECONDS: 5
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_ENTERPRISE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
