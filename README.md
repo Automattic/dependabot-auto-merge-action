@@ -32,25 +32,27 @@ on:
 permissions:
     pull-requests: write
     contents: write
-    vulnerability-alerts: read
     statuses: write
 
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.6
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7
         permissions:
             pull-requests: write
             contents: write
-            vulnerability-alerts: read
             statuses: write
         with:
             event-name: ${{ github.event_name }}
+        secrets:
+            token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
 ```
+
+`GITHUB_TOKEN` cannot read Dependabot alerts, so pass a token that can. See [When the token cannot read Dependabot alerts](#when-the-token-cannot-read-dependabot-alerts).
 
 Pin to the commit SHA a release tag points at, with the tag in a trailing comment — the same way this repo pins third-party actions. Tags name releases; they are not pinning targets, and none of them float. Resolve the SHA with:
 
 ```bash
-gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.6 --jq .sha
+gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.7 --jq .sha
 ```
 
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
@@ -108,10 +110,10 @@ php bin/dependabot-directories owner/repo --dry-run
 php bin/dependabot-directories owner/repo
 ```
 
-From the next tagged release onward it is also attached to the [release](https://github.com/Automattic/dependabot-auto-merge-action/releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
+From v1.6 onward it is also attached to the [release](https://github.com/Automattic/dependabot-auto-merge-action/releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
 
 ```bash
-gh release download v1.6 --pattern 'dependabot-directories.phar*'
+gh release download v1.7 --pattern 'dependabot-directories.phar*'
 shasum -a 256 -c dependabot-directories.phar.sha256
 chmod +x dependabot-directories.phar
 ./dependabot-directories.phar owner/repo --dry-run
@@ -239,7 +241,7 @@ With `--org`, the audit guesses an owning team for each repository: the smallest
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup, and passed to `dependabot/fetch-metadata`, which also lists the PR's commits. Defaults to `GITHUB_TOKEN`, which reads them once the job grants `vulnerability-alerts: read`. Pass a PAT or fine-grained token only where that permission is unavailable. A fine-grained token needs **Dependabot alerts: Read** and, from v1.6, **Pull requests: Read**. |
+| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup, and passed to `dependabot/fetch-metadata`, which also lists the PR's commits. `GITHUB_TOKEN` cannot read Dependabot alerts here, so any repository with indirect dependencies needs it. A fine-grained token needs **Dependabot alerts: Read** and, from v1.6, **Pull requests: Read**. Falls back to `GITHUB_TOKEN` when not passed. |
 
 ## Customisation examples
 
@@ -279,19 +281,16 @@ The calling job must declare:
 permissions:
     pull-requests: write   # label and comment on PRs, read auto-merge state
     contents: write        # merge PRs
-    vulnerability-alerts: read  # read Dependabot alerts
     statuses: write        # record and read eligibility evidence
 ```
 
 These are the minimum required. The fast-track check reads the PR's auto-merge state through the pulls API, which `pull-requests` covers. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
 
-**`statuses: write` and `vulnerability-alerts: read` are breaking changes for callers pinned at v1.5 or earlier.** Add both to both `permissions` blocks when you re-pin, and drop `security-events: read`, which the workflow no longer requests. Without them GitHub refuses to start the reusable workflow, because a called workflow cannot hold a permission its caller did not grant. The workflow writes a `dependabot-auto-merge/eligibility` commit status when a PR passes the gates, and the scheduled merge will not act on a PR without one. See [How it works](#scheduled-merge-job-triggers-on-schedule) for why a label is not enough.
+**`statuses: write` is a breaking change for callers pinned at v1.6 or earlier.** Add it to both `permissions` blocks when you re-pin. A caller that still grants `security-events: read` can keep it, since the workflow no longer requests it. Without `statuses: write` GitHub refuses to start the reusable workflow, because a called workflow cannot hold a permission its caller did not grant. The workflow writes a `dependabot-auto-merge/eligibility` commit status when a PR passes the gates, and the scheduled merge will not act on a PR without one. See [How it works](#scheduled-merge-job-triggers-on-schedule) for why a label is not enough.
 
 ### When the token cannot read Dependabot alerts
 
-`security-events: read` does not grant Dependabot alerts. A `GITHUB_TOKEN` without `vulnerability-alerts: read` gets a 403 from the alerts API, so the Gate 1 step fails the job with `Resource not accessible by integration`. The fix is to grant `vulnerability-alerts: read` on the caller job and at the top of the caller workflow, as in the usage example.
-
-Where that permission is unavailable, pass a token instead.
+The workflow's `GITHUB_TOKEN` cannot read Dependabot alerts. Without a `token` secret, the alerts API returns a 403 and the Gate 1 step fails the job with `Resource not accessible by integration`. Pass a token that can read them, as below.
 
 If the lookup succeeds but the later Dependabot alerts API call fails, what happens depends on why the API was called:
 
@@ -303,11 +302,10 @@ Create a PAT, or a fine-grained token with **Dependabot alerts: Read** and **Pul
 ```yaml
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.6
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7
         permissions:
             pull-requests: write
             contents: write
-            vulnerability-alerts: read
             statuses: write
         with:
             event-name: ${{ github.event_name }}
@@ -416,5 +414,5 @@ Limits of the evidence: any other workflow in your repo that holds `statuses: wr
 - The scheduled merge trusts a commit status on the PR's current head, not its labels. Triage users can change labels but cannot write statuses.
 - The scheduled merge never enables auto-merge, and it refuses a head commit that was not the one evaluated.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
-- `vulnerability-alerts: read` is required to read Dependabot alerts, in the Gate 1 alerts lookup. Where `GITHUB_TOKEN` cannot hold that permission, pass `secrets.token`.
+- The workflow requests no Dependabot alerts permission. The Gate 1 alerts lookup reads them with `secrets.token`.
 - The `token` secret reaches `dependabot/fetch-metadata`, a pinned third-party action, as well as the workflow's own `gh` calls. Scope it to Dependabot alerts and pull requests, read only.

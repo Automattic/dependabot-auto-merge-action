@@ -4,7 +4,7 @@ on:
     workflow_call:
         secrets:
             token:
-                description: 'Token that can read Dependabot alerts, used by the fetch-metadata alert lookup (which also lists the PR commits) and the Gate 1 fallback. Pass a PAT or fine-grained token with Dependabot alerts read and Pull requests read when GITHUB_TOKEN lacks access. Defaults to GITHUB_TOKEN.'
+                description: 'Token that can read Dependabot alerts, used by the Gate 1 alerts lookup and passed to dependabot/fetch-metadata, which lists the PR commits. GITHUB_TOKEN cannot read Dependabot alerts here, so any repository with indirect dependencies needs this secret. A fine-grained token needs Dependabot alerts read and Pull requests read. Falls back to GITHUB_TOKEN when not passed.'
                 required: false
         inputs:
             event-name:
@@ -47,9 +47,9 @@ on:
 permissions:
     pull-requests: write
     contents: write
-    # Dependabot alerts, for the Gate 1 lookup. security-events does not cover them: with it alone the REST
-    # list is a 403 and the GraphQL field returns no alerts.
-    vulnerability-alerts: read
+    # No Dependabot alerts permission. The Gate 1 lookup reads alerts with
+    # secrets.token, so a caller that still grants security-events: read, as
+    # v1.6 callers do, starts this workflow unchanged.
     # evaluate-pr records its verdict as a commit status, and the scheduled
     # merge reads it back. Labels cannot carry that verdict: a triage user
     # can change them.

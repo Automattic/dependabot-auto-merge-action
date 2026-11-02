@@ -17,12 +17,12 @@ setup_file() {
 
 # --- permissions (QAO-767) --------------------------------------------------
 
-# security-events does not cover Dependabot alerts: with it alone the alerts
-# API is a 403 and fetch-metadata's GraphQL lookup returns nothing. Confirmed
-# live on 2026-09-16 in asahasrabuddhe/qao766-fixture-eligibility.
-@test "the workflow requests vulnerability-alerts: read for Dependabot alerts" {
+# Alerts are read with secrets.token, so the workflow requests no alerts
+# permission. A called workflow cannot hold a permission its caller did not
+# grant, so requesting either scope would refuse to start some callers.
+@test "the workflow requests no Dependabot alerts permission" {
     block=$(awk '/^permissions:/{p=1; next} p && /^[^ #]/{exit} p' "$WORKFLOW" | grep -v '^ *#')
-    grep -qxF '    vulnerability-alerts: read' <<<"$block"
+    ! grep -q 'vulnerability-alerts' <<<"$block"
     ! grep -q 'security-events' <<<"$block"
 }
 
