@@ -51,6 +51,11 @@ run_step() {
     bash --noprofile --norc -e "$1"
 }
 
+# Run the scheduled merge step with the flags its `shell: bash` expands to.
+run_merge_step() {
+    bash --noprofile --norc -e -o pipefail "$MERGE_STEP"
+}
+
 # --- pass -> review -------------------------------------------------------
 
 @test "routing to review sheds the pending label in the same edit" {
@@ -85,6 +90,33 @@ run_step() {
     [ "$(log_count '@security')" -eq 1 ]
 }
 
+# Gate 3 fails in two ways that need different reviewer action. Either a
+# real score is below the threshold, or there is no score at all.
+# fetch-metadata spells the second as 0, so without its own reason it read
+# as "0% is below 80%".
+@test "an unavailable compatibility score is named as unavailable" {
+    METADATA_AVAILABLE=true GATE2_PASS=true GATE3_AVAILABLE=false \
+        COMPAT_SCORE='' COMPAT_DEPENDENCY=minimist COMPAT_THRESHOLD=80 \
+        REVIEW_TEAM='' REVIEW_LABEL=sirt-review-required \
+        PENDING_LABEL=auto-merge-pending \
+        run_step "$REVIEW_STEP"
+    [ "$(log_count 'pr comment')" -eq 1 ]
+    [ "$(log_count 'unavailable')" -eq 1 ]
+    [ "$(log_count 'minimist')" -eq 1 ]
+    [ "$(log_count 'below')" -eq 0 ]
+}
+
+@test "a below-threshold compatibility score names the dependency and score" {
+    METADATA_AVAILABLE=true GATE2_PASS=true GATE3_AVAILABLE=true \
+        COMPAT_SCORE=60 COMPAT_DEPENDENCY=minimist COMPAT_THRESHOLD=80 \
+        REVIEW_TEAM='' REVIEW_LABEL=sirt-review-required \
+        PENDING_LABEL=auto-merge-pending \
+        run_step "$REVIEW_STEP"
+    [ "$(log_count 'minimist')" -eq 1 ]
+    [ "$(log_count '60%')" -eq 1 ]
+    [ "$(log_count '80%')" -eq 1 ]
+}
+
 # --- review -> pass -------------------------------------------------------
 
 @test "marking pending sheds the review label in the same edit" {
@@ -115,26 +147,37 @@ merge_env() {
     export REVIEW_LABEL=sirt-review-required
     export AGE_DAYS=7
     export MERGE_METHOD=squash
+    export MERGE_STATE_RETRY_SECONDS=0
 }
 
 mixed_pr_list_fixture() {
     NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     cat >"$GH_STUB_DIR/pr_list" <<EOF
 [
-  {"number": 101, "createdAt": "2020-01-01T00:00:00Z",
+  {"number": 101, "createdAt": "2020-01-01T00:00:00Z", "headRefOid": "a101",
    "labels": [{"name": "auto-merge-pending"}]},
-  {"number": 102, "createdAt": "2020-01-01T00:00:00Z",
+  {"number": 102, "createdAt": "2020-01-01T00:00:00Z", "headRefOid": "a102",
    "labels": [{"name": "auto-merge-pending"}, {"name": "sirt-review-required"}]},
-  {"number": 103, "createdAt": "$NOW",
+  {"number": 103, "createdAt": "$NOW", "headRefOid": "a103",
    "labels": [{"name": "auto-merge-pending"}]}
 ]
 EOF
+    # Every PR carries passing evidence and is ready to merge, so only the
+    # label and age selection under test decides what merges.
+    # tests/scheduled-merge.bats covers the evidence and merge state checks.
+    local sha n
+    for sha in a101 a102 a103; do
+        statuses_fixture "$sha" "$(commit_status success 'github-actions[bot]')"
+    done
+    for n in 101 102 103; do
+        echo '{"mergeable_state":"clean"}' >"$GH_STUB_DIR/GET_repos_acme_widgets_pulls_$n"
+    done
 }
 
 @test "scheduled merge skips PRs that also carry the review label" {
     merge_env
     mixed_pr_list_fixture
-    run_step "$MERGE_STEP"
+    run_merge_step
     # 101 (pending only, old) merges; 102 is the ticket case — past the age
     # gate and still carrying a stale pending label, but routed to review —
     # and 103 is too young.
@@ -148,9 +191,10 @@ EOF
 # One old, pending-labelled PR that also carries $1 as its review label.
 review_labelled_pr_fixture() {
     jq -n --arg review "$1" \
-        '[{number: 201, createdAt: "2020-01-01T00:00:00Z",
+        '[{number: 201, createdAt: "2020-01-01T00:00:00Z", headRefOid: "a201",
            labels: [{name: "auto-merge-pending"}, {name: $review}]}]' \
         >"$GH_STUB_DIR/pr_list"
+    statuses_fixture a201 "$(commit_status success 'github-actions[bot]')"
 }
 
 # Every other label comparison in the chain ignores case, so a caller whose
@@ -161,7 +205,7 @@ review_labelled_pr_fixture() {
 @test "scheduled merge skips a review label whose casing differs on the PR" {
     merge_env
     review_labelled_pr_fixture SIRT-Review-Required
-    run_step "$MERGE_STEP"
+    run_merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
 }
 
@@ -169,17 +213,17 @@ review_labelled_pr_fixture() {
     merge_env
     export REVIEW_LABEL=SIRT-Review-Required
     review_labelled_pr_fixture sirt-review-required
-    run_step "$MERGE_STEP"
+    run_merge_step
     [ "$(log_count 'pr merge')" -eq 0 ]
 }
 
 @test "a merge failure still fails the step" {
     merge_env
     mixed_pr_list_fixture
-    echo "GraphQL: Pull request is in clean status" >"$GH_STUB_DIR/pr_merge.err"
-    run bash --noprofile --norc -e "$MERGE_STEP"
+    echo "GraphQL: Head branch was modified. Review and try the merge again." >"$GH_STUB_DIR/pr_merge.err"
+    run run_merge_step
     [ "$status" -eq 1 ]
     # grep rather than [[ ]]: under macOS bash 3.2 a failed [[ ]] mid-test
     # cannot fail a bats test (errexit/ERR fire only for simple commands).
-    grep -qF '::error::Failed to enable auto-merge on PR #101' <<<"$output"
+    grep -qF '::error::Failed to merge PR #101' <<<"$output"
 }

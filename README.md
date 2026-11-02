@@ -6,9 +6,9 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 
 | # | Gate | Default | Notes |
 |---|------|---------|-------|
-| 1 | Security advisory (GHSA ID) | required | PR must be a security fix, not a routine bump. Falls back to Dependabot Alerts API for indirect deps. |
+| 1 | Security advisory (GHSA ID) | required | PR must be a security fix, not a routine bump. Falls back to the Dependabot alerts API when PR metadata names no advisory. An alert counts only when its package, ecosystem, manifest directory and patched version all match the update. |
 | 2 | CVSS severity | ≥ 7.0 | High or critical. Configurable via `cvss-threshold`. A zero-like or out-of-range score means GitHub has no usable CVSS data, so the PR goes to human review instead. |
-| 3 | Compatibility score | ≥ 80% | Direct deps only; indirect deps skip this gate since fetch-metadata can't provide a score. |
+| 3 | Compatibility score | ≥ 80% | Direct deps only, going by fetch-metadata's `dependency-type`. Every direct dependency in the PR needs a score, and the lowest one counts. A missing score sends the PR to human review. |
 | 4 | Age gate | 7 days | Scheduled job merges passing PRs after `age-days` days. |
 
 PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A person who can merge bypasses all gates by enabling auto-merge on the PR with GitHub's own button. The workflow then posts a one-time audit comment recording who enabled it, when, and a link to the workflow run, and applies the `security-fast-track` label as a marker.
@@ -32,7 +32,8 @@ on:
 permissions:
     pull-requests: write
     contents: write
-    security-events: read
+    vulnerability-alerts: read
+    statuses: write
 
 jobs:
     dependabot-auto-merge:
@@ -40,7 +41,8 @@ jobs:
         permissions:
             pull-requests: write
             contents: write
-            security-events: read
+            vulnerability-alerts: read
+            statuses: write
         with:
             event-name: ${{ github.event_name }}
 ```
@@ -170,7 +172,7 @@ Your default branch needs a branch protection rule (or ruleset) with at least on
 
 Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fully verify ruleset-based required status checks with the default `GITHUB_TOKEN`. Classic branch protection details are only readable by admin tokens, so with classic protection the preflight can confirm the branch is protected but only warns that it cannot verify the checks themselves. If neither is configured, preflight fails with an error pointing back here. (`scripts/bootstrap.sh` creates a ruleset, so bootstrapped repos are fully verifiable by preflight.)
 
-Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**) — the Gate 1 fallback queries the Dependabot Alerts API for indirect dependencies and for unscored advisories on direct ones.
+Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**). Gate 1 reads them through the Dependabot alerts API. fetch-metadata's own alert lookup is left off, because it can match a dismissed alert and its match skips the open and applicability checks.
 
 ## Auditing readiness across an organisation
 
@@ -237,9 +239,7 @@ With `--org`, the audit guesses an owning team for each repository: the smallest
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `token` | **Yes, in practice** | Token used to call the Dependabot alerts API (Gate 1 fallback). Defaults to `GITHUB_TOKEN`, which cannot read that API at all — see below. Without this secret, every security PR for an indirect dependency fails the job. |
-
-`token` is declared optional so the workflow still starts without it, but any repository with indirect dependencies needs it. `GITHUB_TOKEN` is not a substitute.
+| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup, and passed to `dependabot/fetch-metadata`, which also lists the PR's commits. Defaults to `GITHUB_TOKEN`, which reads them once the job grants `vulnerability-alerts: read`. Pass a PAT or fine-grained token only where that permission is unavailable. A fine-grained token needs **Dependabot alerts: Read** and, from v1.6, **Pull requests: Read**. |
 
 ## Customisation examples
 
@@ -278,30 +278,27 @@ The calling job must declare:
 ```yaml
 permissions:
     pull-requests: write   # label and comment on PRs, read auto-merge state
-    contents: write        # enable auto-merge
-    security-events: read  # read Dependabot alerts API
+    contents: write        # merge PRs
+    vulnerability-alerts: read  # read Dependabot alerts
+    statuses: write        # record and read eligibility evidence
 ```
 
 These are the minimum required. The fast-track check reads the PR's auto-merge state through the pulls API, which `pull-requests` covers. If your repo uses a restrictive default permissions policy, set them explicitly on the job as shown in the usage example above.
 
-### GITHUB_TOKEN cannot read the Dependabot alerts API
+**`statuses: write` and `vulnerability-alerts: read` are breaking changes for callers pinned at v1.5 or earlier.** Add both to both `permissions` blocks when you re-pin, and drop `security-events: read`, which the workflow no longer requests. Without them GitHub refuses to start the reusable workflow, because a called workflow cannot hold a permission its caller did not grant. The workflow writes a `dependabot-auto-merge/eligibility` commit status when a PR passes the gates, and the scheduled merge will not act on a PR without one. See [How it works](#scheduled-merge-job-triggers-on-schedule) for why a label is not enough.
 
-This is not a misconfiguration you can fix in your org settings. `security-events: read` does not cover Dependabot alerts, and the GitHub Actions app that `GITHUB_TOKEN` is minted for cannot hold the permission that endpoint requires. The call returns:
+### When the token cannot read Dependabot alerts
 
-```
-HTTP 403: Resource not accessible by integration
-```
+`security-events: read` does not grant Dependabot alerts. A `GITHUB_TOKEN` without `vulnerability-alerts: read` gets a 403 from the alerts API, so the Gate 1 step fails the job with `Resource not accessible by integration`. The fix is to grant `vulnerability-alerts: read` on the caller job and at the top of the caller workflow, as in the usage example.
 
-Confirmed in production on eight repositories with `SecurityEvents: read` granted on the run and no org-level restriction in place. Only a GitHub App granted **Dependabot alerts: Read**, or a PAT with the equivalent, can read it.
+Where that permission is unavailable, pass a token instead.
 
-What the 403 costs depends on why the API was called:
+If the lookup succeeds but the later Dependabot alerts API call fails, what happens depends on why the API was called:
 
-- **Indirect dependency** — the API is the only advisory source, so the Gate 1 fallback step fails the job.
-- **Direct dependency with an unscored advisory** — the API call is a best-effort attempt to recover a real score, so a 403 only logs a warning and the PR goes to human review, exactly as if the API had never been consulted. The job stays green.
+- **PR metadata named no advisory.** The API is the only advisory source, so the Gate 1 fallback step fails the job.
+- **PR metadata named an unscored advisory.** The API call is a best-effort attempt to recover a real score, so a failure only logs a warning and the PR goes to human review, exactly as if the API had never been consulted. The job stays green.
 
-So a repository without this secret silently loses all indirect-dependency coverage and fails loudly on every such PR.
-
-The fix for both is a token that can actually read the endpoint. A GitHub App installation token granted **Dependabot alerts: Read**, minted per run with [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token), or a fine-grained PAT with **Dependabot alerts → Read** on the target repo. Pass it as a secret:
+Create a PAT, or a fine-grained token with **Dependabot alerts: Read** and **Pull requests: Read** on the target repo, and pass it as a secret. A token scoped to alerts alone fails the `dependabot/fetch-metadata` step with `Resource not accessible by personal access token` when it lists the PR's commits:
 
 ```yaml
 jobs:
@@ -310,7 +307,8 @@ jobs:
         permissions:
             pull-requests: write
             contents: write
-            security-events: read
+            vulnerability-alerts: read
+            statuses: write
         with:
             event-name: ${{ github.event_name }}
         secrets:
@@ -327,7 +325,7 @@ Store it as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` 
 
 GitHub sometimes returns `0.0` as the CVSS score for a matched advisory. That is not a severity rating — it means the advisory carries no CVSS v3 vector, usually because it was published recently and has not been scored yet. Branch rewrites can also rematch a PR against a newer, unscored advisory.
 
-The workflow treats as missing metadata every zero-like score — empty, `0`, `0.0`, `00`, `.00` — every value it cannot parse as a number, and anything above `10`. From v1.6 it first tries to recover a real score: an unscored advisory on a direct dependency sends the PR through the Dependabot alerts API, which often holds a score for the same advisory before it reaches PR metadata. Only that advisory counts, never another open alert on the same package. Only when that finds nothing better — no open alert for the advisory, or the call failed (a 403 from a restricted `GITHUB_TOKEN`, typically; expect one warning annotation per such PR) — does the PR fail closed: it gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one. Failing closed ships from v1.5 (v1.4 and earlier described an unscored advisory as below-threshold); the recovery attempt ships from v1.6.
+The workflow treats as missing metadata every zero-like score (empty, `0`, `0.0`, `00`, `.00`), every value it cannot parse as a number, and anything above `10`. From v1.6 it first tries to recover a real score. An unscored advisory in PR metadata sends the PR through the Dependabot alerts API, which often holds a score for the same advisory before it reaches PR metadata. Only that advisory counts, never another open alert on the same package. Only when that finds nothing better, because no applicable open alert exists for the advisory or the call failed (expect one warning annotation per such PR), does the PR fail closed. It gets `review-label` and a comment naming the score GitHub reported, where there was one. It never reads `0.0` as "below the threshold", because that would describe an unscored advisory as a safe one. Failing closed ships from v1.5 (v1.4 and earlier described an unscored advisory as below-threshold); the recovery attempt ships from v1.6.
 
 What to do: check the advisory yourself. If it is a real high-severity fix, enable auto-merge on the PR; the workflow records who did so in an audit comment. Nothing re-evaluates a PR when an advisory is scored later — the gates only re-run on a new PR event, so a stalled PR needs either auto-merge enabled by hand or a push.
 
@@ -336,6 +334,35 @@ What to do: check the advisory yourself. If it is a real high-severity fix, enab
 The workflow posts the comment when it next runs on the PR. It runs at once only if the caller workflow lists `auto_merge_enabled` under the `pull_request_target` types, as the template above does. Without it, the comment and the marker label arrive on the PR's next event, such as a Dependabot rebase. The auto-merge itself is GitHub's and does not wait for the workflow.
 
 If a run did happen and its evaluation job reports "Cannot read the auto-merge state", it stopped before acting on anything. Re-run it once the API is reachable.
+
+### The scheduled job skips a PR labelled `auto-merge-pending`
+
+The run shows a warning naming the PR and its head commit. The scheduled merge needs a `success` status in the `dependabot-auto-merge/eligibility` context on the PR's current head, and the label alone is not enough. Common causes:
+
+- The pending label was applied by hand. That is expected to be refused.
+- Dependabot pushed a new commit and that commit's evaluation has not passed, or failed before it finished. Check the evaluation run for that push.
+- The PR was labelled pending before you upgraded to a version that records evidence, so no status exists yet.
+
+What to do: trigger a fresh evaluation. Any new PR event does it, such as applying a label or asking Dependabot to rebase. If the gates pass, the status is written and the next scheduled run merges the PR.
+
+### A PR was routed for review with "the compatibility score for ... was unavailable"
+
+Dependabot publishes a compatibility score only for updates it has enough CI data on, and fetch-metadata reports a missing score as `0`. The workflow treats `0`, and anything that is not a whole number from 1 to 100, as no score, so the PR goes to review rather than reading as a 0% score. In a grouped update every direct dependency needs a score, and the comment names the first one without.
+
+Before v1.6 the compatibility lookup was never enabled and Gate 3 never ran, so direct-dependency PRs went to `pending-label` with no compatibility check. Expect more reviews of this kind after upgrading.
+
+What to do: check the update yourself, and apply the `fast-track-label` if it is safe to merge.
+
+### A security PR got no label at all
+
+The workflow found no open Dependabot alert that applies to the update, so it treated the PR as a routine version update. An alert applies only when all of these match an updated dependency:
+
+- **Package name**, exactly.
+- **Ecosystem.** Dependabot's package manager (`npm_and_yarn`, `go_modules`, `gradle`) is mapped to the alerts API ecosystem (`npm`, `go`, `maven`). Managers with no advisory database ecosystem, such as `docker` or `terraform`, never match.
+- **Manifest directory.** The alert's manifest sits in the directory Dependabot updated or anywhere below it. An alert in an unrelated subfolder can send a routine PR to review, which is the safe error. For GitHub Actions, workflow files under that directory's `.github/workflows` count too.
+- **Version.** The new version is at or above the advisory's first patched version. Only plain dotted numbers such as `4.17.21` are compared. A pre-release or qualified version (`4.18.0-beta.1`, `32.1.0-jre`, `1.0.post1`), or an advisory with no patched release, cannot be compared across ecosystems reliably, so it does not match.
+
+The Gate 1 fallback step log says how many open alerts named an updated package without applying to it. Review those PRs by hand.
 
 ### A PR carries both `auto-merge-pending` and `sirt-review-required`
 
@@ -359,23 +386,35 @@ A red preflight is intentional: it surfaces a repo where auto-merge could never 
 
 ### `evaluate-pr` job (triggers on `pull_request_target`)
 
-Runs on every opened/updated/labelled Dependabot PR, and when a person enables auto-merge on one, after preflight passes:
+Runs on every opened/updated/labelled Dependabot PR, and when a person enables auto-merge on one, after preflight passes. Evaluations of the same PR run one at a time. A newer event waits for the running one rather than cancelling it part-way.
 
 1. **Fast-track check** — read the PR's auto-merge state. If a person (any login other than `github-actions[bot]`) has enabled auto-merge, GitHub has already checked that they can merge, so the workflow posts a one-time audit comment (who enabled it, UTC timestamp, workflow-run link), applies the `fast-track-label` as a marker, and exits. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it. An auto-merge the scheduled job queued, or one with no readable enabler, goes through the gates below. A failed read fails the run rather than guessing.
-2. **Gate 1** — use `dependabot/fetch-metadata` to extract the GHSA ID and CVSS. The Dependabot Alerts API is consulted as a fallback in two cases: the GHSA ID is missing (indirect dep — fetch-metadata cannot embed advisory data for those), or it is present but the CVSS is unusable (unscored advisory — the API may hold a real score for it). Open security alerts are matched against the updated packages, and on the direct-dep path against the GHSA ID the PR fixes as well, so a package with several open alerts cannot lend a score from a vulnerability this PR leaves in place.
+2. **Gate 1.** `dependabot/fetch-metadata` runs with `compat-lookup` on and its alert lookup off. The Dependabot alerts API supplies the advisory. If PR metadata names a GHSA ID with an unusable CVSS, the API is consulted again for a real score. Open alerts count only when they apply to an updated dependency, by package name, ecosystem, manifest directory and patched version (see [A security PR got no label at all](#a-security-pr-got-no-label-at-all)). When PR metadata named an advisory, only that advisory counts, so a package with several open alerts cannot lend a score from a vulnerability this PR leaves in place.
 3. **Resolve the effective CVSS** — prefer the fetch-metadata score, then the alerts-API score. A score that is empty, non-numeric, numerically zero (`0`, `0.0`, `00`, `.00`), or above `10` is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`, and the comment names the score GitHub reported.
 4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
-5. **Gate 3** — require compatibility score ≥ `compatibility-threshold`% (skipped for indirect deps).
+5. **Gate 3.** Require compatibility score ≥ `compatibility-threshold`% for every direct dependency in the PR. Whether a PR has any is read from fetch-metadata's `dependency-type`, never from which Gate 1 path found the advisory. A PR of only indirect dependencies passes this gate, since fetch-metadata cannot score them. A missing score routes the PR to `review-label`.
 6. Apply `review-label` and remove `pending-label` if any gate fails; apply `pending-label` and remove `review-label` if all pass. The two labels are mutually exclusive states — a re-evaluated PR always ends up with exactly one.
+7. **Record the verdict on the head commit.** A pass writes a `success` commit status with the context `dependabot-auto-merge/eligibility` on the commit just evaluated. Any other outcome, including a run that errored before Gate 2 reported, writes `failure` over an earlier `success` on the same commit. A commit with no earlier `success` gets no status at all, so routine updates do not show a red status.
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
-Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and enables auto-merge on each — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set. That exclusion ignores case, matching how Actions, `gh pr edit` and `gh pr list --label` compare labels, so a `review-label` input whose casing differs from the repository label still excludes the PR.
+Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and merges each one GitHub would merge now — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set. That exclusion ignores case, matching how Actions, `gh pr edit` and `gh pr list --label` compare labels, so a `review-label` input whose casing differs from the repository label still excludes the PR.
+
+The labels only choose candidates. They are not proof a PR passed, because a triage user can apply `pending-label` or remove `review-label`, and evaluation never touches the labels of a routine version update. Each candidate merges only when the latest `dependabot-auto-merge/eligibility` status from `github-actions[bot]` on its current head commit is `success`. That status comes from evaluate-pr alone. Creating one takes `statuses: write`, which triage users do not have, and it belongs to one commit, so evidence for an earlier head does not carry over to a new one. A candidate with no evidence, or withdrawn evidence, is skipped with a warning. A failed status lookup skips the PR and fails the job, as a failed merge does.
+
+The job merges directly rather than enabling auto-merge, so nothing it starts can outlive the evidence it checked. It reads the PR's merge state from the pulls API and merges only a PR that is `clean`, `has_hooks` or `unstable`, the states `gh` itself treats as mergeable at once. Any other state, such as `blocked` while a required check runs or a required review is missing, skips the PR until the next run. The merge is pinned to the head commit whose evidence was just checked with `--match-head-commit`, so a commit pushed in between makes GitHub refuse it. A PR whose auto-merge a person already enabled is skipped, since GitHub merges it on its own.
+
+Two other designs were considered. A check run from a dedicated job would need `checks: read` to read back on private repos, a new permission all the same, and its name carries the caller's job name as a prefix that this workflow cannot know. Re-running the gates in the scheduled job is not possible, because `dependabot/fetch-metadata` only runs on a pull request event.
+
+Limits of the evidence: any other workflow in your repo that holds `statuses: write` and uses `GITHUB_TOKEN` also writes as `github-actions[bot]`, so it could write this context. Only people who can already change workflows can set that up.
 
 ## Security notes
 
 - The workflow only acts on PRs authored by `app/dependabot`.
 - The fast-track label never enables auto-merge. A person bypasses the gates by enabling auto-merge themselves, which GitHub allows only for write, maintain, or admin and records on the PR timeline.
 - Every fast-track leaves an audit comment on the PR as well, so gate bypasses are attributable after the fact.
+- The scheduled merge trusts a commit status on the PR's current head, not its labels. Triage users can change labels but cannot write statuses.
+- The scheduled merge never enables auto-merge, and it refuses a head commit that was not the one evaluated.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
-- `security-events: read` is required to call the Dependabot Alerts API — for indirect dependency lookups, and to recover a real score for unscored advisories on direct ones.
+- `vulnerability-alerts: read` is required to read Dependabot alerts, in the Gate 1 alerts lookup. Where `GITHUB_TOKEN` cannot hold that permission, pass `secrets.token`.
+- The `token` secret reaches `dependabot/fetch-metadata`, a pinned third-party action, as well as the workflow's own `gh` calls. Scope it to Dependabot alerts and pull requests, read only.
