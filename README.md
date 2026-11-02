@@ -241,7 +241,7 @@ With `--org`, the audit guesses an owning team for each repository: the smallest
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup, and passed to `dependabot/fetch-metadata`, which also lists the PR's commits. `GITHUB_TOKEN` cannot read Dependabot alerts here, so any repository with indirect dependencies needs it. A fine-grained token needs **Dependabot alerts: Read** and, from v1.6, **Pull requests: Read**. Falls back to `GITHUB_TOKEN` when not passed. |
+| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup, and passed to `dependabot/fetch-metadata`, which also lists the PR's commits. `GITHUB_TOKEN` cannot read Dependabot alerts here, so any repository with indirect dependencies needs it. A fine-grained token needs **Dependabot alerts: Read** and, from v1.7, **Pull requests: Read**. Falls back to `GITHUB_TOKEN` when not passed. |
 
 ## Customisation examples
 
@@ -347,7 +347,7 @@ What to do: trigger a fresh evaluation. Any new PR event does it, such as applyi
 
 Dependabot publishes a compatibility score only for updates it has enough CI data on, and fetch-metadata reports a missing score as `0`. The workflow treats `0`, and anything that is not a whole number from 1 to 100, as no score, so the PR goes to review rather than reading as a 0% score. In a grouped update every direct dependency needs a score, and the comment names the first one without.
 
-Before v1.6 the compatibility lookup was never enabled and Gate 3 never ran, so direct-dependency PRs went to `pending-label` with no compatibility check. Expect more reviews of this kind after upgrading.
+Before v1.7 the compatibility lookup was never enabled and Gate 3 never ran, so direct-dependency PRs went to `pending-label` with no compatibility check. Expect more reviews of this kind after upgrading.
 
 What to do: check the update yourself, and apply the `fast-track-label` if it is safe to merge.
 
