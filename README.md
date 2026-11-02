@@ -55,9 +55,15 @@ Pin to the commit SHA a release tag points at, with the tag in a trailing commen
 gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.7 --jq .sha
 ```
 
+On GitHub Enterprise Server, set `GH_HOST` first, for example `export GH_HOST=github.a8c.com`. Every `gh` command in this README then talks to that host.
+
 That's it. All inputs have defaults that match the original P2 configuration, so no extra config is needed unless you want to customize behaviour.
 
 Callers pinned at v1.6 or earlier: the `security-fast-track` label no longer enables auto-merge. Enable auto-merge on the PR instead, with the button or `gh pr merge --auto`. Add `auto_merge_enabled` to `types` when you re-pin, so the audit comment posts on that event rather than on the PR's next push.
+
+#### On github.a8c.com
+
+The same caller works unchanged. A `uses:` line resolves on the host the caller runs on, so a repo on github.a8c.com gets github.a8c.com's copy of this workflow, and a release carries the same commit SHA on both hosts. There, every job runs on the SecEx runner `[self-hosted, secex, gha-runner-2cpu-4gb]`. Pass `runner` to pick another.
 
 ### 2. Bootstrap the repo prerequisites
 
@@ -110,7 +116,7 @@ php bin/dependabot-directories owner/repo --dry-run
 php bin/dependabot-directories owner/repo
 ```
 
-From v1.6 onward it is also attached to the [release](https://github.com/Automattic/dependabot-auto-merge-action/releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
+From v1.6 onward it is also attached to the [release](../../releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
 
 ```bash
 gh release download v1.7 --pattern 'dependabot-directories.phar*'
@@ -236,6 +242,7 @@ With `--org`, the audit guesses an owning team for each repository: the smallest
 | `review-label` | string | `'sirt-review-required'` | Label applied when a PR fails a gate. |
 | `pending-label` | string | `'auto-merge-pending'` | Label applied when a PR passes all gates and is waiting for the age gate. |
 | `review-team` | string | `''` | Optional. GitHub team slug (`org/team`) @-mentioned in review-required comments. |
+| `runner` | string | `''` | Optional. Runner labels for every job, as a JSON array such as `'["self-hosted","secex","gha-runner-2cpu-4gb"]'`. Empty picks `ubuntu-latest` on github.com and a SecEx runner on github.a8c.com. |
 
 ## Secrets
 
@@ -387,7 +394,7 @@ A red preflight is intentional: it surfaces a repo where auto-merge could never 
 Runs on every opened/updated/labelled Dependabot PR, and when a person enables auto-merge on one, after preflight passes. Evaluations of the same PR run one at a time. A newer event waits for the running one rather than cancelling it part-way.
 
 1. **Fast-track check** — read the PR's auto-merge state. If a person (any login other than `github-actions[bot]`) has enabled auto-merge, GitHub has already checked that they can merge, so the workflow posts a one-time audit comment (who enabled it, UTC timestamp, workflow-run link), applies the `fast-track-label` as a marker, and exits. The comment is deduplicated via a hidden HTML marker, so repeated PR events never re-post it. An auto-merge the scheduled job queued, or one with no readable enabler, goes through the gates below. A failed read fails the run rather than guessing.
-2. **Gate 1.** `dependabot/fetch-metadata` runs with `compat-lookup` on and its alert lookup off. The Dependabot alerts API supplies the advisory. If PR metadata names a GHSA ID with an unusable CVSS, the API is consulted again for a real score. Open alerts count only when they apply to an updated dependency, by package name, ecosystem, manifest directory and patched version (see [A security PR got no label at all](#a-security-pr-got-no-label-at-all)). When PR metadata named an advisory, only that advisory counts, so a package with several open alerts cannot lend a score from a vulnerability this PR leaves in place.
+2. **Gate 1.** `dependabot/fetch-metadata` runs in a job of its own just before this one, from the `third-party-actions` mirror on github.a8c.com, with `compat-lookup` on and its alert lookup off. The Dependabot alerts API supplies the advisory. If PR metadata names a GHSA ID with an unusable CVSS, the API is consulted again for a real score. Open alerts count only when they apply to an updated dependency, by package name, ecosystem, manifest directory and patched version (see [A security PR got no label at all](#a-security-pr-got-no-label-at-all)). When PR metadata named an advisory, only that advisory counts, so a package with several open alerts cannot lend a score from a vulnerability this PR leaves in place.
 3. **Resolve the effective CVSS** — prefer the fetch-metadata score, then the alerts-API score. A score that is empty, non-numeric, numerically zero (`0`, `0.0`, `00`, `.00`), or above `10` is treated as missing metadata: the PR skips Gate 2 and goes straight to `review-label`, and the comment names the score GitHub reported.
 4. **Gate 2** — require CVSS ≥ `cvss-threshold`.
 5. **Gate 3.** Require compatibility score ≥ `compatibility-threshold`% for every direct dependency in the PR. Whether a PR has any is read from fetch-metadata's `dependency-type`, never from which Gate 1 path found the advisory. A PR of only indirect dependencies passes this gate, since fetch-metadata cannot score them. A missing score routes the PR to `review-label`.

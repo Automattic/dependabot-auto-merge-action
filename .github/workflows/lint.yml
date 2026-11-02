@@ -11,15 +11,26 @@ on:
             - 'bin/**'
             - 'composer.json'
             - 'composer.lock'
-    # No path filter on pull requests. The main-branch ruleset requires the
-    # actionlint check, and a workflow skipped by a path filter never reports
-    # it, so a docs-only PR would wait on that check forever.
+    # No path filter on pull requests. A required actionlint check would never
+    # report on a workflow skipped by a path filter, so a docs-only PR would
+    # wait on it forever.
     pull_request:
+
+# Development happens on github.a8c.com, so these jobs run there only. github.com
+# receives each release as a direct push and never runs them.
+#
+# github.a8c.com runs jobs on SecEx runners, which drop outbound traffic to any
+# host not listed here. The runner reads this before the job starts, so it must
+# be a literal. The list covers the actionlint download, apt for bats and
+# shellcheck, setup-php's PHP and PPA downloads, and Composer and Packagist.
+env:
+    SECEX_EGRESS_RULES: 'github.a8c.com,*.github.a8c.com,github.com,*.github.com,*.githubusercontent.com,packagist.org,*.packagist.org,getcomposer.org,setup-php.com,ppa.setup-php.com,cdn.jsdelivr.net,ppa.launchpadcontent.net,launchpad.net,*.launchpad.net,keyserver.ubuntu.com,archive.ubuntu.com,security.ubuntu.com'
 
 jobs:
     actionlint:
         name: actionlint
-        runs-on: ubuntu-latest
+        if: github.server_url != 'https://github.com'
+        runs-on: [self-hosted, secex, gha-runner-1cpu-1gb]
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - name: Download actionlint
@@ -33,15 +44,17 @@ jobs:
 
     shellcheck:
         name: shellcheck
-        runs-on: ubuntu-latest
+        if: github.server_url != 'https://github.com'
+        runs-on: [self-hosted, secex, gha-runner-1cpu-1gb]
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - name: Check shell scripts
-              # shellcheck is preinstalled on ubuntu-latest. find keeps the
-              # coverage recursive to match the scripts/** trigger paths;
-              # -exec {} + propagates shellcheck's exit status. Stubs are swept
-              # as a directory so a newly added one cannot go unlinted.
+              # find keeps the coverage recursive to match the scripts/**
+              # trigger paths; -exec {} + propagates shellcheck's exit status.
+              # Stubs are swept as a directory so a newly added one cannot go
+              # unlinted.
               run: |
+                  command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
                   find scripts -type f -name '*.sh' -exec shellcheck --severity=warning {} +
                   find tests/stubs -type f -exec shellcheck --severity=warning {} +
                   shellcheck --severity=warning tests/*.bash
@@ -49,19 +62,22 @@ jobs:
 
     bats:
         name: bats
-        runs-on: ubuntu-latest
+        if: github.server_url != 'https://github.com'
+        runs-on: [self-hosted, secex, gha-runner-1cpu-1gb]
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - name: Install bats
               run: sudo apt-get update && sudo apt-get install -y bats
             - name: Run tests
-              # jq is preinstalled on ubuntu-latest
-              run: bats tests/
+              run: |
+                  command -v jq >/dev/null || sudo apt-get install -y jq
+                  bats tests/
               shell: bash
 
     php:
         name: php ${{ matrix.php }}
-        runs-on: ubuntu-latest
+        if: github.server_url != 'https://github.com'
+        runs-on: [self-hosted, secex, gha-runner-2cpu-4gb]
         strategy:
             fail-fast: false
             matrix:
@@ -70,7 +86,8 @@ jobs:
                 php: ['8.2', '8.4']
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-            - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2.40.0
+            # v2.37.2, the newest release proven to install PHP on SecEx.
+            - uses: third-party-actions/shivammathur-setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
               with:
                   php-version: ${{ matrix.php }}
                   extensions: json, mbstring, phar

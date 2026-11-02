@@ -1,0 +1,6 @@
+# Labels of the SecEx self-hosted runners on github.a8c.com.
+self-hosted-runner:
+    labels:
+        - secex
+        - gha-runner-1cpu-1gb
+        - gha-runner-2cpu-4gb
