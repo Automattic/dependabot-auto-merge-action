@@ -1,0 +1,15 @@
+{
+  "cvss_unavailable_with_effective": {
+    "feature": "dependabot_auto_merge",
+    "source": "dependabot-auto-merge",
+    "outcome": "cvss_unavailable",
+    "job": "evaluate_pr",
+    "repo": "Automattic/some-repo",
+    "github_host": "github.com",
+    "ci_provider": "github_actions",
+    "build_url": "https://github.com/Automattic/some-repo/actions/runs/1",
+    "pr": "500",
+    "cvss_reported": "0.0",
+    "cvss_effective": 7.5
+  }
+}
