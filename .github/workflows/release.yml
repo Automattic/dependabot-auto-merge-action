@@ -4,10 +4,10 @@ name: Release
 # and gh and nothing else — no Composer step, and nothing compiled in the
 # repository. Built here rather than committed for the same reason.
 #
-# github.a8c.com is the primary home. Pushing a tag there builds its release,
-# then publishes the tagged commit and the tag to github.com, where the same
-# tag push builds github.com's release. Each host builds its own PHAR, so the
-# two jobs below differ only in runner and setup-php source: github.a8c.com
+# github.a8c.com is the primary home and github.com a public mirror. A tag
+# pushed to either host builds that host's release; docs/releasing.md covers
+# pushing a release to github.com by hand. Each host builds its own PHAR, so
+# the two jobs below differ only in runner and setup-php source: github.a8c.com
 # allows only actions mirrored into its third-party-actions org, and a runner
 # fetches every action in a job before the first step, so one job cannot hold
 # both. Keep their remaining steps identical.
@@ -22,7 +22,7 @@ permissions:
 # github.a8c.com runs jobs on SecEx runners, which drop outbound traffic to any
 # host not listed here. The runner reads this before the job starts, so it must
 # be a literal. github.com ignores it. The list covers setup-php's PHP and PPA
-# downloads, Composer and Packagist, and the push to github.com.
+# downloads, and Composer and Packagist.
 env:
     SECEX_EGRESS_RULES: 'github.a8c.com,*.github.a8c.com,github.com,*.github.com,*.githubusercontent.com,packagist.org,*.packagist.org,getcomposer.org,setup-php.com,ppa.setup-php.com,cdn.jsdelivr.net,ppa.launchpadcontent.net,launchpad.net,*.launchpad.net,keyserver.ubuntu.com,archive.ubuntu.com,security.ubuntu.com'
 
@@ -122,34 +122,4 @@ jobs:
                       bin/dependabot-directories.phar \
                       bin/dependabot-directories.phar.sha256 \
                       --clobber
-              shell: bash
-
-    # Publishes the release to github.com once github.a8c.com's own release
-    # exists. The deploy key is the only actor github.com's main ruleset lets
-    # push directly. The push is atomic and never forced: if github.com's main
-    # has moved on its own, both refs are refused and this job fails, which is
-    # the signal that the hosts have diverged.
-    publish-github-com:
-        name: Publish to github.com
-        needs: phar-ghes
-        if: github.server_url != 'https://github.com'
-        runs-on: [self-hosted, secex, gha-runner-1cpu-1gb]
-        steps:
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-              with:
-                  fetch-depth: 0
-            - name: Push the tagged commit and the tag
-              env:
-                  DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
-              run: |
-                  KEY="$RUNNER_TEMP/github_com_deploy_key"
-                  KNOWN_HOSTS="$RUNNER_TEMP/github_com_known_hosts"
-                  printf '%s\n' "$DEPLOY_KEY" > "$KEY"
-                  chmod 600 "$KEY"
-                  # github.com's published host key, from its meta API.
-                  echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$KNOWN_HOSTS"
-                  export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
-                  git push --atomic git@github.com:Automattic/dependabot-auto-merge-action.git \
-                      "${GITHUB_SHA}:refs/heads/main" \
-                      "${GITHUB_REF}:${GITHUB_REF}"
               shell: bash
