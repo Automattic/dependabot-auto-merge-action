@@ -524,6 +524,32 @@ EOF
     [[ "$(rec .checks.required_checks.detail)" == *"admin token"* ]]
 }
 
+@test "a branch protected only by a ruleset fails, even though .protected is true" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    # github.com reports .protected for a ruleset too. The .protection
+    # summary is classic protection only.
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":true,"protection":{"enabled":false,"required_status_checks":{"contexts":[],"checks":[]}}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "fail" ]
+    [[ "$(rec .checks.required_checks.detail)" == *"no classic branch protection"* ]]
+}
+
+@test "classic protection's checks are read from the branch summary, without admin" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":true,"protection":{"enabled":true,"required_status_checks":{"contexts":["ci"],"checks":[{"context":"ci","app_id":null}]}}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "pass" ]
+    [ "$(log_count 'branches/main/protection')" -eq 0 ]
+}
+
+@test "classic protection whose summary names no check fails" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":true,"protection":{"enabled":true,"required_status_checks":{"contexts":[],"checks":[]}}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "fail" ]
+    [ "$(log_count 'branches/main/protection')" -eq 0 ]
+}
+
 @test "an unreadable branch is unknown, never fail" {
     repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
     fixture GET_repos_acme_widgets_branches_main.err <<<'gh: Not Found (HTTP 404)'
