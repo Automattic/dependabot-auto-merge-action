@@ -26,8 +26,10 @@ Steps:
      (creates ruleset "dependabot-auto-merge-required-checks" only when no
      required checks exist and --required-check is given; existing branch
      protection or rulesets are never modified)
-  3. Create or update the three labels the workflow depends on
-  4. Enable Dependabot vulnerability alerts
+  3. Check that the GitHub Actions app may push to the default branch
+     (reports only; existing branch protection is never modified)
+  4. Create or update the three labels the workflow depends on
+  5. Enable Dependabot vulnerability alerts
 
 Options:
   --required-check <name>  Check-run name to require on the default branch when
@@ -282,6 +284,38 @@ step_ruleset() {
         POST "repos/$REPO/rulesets" "$payload"
 }
 
+# Read-only. The scheduled merge pushes to the default branch as the GitHub
+# Actions app, so a push restriction that leaves it out refuses every merge.
+# Branch protection is the team's to change, so this only reports.
+step_push_restrictions() {
+    local out apps rules
+    # 200 = pushes are restricted, 404 = they are not (or no protection).
+    if out=$(gh api "repos/$REPO/branches/$ENC_BRANCH/protection/restrictions" 2>&1); then
+        apps=$(jq -r '[.apps[]?.slug] | index("github-actions") != null' <<<"$out") || {
+            fail "push restrictions: cannot parse classic branch protection"
+            return 1
+        }
+        if [[ $apps == true ]]; then
+            ok "push restrictions: '$DEFAULT_BRANCH' restricts pushes and allows the GitHub Actions app"
+        else
+            note "push restrictions: '$DEFAULT_BRANCH' restricts who can push and the GitHub Actions app is not allowed, so GitHub will refuse the scheduled merge — add it under Settings > Branches > Restrict who can push"
+        fi
+    elif grep -q "HTTP 404" <<<"$out"; then
+        ok "push restrictions: classic branch protection does not restrict who can push to '$DEFAULT_BRANCH'"
+    else
+        fail "push restrictions: cannot read classic branch protection: $(head -c 300 <<<"$out")"
+        return 1
+    fi
+
+    if ! rules=$(gh api --paginate "repos/$REPO/rules/branches/$ENC_BRANCH" --jq '.[] | select(.type == "update") | .ruleset_id' 2>&1); then
+        fail "push restrictions: cannot read rules for branch '$DEFAULT_BRANCH': $(head -c 300 <<<"$rules")"
+        return 1
+    fi
+    if [[ -n $rules ]]; then
+        note "push restrictions: a ruleset restricts updates to '$DEFAULT_BRANCH'; the scheduled merge is refused unless GitHub Actions can bypass it"
+    fi
+}
+
 step_labels() {
     local rc=0 entry name color desc enc cur cur_color cur_desc payload
     for entry in "${LABELS[@]}"; do
@@ -395,6 +429,7 @@ fi
 FAILED_STEPS=""
 step_auto_merge || FAILED_STEPS="$FAILED_STEPS auto-merge"
 step_ruleset || FAILED_STEPS="$FAILED_STEPS required-checks"
+step_push_restrictions || FAILED_STEPS="$FAILED_STEPS push-restrictions"
 step_labels || FAILED_STEPS="$FAILED_STEPS labels"
 step_vuln_alerts || FAILED_STEPS="$FAILED_STEPS vulnerability-alerts"
 

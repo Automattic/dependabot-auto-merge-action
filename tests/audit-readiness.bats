@@ -29,7 +29,8 @@ log_count() {
     grep -cF -- "$1" "$GH_STUB_LOG" || true
 }
 
-# The caller workflow exactly as the eight onboarded repos ship it.
+# A v1.7 caller as onboarded repos ship it, still granting the
+# security-events: read that v1.6 needed.
 good_caller() {
     cat <<'EOF'
 name: Dependabot auto-merge
@@ -42,6 +43,7 @@ permissions:
   pull-requests: write
   contents: write
   security-events: read
+  statuses: write
 jobs:
   dependabot-auto-merge:
     uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@8143c95d871e96dc12cb448aa1dde9c2abae694e # v1.5
@@ -49,6 +51,7 @@ jobs:
       pull-requests: write
       contents: write
       security-events: read
+      statuses: write
     with:
       event-name: ${{ github.event_name }}
     secrets:
@@ -449,6 +452,43 @@ EOF
     [ "$(log_count 'branches')" -eq 0 ]
 }
 
+@test "classic protection that turns on status checks but names none fails" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []},
+                                      branchProtectionRule: {requiresStatusChecks: true,
+                                                             requiredStatusCheckContexts: [],
+                                                             requiredApprovingReviewCount: 0}}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "fail" ]
+    [[ "$(rec .checks.required_checks.detail)" == *"name no check"* ]]
+}
+
+@test "classic protection with no status checks fails without a REST call" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []},
+                                      branchProtectionRule: {requiresStatusChecks: false,
+                                                             requiredStatusCheckContexts: [],
+                                                             requiredApprovingReviewCount: 0}}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "fail" ]
+    [ "$(log_count 'branches')" -eq 0 ]
+}
+
+@test "an empty classic list beside a ruleset check passes on the ruleset" {
+    repo_set '. * {defaultBranchRef: {branchProtectionRule: {requiresStatusChecks: true,
+                                                             requiredStatusCheckContexts: [],
+                                                             requiredApprovingReviewCount: 0}}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "pass" ]
+    [ "$(rec .checks.required_checks.path)" = "ruleset" ]
+}
+
+@test "protected with an empty required-checks list fails via the classic fallback" {
+    repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
+    fixture GET_repos_acme_widgets_branches_main <<<'{"protected":true}'
+    fixture GET_repos_acme_widgets_branches_main_protection <<<'{"required_status_checks":{"contexts":[],"checks":[]}}'
+    run_audit
+    [ "$(rec .checks.required_checks.status)" = "fail" ]
+}
+
 @test "an unprotected default branch fails" {
     repo_set '. * {defaultBranchRef: {rules: {totalCount: 0, nodes: []}, branchProtectionRule: null}}'
     fixture GET_repos_acme_widgets_branches_main <<<'{"protected":false}'
@@ -668,10 +708,27 @@ EOF
 }
 
 @test "permissions present in only one block fails" {
-    repo_set '.caller.text |= sub("    permissions:\n      pull-requests: write\n      contents: write\n      security-events: read\n"; "")'
+    repo_set '.caller.text |= sub("    permissions:\n      pull-requests: write\n      contents: write\n      security-events: read\n      statuses: write\n"; "")'
     run_audit
     [ "$(rec .checks.caller_workflow.status)" = "fail" ]
     [[ "$(rec .checks.caller_workflow.detail)" == *"permissions"* ]]
+}
+
+@test "the caller from the README passes as written" {
+    local readme_caller
+    readme_caller=$(awk '/^# \.github\/workflows\/dependabot-auto-merge\.yml$/{on=1} on&&/^```$/{exit} on' "$REPO_ROOT/README.md" \
+        | sed 's/@<sha>/@8143c95d871e96dc12cb448aa1dde9c2abae694e/')
+    [[ $readme_caller == *"statuses: write"* ]]
+    repo_set ".caller.text = $(jq -n --arg t "$readme_caller" '$t')"
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+}
+
+@test "a v1.6 caller without statuses: write fails and names it" {
+    repo_set '.caller.text |= gsub("\n *statuses: write"; "")'
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "fail" ]
+    [[ "$(rec .checks.caller_workflow.detail)" == *"statuses: write missing"* ]]
 }
 
 @test "a caller we cannot parse is unknown, never fail" {
@@ -834,8 +891,59 @@ EOF
     [ "$(rec .checks.merge_method.status)" = "fail" ]
 }
 
-@test "--merge-method merge checks the merge-commit setting instead" {
-    repo_set '. * {squashMergeAllowed: false, mergeCommitAllowed: true}'
+@test "an adopted caller's merge-method is checked rather than the flag" {
+    repo_set '.squashMergeAllowed = false
+              | .caller.text |= sub("      event-name:"; "      merge-method: \u0027merge\u0027\n      event-name:")'
+    run_audit
+    [ "$(rec .checks.merge_method.status)" = "pass" ]
+    [ "$(rec .checks.merge_method.method)" = "merge" ]
+}
+
+@test "an adopted caller without merge-method is checked as squash, the workflow default" {
+    repo_set '.squashMergeAllowed = false'
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --merge-method merge
+    [ "$(rec .checks.merge_method.status)" = "fail" ]
+    [ "$(rec .checks.merge_method.method)" = "squash" ]
+}
+
+# --- push restrictions --------------------------------------------------------
+
+@test "unrestricted pushes pass" {
+    repo_set
+    run_audit
+    [ "$(rec .checks.push_restrictions.status)" = "pass" ]
+}
+
+@test "restricted pushes without the GitHub Actions app block the merge" {
+    repo_set '. * {defaultBranchRef: {branchProtectionRule: {
+                    requiresStatusChecks: true, requiredStatusCheckContexts: ["ci"],
+                    restrictsPushes: true,
+                    pushAllowances: {totalCount: 1, nodes: [{actor: {__typename: "Team"}}]}}}}'
+    run_audit
+    [ "$(rec .checks.push_restrictions.status)" = "fail" ]
+    [ "$(rec .verdict)" = "blocked" ]
+    [[ "$(rec .checks.push_restrictions.detail)" == *"GitHub Actions app is not allowed"* ]]
+}
+
+@test "restricted pushes that allow the GitHub Actions app pass" {
+    repo_set '. * {defaultBranchRef: {branchProtectionRule: {
+                    requiresStatusChecks: true, requiredStatusCheckContexts: ["ci"],
+                    restrictsPushes: true,
+                    pushAllowances: {totalCount: 2, nodes: [{actor: {__typename: "Team"}},
+                                                            {actor: {__typename: "App", slug: "github-actions"}}]}}}}'
+    run_audit
+    [ "$(rec .checks.push_restrictions.status)" = "pass" ]
+}
+
+@test "a ruleset that restricts updates is a risk" {
+    repo_set '.defaultBranchRef.rules.nodes += [{type: "UPDATE", parameters: null,
+                                                repositoryRuleset: {name: "Lock trunk", enforcement: "ACTIVE"}}]'
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("update_restricted") != null')" = "true" ]
+}
+
+@test "--merge-method merge checks the merge-commit setting for a repo not adopted yet" {
+    repo_set '. * {squashMergeAllowed: false, mergeCommitAllowed: true, caller: null}'
     run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --merge-method merge
     [ "$status" -eq 0 ]
     [ "$(rec .checks.merge_method.status)" = "pass" ]

@@ -177,6 +177,33 @@ EOF
     [ "$(grep -c -- '-X POST repos/acme/widgets/labels' "$GH_STUB_LOG")" -eq 3 ]
 }
 
+@test "pushes restricted without the GitHub Actions app is reported, not changed" {
+    configured_repo_fixtures
+    fixture GET_repos_acme_widgets_branches_main_protection_restrictions <<<'{"users":[],"teams":[{"slug":"ventures"}],"apps":[]}'
+    run "$SCRIPT" acme/widgets
+    [ "$status" -eq 0 ]
+    [[ $output == *"GitHub Actions app is not allowed"* ]]
+    [ "$(mutation_count)" -eq 0 ]
+}
+
+@test "pushes restricted with the GitHub Actions app allowed passes" {
+    configured_repo_fixtures
+    fixture GET_repos_acme_widgets_branches_main_protection_restrictions <<<'{"users":[],"teams":[],"apps":[{"slug":"github-actions"}]}'
+    run "$SCRIPT" acme/widgets
+    [ "$status" -eq 0 ]
+    [[ $output == *"allows the GitHub Actions app"* ]]
+}
+
+@test "a ruleset that restricts updates is reported" {
+    configured_repo_fixtures
+    fixture GET_repos_acme_widgets_rules_branches_main <<'EOF'
+[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"ci"}]}},{"type":"update","ruleset_id":7}]
+EOF
+    run "$SCRIPT" acme/widgets
+    [ "$status" -eq 0 ]
+    [[ $output == *"a ruleset restricts updates"* ]]
+}
+
 @test "failed step exits 1 and is named, later steps still run" {
     fresh_repo_fixtures
     fixture PATCH_repos_acme_widgets </dev/null
