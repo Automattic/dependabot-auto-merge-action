@@ -3,8 +3,14 @@ name: Dependabot auto-merge
 on:
     workflow_call:
         secrets:
+            app-client-id:
+                description: 'Client ID of a GitHub App with Dependabot alerts read. With app-private-key, the Gate 1 alerts lookup mints a token from the App, scoped to this repository, and uses it ahead of token. Pass it from a Dependabot secret: Dependabot-triggered runs cannot read Actions secrets.'
+                required: false
+            app-private-key:
+                description: 'Private key of the GitHub App named by app-client-id. Pass it from a Dependabot secret.'
+                required: false
             token:
-                description: 'Token that can read Dependabot alerts, used by the Gate 1 alerts lookup. GITHUB_TOKEN cannot read Dependabot alerts here, so any repository with indirect dependencies needs this secret. A fine-grained token needs Dependabot alerts read only. Falls back to GITHUB_TOKEN when not passed.'
+                description: 'Token that can read Dependabot alerts, used by the Gate 1 alerts lookup when no App is passed. GITHUB_TOKEN cannot read Dependabot alerts here, so any repository with indirect dependencies needs the App or this secret. A fine-grained token needs Dependabot alerts read only. Falls back to GITHUB_TOKEN when not passed.'
                 required: false
         inputs:
             event-name:
@@ -51,9 +57,10 @@ on:
 permissions:
     pull-requests: write
     contents: write
-    # No Dependabot alerts permission. The Gate 1 lookup reads alerts with
-    # secrets.token, so a caller that still grants security-events: read, as
-    # v1.6 callers do, starts this workflow unchanged.
+    # No Dependabot alerts permission. The Gate 1 lookup reads alerts with a
+    # token minted from the caller's GitHub App, or with secrets.token, so a
+    # caller that still grants security-events: read, as v1.6 callers do,
+    # starts this workflow unchanged.
     # evaluate-pr records its verdict as a commit status, and the scheduled
     # merge reads it back. Labels cannot carry that verdict: a triage user
     # can change them.
@@ -249,6 +256,9 @@ jobs:
         concurrency:
             group: dependabot-auto-merge-evaluate-pr-${{ github.event.pull_request.number }}
             cancel-in-progress: false
+        # A step's `if:` cannot read secrets, so the App check is made here.
+        env:
+            APP_CONFIGURED: ${{ secrets.app-client-id != '' && secrets.app-private-key != '' }}
         steps:
             # gh talks to github.com unless told otherwise, so point it at
             # the host this run is on. GH_ENTERPRISE_TOKEN beside each
@@ -404,6 +414,27 @@ jobs:
               env:
                   GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
                   CVSS: ${{ steps.meta.outputs.cvss }}
+
+            # Mint the alerts token from the caller's GitHub App, only when
+            # the fallback below will run. A caller cannot mint it and pass it
+            # in: its calling job has no steps, and GitHub drops job outputs
+            # that hold secrets. The token reads Dependabot alerts in this
+            # repository only and expires within the hour. When the App is
+            # passed but cannot mint (not installed, wrong key), the job fails
+            # here rather than falling back to a token that cannot read alerts.
+            - name: Mint the Dependabot alerts token from the GitHub App
+              id: app-token
+              if: |
+                  env.APP_CONFIGURED == 'true' &&
+                  steps.fast-track.outputs.active != 'true' &&
+                  (steps.gate1.outputs.pass == 'false' || steps.gate1.outputs.cvss-usable == 'false')
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.app-client-id }}
+                  private-key: ${{ secrets.app-private-key }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ github.event.repository.name }}
+                  permission-vulnerability-alerts: read
 
             # Gate 1 fallback: query the Dependabot alerts API and match open
             # alerts against the dependencies being updated. Runs when PR
@@ -574,8 +605,8 @@ jobs:
                   UPDATED_DEPENDENCIES: ${{ steps.meta.outputs.updated-dependencies-json }}
                   GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
                   GATE1_PASS: ${{ steps.gate1.outputs.pass }}
-                  GH_TOKEN: ${{ secrets.token || github.token }}
-                  GH_ENTERPRISE_TOKEN: ${{ secrets.token || github.token }}
+                  GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
+                  GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
 
             # Resolve the effective CVSS from whichever source succeeded, and
             # decide in the same place whether that score is usable at all.

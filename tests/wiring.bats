@@ -17,8 +17,8 @@ setup_file() {
 
 # --- permissions (QAO-767) --------------------------------------------------
 
-# Alerts are read with secrets.token, so the workflow requests no alerts
-# permission. A called workflow cannot hold a permission its caller did not
+# Alerts are read with a token minted from the caller's App, or with
+# secrets.token, so the workflow requests no alerts permission. A called workflow cannot hold a permission its caller did not
 # grant, so requesting either scope would refuse to start some callers.
 @test "the workflow requests no Dependabot alerts permission" {
     block=$(awk '/^permissions:/{p=1; next} p && /^[^ #]/{exit} p' "$WORKFLOW" | grep -v '^ *#')
@@ -36,6 +36,75 @@ setup_file() {
     run grep -A4 'uses: .*fetch-metadata@' "$WORKFLOW"
     [ "$(grep -c 'github-token: \${{ github.token }}$' <<<"$output")" -eq 2 ]
     ! grep -q 'secrets.token' <<<"$output"
+}
+
+# --- GitHub App alerts token (QAO-477) -------------------------------------
+
+# Print the step whose id is $1, from its `- ` line to the next step.
+step_block() {
+    awk -v id="$1" '
+        /^ +- (name|uses|id|run):/ { if (hit) exit; buf = "" }
+        { buf = buf $0 "\n" }
+        $0 ~ "^ +id: " id "$" { hit = 1 }
+        hit && !printed { printf "%s", buf; printed = 1; next }
+        hit { print }
+    ' "$WORKFLOW"
+}
+
+@test "the App token is minted with the pinned action" {
+    run step_block app-token
+    grep -qF 'uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0' <<<"$output"
+}
+
+@test "the App token reads Dependabot alerts in this repository only" {
+    run extract_key app-token with
+    [ "$(grep -c 'permission-' <<<"$output")" -eq 1 ]
+    grep -qF 'permission-vulnerability-alerts: read' <<<"$output"
+    grep -qF 'repositories: ${{ github.event.repository.name }}' <<<"$output"
+    grep -qF 'owner: ${{ github.repository_owner }}' <<<"$output"
+}
+
+@test "the App token is minted only when both App secrets are passed" {
+    grep -qF "APP_CONFIGURED: \${{ secrets.app-client-id != '' && secrets.app-private-key != '' }}" "$WORKFLOW"
+    grep -qF "env.APP_CONFIGURED == 'true'" <<<"$(extract_if app-token)"
+}
+
+# Minting costs an API call and a token on every evaluation, so it runs only
+# when the alerts lookup will.
+@test "the App token is minted only when the alerts lookup runs" {
+    fallback=$(extract_if gate1-fallback)
+    mint=$(extract_if app-token)
+    [ -n "$fallback" ] && [ -n "$mint" ]
+    while IFS= read -r line; do
+        grep -qF "$line" <<<"$mint"
+    done <<<"$fallback"
+}
+
+@test "the App token is minted before the alerts lookup" {
+    mint=$(grep -n '^ *id: app-token$' "$WORKFLOW" | cut -d: -f1)
+    fallback=$(grep -n '^ *id: gate1-fallback$' "$WORKFLOW" | cut -d: -f1)
+    [ -n "$mint" ] && [ -n "$fallback" ]
+    [ "$mint" -lt "$fallback" ]
+}
+
+@test "the alerts lookup prefers the App token, then the token secret, then GITHUB_TOKEN" {
+    run extract_key gate1-fallback env
+    [ "$(grep -cF 'GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.token || github.token }}' <<<"$output")" -eq 1 ]
+    [ "$(grep -cF 'GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token || secrets.token || github.token }}' <<<"$output")" -eq 1 ]
+}
+
+@test "only the alerts lookup receives the App token" {
+    [ "$(grep -c 'steps.app-token.outputs.token' "$WORKFLOW")" -eq 2 ]
+    [ "$(step_block gate1-fallback | grep -c 'steps.app-token.outputs.token')" -eq 2 ]
+}
+
+# The token reaches the step as GH_TOKEN, which gh reads without printing.
+# A step that echoed it, or wrote it to GITHUB_ENV or GITHUB_OUTPUT, would
+# put a live credential in the log or hand it to every later step.
+@test "nothing prints or exports the App token" {
+    ! grep -qE '(echo|printf).*(GH_TOKEN|GH_ENTERPRISE_TOKEN|app-token)' "$WORKFLOW"
+    ! grep -qE '(GH_TOKEN|GH_ENTERPRISE_TOKEN).*>> *"?\$(GITHUB_ENV|GITHUB_OUTPUT)' "$WORKFLOW"
+    ! grep -qE 'outputs:.*app-token|: \$\{\{ *steps\.app-token\.outputs\.token *\}\}$' "$WORKFLOW"
 }
 
 # --- fast-track detection (QAO-765) ---------------------------------------

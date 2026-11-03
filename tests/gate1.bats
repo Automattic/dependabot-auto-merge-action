@@ -64,11 +64,11 @@ gate1() {
 }
 
 # The alerts fallback is the only reader of Dependabot alerts, so it is the
-# step that needs the token secret. fetch-metadata gets GITHUB_TOKEN, which
-# tests/wiring.bats checks.
-@test "the alerts fallback reads alerts with the token secret" {
+# step that needs the App token or the token secret. fetch-metadata gets
+# GITHUB_TOKEN, which tests/wiring.bats checks.
+@test "the alerts fallback reads alerts with the App token, then the token secret" {
     token=$(extract_key gate1-fallback env | sed -n 's/^GH_TOKEN: //p')
-    [ "$token" = '${{ secrets.token || github.token }}' ]
+    [ "$token" = '${{ steps.app-token.outputs.token || secrets.token || github.token }}' ]
 }
 
 # Steps cannot share functions and callers never check this repo out, so the

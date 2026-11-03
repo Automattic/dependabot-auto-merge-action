@@ -36,7 +36,7 @@ permissions:
 
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7.1
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.8
         permissions:
             pull-requests: write
             contents: write
@@ -44,15 +44,16 @@ jobs:
         with:
             event-name: ${{ github.event_name }}
         secrets:
-            token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+            app-client-id: ${{ secrets.DEPENDABOT_APP_CLIENT_ID }}
+            app-private-key: ${{ secrets.DEPENDABOT_APP_PRIVATE_KEY }}
 ```
 
-`GITHUB_TOKEN` cannot read Dependabot alerts, so pass a token that can. See [When the token cannot read Dependabot alerts](#when-the-token-cannot-read-dependabot-alerts).
+`GITHUB_TOKEN` cannot read Dependabot alerts, so pass a GitHub App that can. The workflow mints a short-lived token from it on each run. See [When the token cannot read Dependabot alerts](#when-the-token-cannot-read-dependabot-alerts) for the App's setup, and for the `token` secret, which still works.
 
 Pin to the commit SHA a release tag points at, with the tag in a trailing comment — the same way this repo pins third-party actions. Tags name releases; they are not pinning targets, and none of them float. Resolve the SHA with:
 
 ```bash
-gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.7.1 --jq .sha
+gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.8 --jq .sha
 ```
 
 On GitHub Enterprise Server, set `GH_HOST` first, for example `export GH_HOST=github.a8c.com`. Every `gh` command in this README then talks to that host.
@@ -119,7 +120,7 @@ php bin/dependabot-directories owner/repo
 From v1.6 onward it is also attached to the [release](../../releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
 
 ```bash
-gh release download v1.7.1 --pattern 'dependabot-directories.phar*'
+gh release download v1.8 --pattern 'dependabot-directories.phar*'
 shasum -a 256 -c dependabot-directories.phar.sha256
 chmod +x dependabot-directories.phar
 ./dependabot-directories.phar owner/repo --dry-run
@@ -251,7 +252,9 @@ With `--org`, the audit guesses an owning team for each repository: the smallest
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup. `GITHUB_TOKEN` cannot read Dependabot alerts here, so any repository with indirect dependencies needs it. A fine-grained token needs **Dependabot alerts: Read** only. Falls back to `GITHUB_TOKEN` when not passed. |
+| `app-client-id` | No | Client ID of a GitHub App with **Dependabot alerts: Read**. With `app-private-key`, the Gate 1 alerts lookup mints a token from the App, scoped to the calling repository, and uses it ahead of `token`. Pass it from a Dependabot secret. From v1.8. |
+| `app-private-key` | No | Private key of that App. Pass it from a Dependabot secret. From v1.8. |
+| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup, when no App is passed. `GITHUB_TOKEN` cannot read Dependabot alerts here, so any repository with indirect dependencies needs the App or this secret. A fine-grained token needs **Dependabot alerts: Read** only. Falls back to `GITHUB_TOKEN` when not passed. |
 
 ## Customisation examples
 
@@ -300,19 +303,31 @@ These are the minimum required. The fast-track check reads the PR's auto-merge s
 
 ### When the token cannot read Dependabot alerts
 
-The workflow's `GITHUB_TOKEN` cannot read Dependabot alerts. Without a `token` secret, the alerts API returns a 403 and the Gate 1 step fails the job with `Resource not accessible by integration`. Pass a token that can read them, as below.
+The workflow's `GITHUB_TOKEN` cannot read Dependabot alerts. Without an App or a `token` secret, the alerts API returns a 403 and the Gate 1 step fails the job with `Resource not accessible by integration`. Pass a GitHub App, or a token, that can read them.
 
 If the lookup succeeds but the later Dependabot alerts API call fails, what happens depends on why the API was called:
 
 - **PR metadata named no advisory.** The API is the only advisory source, so the Gate 1 fallback step fails the job.
 - **PR metadata named an unscored advisory.** The API call is a best-effort attempt to recover a real score, so a failure only logs a warning and the PR goes to human review, exactly as if the API had never been consulted. The job stays green.
 
-Create a PAT, or a fine-grained token with **Dependabot alerts: Read** on the target repo, and pass it as a secret. v1.7 also passed the secret to `dependabot/fetch-metadata`, so on a private repo a token scoped to alerts alone failed that step with `Resource not accessible by personal access token` when it listed the PR's commits. From v1.7.1, fetch-metadata uses `GITHUB_TOKEN` and the secret needs alerts access only:
+#### A GitHub App (from v1.8)
+
+The caller in [step 1](#1-create-the-caller-workflow-in-your-repo) passes an App's client ID and private key. Just before the alerts lookup, the workflow mints a token from them with `actions/create-github-app-token`. The token reads Dependabot alerts in the calling repository only and expires within the hour. The caller cannot mint the token itself and pass it in, because a job that calls a reusable workflow has no steps, and GitHub drops job outputs that hold secrets.
+
+1. Create a GitHub App owned by the organisation, with one repository permission, **Dependabot alerts: Read**, and no webhook.
+2. Install it on the organisation, on all repositories or on the ones that call this workflow.
+3. Store its client ID as `DEPENDABOT_APP_CLIENT_ID` and a private key as `DEPENDABOT_APP_PRIVATE_KEY`, as organisation **Dependabot** secrets. A run that Dependabot triggers can read only Dependabot secrets, so the same values stored as Actions secrets reach the workflow empty, and it falls back to `token` or `GITHUB_TOKEN`.
+
+When both secrets are passed and the token cannot be minted, for example because the App is not installed on the repository, the job fails at the minting step with the action's error. It does not fall back to `token`.
+
+#### A token
+
+A PAT, or a fine-grained token with **Dependabot alerts: Read** on the target repo, still works. The workflow uses it when no App is passed. v1.7 also passed the secret to `dependabot/fetch-metadata`, so on a private repo a token scoped to alerts alone failed that step with `Resource not accessible by personal access token` when it listed the PR's commits. From v1.7.1, fetch-metadata uses `GITHUB_TOKEN` and the secret needs alerts access only:
 
 ```yaml
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7.1
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.8
         permissions:
             pull-requests: write
             contents: write
@@ -323,9 +338,17 @@ jobs:
             token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
 ```
 
-Store it as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`. An organisation secret is the least work across many repositories: set it once, and each caller picks it up with the two lines above.
+Store it as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` (or any name you prefer) and reference it in `secrets.token`.
 
-`scripts/audit-readiness.sh` checks this. It reads the secret name from the `token` line in the job that calls this workflow and confirms a secret by that name exists, at repo or organisation level. A caller that passes no token fails the check, because the workflow then falls back to `GITHUB_TOKEN`. Values are never readable, only names, and listing repository secrets needs admin, so without it the check reports `unknown` rather than a failure. The same goes for an organisation secret list it cannot read.
+#### What the audit checks
+
+`scripts/audit-readiness.sh` reads the secrets the job that calls this workflow passes.
+
+- **App secrets.** Each one must exist as a Dependabot secret, in the repository or in the organisation with a visibility that reaches the repository. Listing the organisation's Dependabot secrets needs organisation admin, and GitHub has no endpoint for the ones shared with a single repository, so without that access the check reports `unknown`. A caller that passes only one of the two fails.
+- **Token.** It confirms an Actions secret by that name exists, at repo or organisation level.
+- **Neither.** The check fails, because the workflow then falls back to `GITHUB_TOKEN`.
+
+Values are never readable, only names, and listing repository secrets needs admin, so without it the check reports `unknown` rather than a failure.
 
 ## Troubleshooting
 
@@ -437,7 +460,8 @@ Limits of the evidence: any other workflow in your repo that holds `statuses: wr
 - The scheduled merge trusts a commit status on the PR's current head, not its labels. Triage users can change labels but cannot write statuses.
 - The scheduled merge never enables auto-merge, and it refuses a head commit that was not the one evaluated.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
-- The workflow requests no Dependabot alerts permission. The Gate 1 alerts lookup reads them with `secrets.token`.
+- The workflow requests no Dependabot alerts permission. The Gate 1 alerts lookup reads them with a token minted from the caller's GitHub App, or with `secrets.token`.
+- The minted App token is scoped to the calling repository and to Dependabot alerts read, expires within the hour, and reaches only the alerts lookup. The App's private key reaches only the pinned `actions/create-github-app-token` step.
 - The `token` secret reaches only the workflow's own `gh` calls, not `dependabot/fetch-metadata`, which gets `GITHUB_TOKEN`. Scope it to Dependabot alerts, read only.
 
 ## Development

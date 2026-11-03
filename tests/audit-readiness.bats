@@ -740,14 +740,38 @@ EOF
     [[ "$(rec .checks.caller_workflow.detail)" == *"permissions"* ]]
 }
 
+# The README's caller is what people copy, so the audit must pass it as
+# written: the workflow shape and the secrets it names. The secrets exist
+# where the README says to put them, as organisation Dependabot secrets.
 @test "the caller from the README passes as written" {
     local readme_caller
     readme_caller=$(awk '/^# \.github\/workflows\/dependabot-auto-merge\.yml$/{on=1} on&&/^```$/{exit} on' "$REPO_ROOT/README.md" \
         | sed 's/@<sha>/@8143c95d871e96dc12cb448aa1dde9c2abae694e/')
     [[ $readme_caller == *"statuses: write"* ]]
+    [[ $readme_caller == *"app-client-id: \${{ secrets.DEPENDABOT_APP_CLIENT_ID }}"* ]]
+    [[ $readme_caller == *"app-private-key: \${{ secrets.DEPENDABOT_APP_PRIVATE_KEY }}"* ]]
     repo_set ".caller.text = $(jq -n --arg t "$readme_caller" '$t')"
+    secrets_fixture ""
+    fixture GET_repos_acme_widgets_dependabot_secrets_per_page_100 <<<'{"total_count":0,"secrets":[]}'
+    fixture GET_orgs_acme_dependabot_secrets_per_page_100 <<<'{"total_count":2,"secrets":[
+        {"name":"DEPENDABOT_APP_CLIENT_ID","visibility":"all"},
+        {"name":"DEPENDABOT_APP_PRIVATE_KEY","visibility":"all"}]}'
     run_audit
     [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+# The README's token caller is still supported, so it must pass too.
+@test "the token caller from the README passes as written" {
+    local readme_caller
+    readme_caller=$(awk '/^#### A token$/{on=1} on&&/^```yaml$/{yaml=1; next} yaml&&/^```$/{exit} yaml' "$REPO_ROOT/README.md" \
+        | sed 's/@<sha>/@8143c95d871e96dc12cb448aa1dde9c2abae694e/')
+    [[ $readme_caller == *"token: \${{ secrets.DEPENDABOT_ALERTS_TOKEN }}"* ]]
+    repo_set ".caller.text |= sub(\"jobs:\\n[\\\\s\\\\S]*\"; $(jq -n --arg t "$readme_caller" '$t | sub("^    "; ""; "g")' | jq -c .))"
+    secrets_fixture "DEPENDABOT_ALERTS_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+    [ "$(rec .checks.alerts_token.secret)" = "DEPENDABOT_ALERTS_TOKEN" ]
 }
 
 @test "a v1.6 caller without statuses: write fails and names it" {
@@ -863,7 +887,7 @@ EOF
     secrets_fixture "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
     run_audit
     [ "$(rec .checks.alerts_token.status)" = "fail" ]
-    grep -qF 'passes no token secret' <<<"$(rec .checks.alerts_token.detail)"
+    grep -qF 'passes no GitHub App or token secret' <<<"$(rec .checks.alerts_token.detail)"
 }
 
 @test "a quoted token secret is read" {
@@ -907,6 +931,120 @@ EOF
     run_audit
     [ "$(rec '.remediation.needs_work | index("alerts_token") != null')" = "true" ]
     [ "$(rec '.remediation.bootstrap_fixes | index("alerts_token")')" = "null" ]
+}
+
+# --- GitHub App alerts credential (QAO-477) ----------------------------------
+
+# A caller that passes the App secrets instead of a token.
+APP_CALLER='.caller.text |= sub("      token: \\$\\{\\{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN \\}\\}"; "      app-client-id: ${{ secrets.DEPENDABOT_APP_CLIENT_ID }}\n      app-private-key: ${{ secrets.DEPENDABOT_APP_PRIVATE_KEY }}")'
+
+# Dependabot secret listings: $1 names in the repository, $2 an organisation
+# list as JSON (omit it for an organisation list we cannot read).
+dependabot_secrets_fixture() {
+    jq -cn --arg n "$1" '{total_count: ($n | split(",") | map(select(length > 0)) | length),
+                          secrets: ($n | split(",") | map(select(length > 0) | {name: .}))}' \
+        | fixture GET_repos_acme_widgets_dependabot_secrets_per_page_100
+    if [[ -n ${2:-} ]]; then
+        fixture GET_orgs_acme_dependabot_secrets_per_page_100 <<<"$2"
+    fi
+}
+
+@test "App secrets that exist as repository Dependabot secrets pass" {
+    repo_set "$APP_CALLER"
+    secrets_fixture ""
+    dependabot_secrets_fixture "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+    [ "$(rec .checks.alerts_token.secret)" = "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY" ]
+}
+
+@test "App secrets shared from the organisation with every repository pass" {
+    repo_set "$APP_CALLER"
+    secrets_fixture ""
+    dependabot_secrets_fixture "" '{"total_count":2,"secrets":[
+        {"name":"DEPENDABOT_APP_CLIENT_ID","visibility":"all"},
+        {"name":"DEPENDABOT_APP_PRIVATE_KEY","visibility":"all"}]}'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "App secrets shared with selected repositories pass only when this one is selected" {
+    repo_set "$APP_CALLER"
+    secrets_fixture ""
+    dependabot_secrets_fixture "" '{"total_count":2,"secrets":[
+        {"name":"DEPENDABOT_APP_CLIENT_ID","visibility":"selected"},
+        {"name":"DEPENDABOT_APP_PRIVATE_KEY","visibility":"all"}]}'
+    fixture GET_orgs_acme_dependabot_secrets_DEPENDABOT_APP_CLIENT_ID_repositories_per_page_100 \
+        <<<'{"total_count":1,"repositories":[{"full_name":"acme/gadgets"}]}'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    grep -qF 'is not shared with this repository' <<<"$(rec .checks.alerts_token.detail)"
+
+    fixture GET_orgs_acme_dependabot_secrets_DEPENDABOT_APP_CLIENT_ID_repositories_per_page_100 \
+        <<<'{"total_count":1,"repositories":[{"full_name":"acme/widgets"}]}'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+@test "App secrets visible to private repositories fail on a public one" {
+    repo_set "$APP_CALLER"
+    secrets_fixture ""
+    dependabot_secrets_fixture "" '{"total_count":2,"secrets":[
+        {"name":"DEPENDABOT_APP_CLIENT_ID","visibility":"private"},
+        {"name":"DEPENDABOT_APP_PRIVATE_KEY","visibility":"private"}]}'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+
+    repo_set "$APP_CALLER | .isPrivate = true"
+    secrets_fixture ""
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+}
+
+# Dependabot-triggered runs cannot read Actions secrets, so an Actions secret
+# by the right name would mint nothing.
+@test "App secrets stored only as Actions secrets fail" {
+    repo_set "$APP_CALLER"
+    secrets_fixture "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY"
+    dependabot_secrets_fixture "" '{"total_count":0,"secrets":[]}'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    [ "$(rec '.blockers | index("alerts_token") != null')" = "true" ]
+    grep -qF "no Dependabot secret named 'DEPENDABOT_APP_CLIENT_ID'" <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "an organisation Dependabot secret list we cannot read is unknown, not fail" {
+    repo_set "$APP_CALLER"
+    secrets_fixture ""
+    dependabot_secrets_fixture ""
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "unknown" ]
+    [ "$(rec '.blockers | index("alerts_token")')" = "null" ]
+}
+
+@test "repository Dependabot secrets we cannot list are unknown" {
+    repo_set "$APP_CALLER"
+    secrets_fixture ""
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "unknown" ]
+    grep -qF 'needs admin' <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "a caller that passes one App secret fails and names the other" {
+    repo_set "$APP_CALLER"' | .caller.text |= sub("\n      app-private-key: [^\n]*"; "")'
+    secrets_fixture "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    dependabot_secrets_fixture "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    grep -qF 'passes app-client-id but not app-private-key' <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "with both an App and a token, the App is what is checked" {
+    repo_set "$APP_CALLER"' | .caller.text |= sub("    secrets:\n"; "    secrets:\n      token: ${{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN }}\n")'
+    secrets_fixture "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    dependabot_secrets_fixture "" '{"total_count":0,"secrets":[]}'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
 }
 
 # --- merge method and risks ---------------------------------------------------

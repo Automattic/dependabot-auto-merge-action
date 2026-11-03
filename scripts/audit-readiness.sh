@@ -418,14 +418,15 @@ record_graphql_errors() {
     ' <<<"$body" >>"$WORK/errors.jsonl" 2>/dev/null || true
 }
 
-# Print the secret the caller passes as `token` to the reusable workflow,
-# nothing when the calling job passes none, or "?" when that job cannot be
-# found. Only the job that calls dependabot-auto-merge.yml counts, since a
-# `token:` in another job does not reach it, and the value may be quoted.
-# The job is the nearest line above `uses:` indented less than it, and runs
-# until the next line indented no more than the job key.
-caller_token_secret() {
-    awk '
+# Print the secret the caller passes to the reusable workflow as $1 (token,
+# app-client-id or app-private-key), nothing when the calling job passes
+# none, or "?" when that job cannot be found. Only the job that calls
+# dependabot-auto-merge.yml counts, since a secret in another job does not
+# reach it, and the value may be quoted. The job is the nearest line above
+# `uses:` indented less than it, and runs until the next line indented no
+# more than the job key.
+caller_secret() {
+    awk -v key="$1" '
         { line[NR] = $0 }
         END {
             for (i = 1; i <= NR; i++) if (line[i] ~ /dependabot-auto-merge\.yml@/) { u = i; break }
@@ -440,7 +441,7 @@ caller_token_secret() {
             for (i = j + 1; i <= NR; i++) {
                 if (line[i] ~ /^[ ]*(#|$)/) continue
                 if (match(line[i], /[^ ]/) - 1 <= ji) break
-                if (line[i] ~ /^[ ]*token[ ]*:[ ]*["\047]?\$\{\{[ ]*secrets\.[A-Za-z0-9_]+/) {
+                if (line[i] ~ "^[ ]*" key "[ ]*:[ ]*[\"\047]?[$][{][{][ ]*secrets[.][A-Za-z0-9_]+") {
                     s = line[i]
                     sub(/.*secrets\./, "", s)
                     sub(/[^A-Za-z0-9_].*/, "", s)
@@ -456,6 +457,54 @@ secret_listed() { jq -e --arg n "$1" '(.secrets // []) | any(.name == $n)' >/dev
 
 # Whether the secrets list on stdin is one page of a longer list.
 secret_list_partial() { jq -e '(.total_count // 0) > ((.secrets // []) | length)' >/dev/null 2>&1; }
+
+# Whether the Dependabot secret $2 reaches repository $1, whose privacy is
+# $3 (true, false or empty when unknown). Prints status<TAB>detail. Only
+# Dependabot secrets count: a Dependabot-triggered run cannot read Actions
+# secrets. GitHub has no endpoint listing the organisation's Dependabot
+# secrets shared with one repository, so the organisation list is read and
+# the secret's visibility decides. That list needs organisation admin, and
+# without it the answer is unknown, not fail.
+dependabot_secret_status() {
+    local repo=$1 name=$2 private=$3 owner=${1%%/*} list org_list visibility shared
+    if ! list=$(api_rest "repos/$repo/dependabot/secrets?per_page=100"); then
+        printf 'unknown\t%s' "cannot list the repository's Dependabot secrets (needs admin); could not confirm '$name'"
+    elif secret_listed "$name" <<<"$list"; then
+        printf 'pass\t%s' "Dependabot secret '$name' exists"
+    elif secret_list_partial <<<"$list"; then
+        printf 'unknown\t%s' "the repository has more than 100 Dependabot secrets and only the first 100 were read; could not confirm '$name'"
+    elif ! org_list=$(api_rest "orgs/$owner/dependabot/secrets?per_page=100"); then
+        printf 'unknown\t%s' "no repository Dependabot secret named '$name', and cannot list the organisation's Dependabot secrets (needs organisation admin); could not confirm one"
+    else
+        visibility=$(jq -r --arg n "$name" '[(.secrets // [])[] | select(.name == $n) | .visibility][0] // empty' <<<"$org_list" 2>/dev/null)
+        case $visibility:$private in
+            all:*)
+                printf 'pass\t%s' "organisation Dependabot secret '$name' is visible to all repositories" ;;
+            private:true)
+                printf 'pass\t%s' "organisation Dependabot secret '$name' is visible to private and internal repositories" ;;
+            private:false)
+                printf 'fail\t%s' "organisation Dependabot secret '$name' is visible to private and internal repositories only, and this one is public" ;;
+            private:*)
+                printf 'unknown\t%s' "organisation Dependabot secret '$name' is visible to private and internal repositories only, and this repository's visibility is unknown" ;;
+            selected:*)
+                if ! shared=$(api_rest "orgs/$owner/dependabot/secrets/$name/repositories?per_page=100"); then
+                    printf 'unknown\t%s' "organisation Dependabot secret '$name' is shared with selected repositories, and that list cannot be read"
+                elif jq -e --arg r "$repo" '(.repositories // []) | any(.full_name == $r)' >/dev/null 2>&1 <<<"$shared"; then
+                    printf 'pass\t%s' "organisation Dependabot secret '$name' is shared with this repository"
+                elif jq -e '(.total_count // 0) > ((.repositories // []) | length)' >/dev/null 2>&1 <<<"$shared"; then
+                    printf 'unknown\t%s' "organisation Dependabot secret '$name' is shared with more than 100 repositories and only the first 100 were read"
+                else
+                    printf 'fail\t%s' "organisation Dependabot secret '$name' is not shared with this repository"
+                fi ;;
+            *)
+                if secret_list_partial <<<"$org_list"; then
+                    printf 'unknown\t%s' "the organisation has more than 100 Dependabot secrets and only the first 100 were read; could not confirm '$name'"
+                else
+                    printf 'fail\t%s' "no Dependabot secret named '$name' in the repository or the organisation"
+                fi ;;
+        esac
+    fi
+}
 
 # A node for a repository nothing could be read from. It keeps the repo visible
 # and lets every check resolve to unknown, which is the honest answer.
@@ -875,27 +924,70 @@ probe_repo() {
         fi
     fi
 
-    # --- is an alerts token actually wired up? --------------------------------
+    # --- is an alerts credential actually wired up? ---------------------------
     #
     # GITHUB_TOKEN cannot read the Dependabot alerts API under any
-    # configuration, so a repo without this secret loses every
-    # indirect-dependency security PR. Secret *values* are never readable;
-    # names are, which is enough to tell "wired" from "not wired".
-    local want_secret repo_secrets org_secrets caller_text
+    # configuration, so a repo without a credential loses every
+    # indirect-dependency security PR. A caller passes either a GitHub App
+    # (app-client-id and app-private-key, which must be Dependabot secrets) or
+    # a token. Secret *values* are never readable; names are, which is enough
+    # to tell "wired" from "not wired".
+    local want_secret repo_secrets org_secrets caller_text app_id="" app_key=""
+    local id_result key_result id_status key_status private
     caller_text=$(jq -r '.caller.text // empty' <<<"$node" 2>/dev/null)
     if [[ -n $caller_text ]]; then
-        want_secret=$(caller_token_secret <<<"$caller_text")
+        want_secret=$(caller_secret token <<<"$caller_text")
+        app_id=$(caller_secret app-client-id <<<"$caller_text")
+        app_key=$(caller_secret app-private-key <<<"$caller_text")
     else
         # Not adopted yet. Check for the secret the rollout will wire up.
         want_secret=$ALERTS_TOKEN_SECRET
     fi
+    [[ $app_id == "?" ]] && app_id=""
+    [[ $app_key == "?" ]] && app_key=""
 
-    if [[ $want_secret == "?" ]]; then
+    if [[ -n $app_id && -n $app_key ]]; then
+        # The workflow mints from the App ahead of any token, so the token
+        # does not matter here.
+        want_secret="$app_id,$app_key"
+        # Not `// empty`: that drops a false isPrivate too.
+        private=$(jq -r 'if .isPrivate == null then "" else .isPrivate end' <<<"$node" 2>/dev/null)
+        id_result=$(dependabot_secret_status "$repo" "$app_id" "$private")
+        key_result=$(dependabot_secret_status "$repo" "$app_key" "$private")
+        id_status=${id_result%%$'\t'*}
+        key_status=${key_result%%$'\t'*}
+        if [[ $id_status == fail ]]; then
+            token_status=fail
+            token_detail="${id_result#*$'\t'}; the App token cannot be minted"
+        elif [[ $key_status == fail ]]; then
+            token_status=fail
+            token_detail="${key_result#*$'\t'}; the App token cannot be minted"
+        elif [[ $id_status == unknown ]]; then
+            token_status=unknown
+            token_detail=${id_result#*$'\t'}
+        elif [[ $key_status == unknown ]]; then
+            token_status=unknown
+            token_detail=${key_result#*$'\t'}
+        else
+            token_status=pass
+            token_detail="GitHub App secrets '$app_id' and '$app_key' reach this repository as Dependabot secrets"
+        fi
+    elif [[ -n $app_id || -n $app_key ]]; then
+        # One App secret alone mints nothing, and the workflow falls back to
+        # the token. Passing half an App is a mistake worth naming.
+        want_secret="$app_id$app_key"
+        token_status=fail
+        if [[ -n $app_id ]]; then
+            token_detail="the caller passes app-client-id but not app-private-key, so the workflow cannot mint the App token"
+        else
+            token_detail="the caller passes app-private-key but not app-client-id, so the workflow cannot mint the App token"
+        fi
+    elif [[ $want_secret == "?" ]]; then
         token_status=unknown
         token_detail="cannot find the job that calls the workflow in the caller, so cannot tell which secret it passes"
     elif [[ -z $want_secret ]]; then
         token_status=fail
-        token_detail="the caller passes no token secret, so the workflow falls back to GITHUB_TOKEN, which cannot read the Dependabot alerts API"
+        token_detail="the caller passes no GitHub App or token secret, so the workflow falls back to GITHUB_TOKEN, which cannot read the Dependabot alerts API"
     elif ! repo_secrets=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
         # Listing repository secrets needs admin. Not knowing is not a failure.
         token_status=unknown
@@ -1232,7 +1324,7 @@ assemble() {
 
                 alerts_token: (
                   if ($nr.alerts_token == null) then
-                    check("unknown"; "the alerts-token secret was not checked"; "rest")
+                    check("unknown"; "the alerts credential was not checked"; "rest")
                   else
                     check($nr.alerts_token.status; $nr.alerts_token.detail; "rest")
                       + {secret: $nr.alerts_token.secret}
