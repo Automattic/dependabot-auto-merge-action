@@ -61,7 +61,7 @@ Callers pinned at v1.6 or earlier: the `security-fast-track` label no longer ena
 
 ### 2. Bootstrap the repo prerequisites
 
-[`scripts/bootstrap.sh`](scripts/bootstrap.sh) configures everything else the workflow needs — auto-merge allowed, a required status check on the default branch, the three labels, and Dependabot vulnerability alerts. Every step is idempotent: re-runs are safe and report what is already correct.
+[`scripts/bootstrap.sh`](scripts/bootstrap.sh) configures everything else the workflow needs — auto-merge allowed, a required status check on the default branch, the three labels, and Dependabot vulnerability alerts. It also checks that the GitHub Actions app may push to the default branch, but only reports on it, since it never changes existing branch protection. Every step is idempotent: re-runs are safe and report what is already correct.
 
 ```bash
 ./scripts/bootstrap.sh owner/repo --required-check "your-check-name" --dry-run
@@ -170,7 +170,9 @@ The workflow's preflight job verifies this at runtime and fails with an error po
 
 ### 6. Branch protection (manual alternative)
 
-Your default branch needs a branch protection rule (or ruleset) with at least one required status check. Without it, GitHub won't queue an auto-merge.
+Your default branch needs a branch protection rule (or ruleset) that names at least one required status check. Turning on "Require status checks to pass" without naming a check does not count, because it holds nothing back. Without a named check, a person's auto-merge and the scheduled merge would both merge a PR before its CI finishes.
+
+If classic branch protection turns on "Restrict who can push to matching branches", add the GitHub Actions app to that list. The scheduled merge runs as the GitHub Actions app, so GitHub refuses it otherwise. A ruleset with "Restrict updates" needs GitHub Actions on its bypass list for the same reason.
 
 Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fully verify ruleset-based required status checks with the default `GITHUB_TOKEN`. Classic branch protection details are only readable by admin tokens, so with classic protection the preflight can confirm the branch is protected but only warns that it cannot verify the checks themselves. If neither is configured, preflight fails with an error pointing back here. (`scripts/bootstrap.sh` creates a ruleset, so bootstrapped repos are fully verifiable by preflight.)
 
@@ -201,14 +203,15 @@ Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Se
 ### What it checks
 
 1. `Allow auto-merge` is enabled.
-2. The default branch has at least one required status check. This reproduces the preflight job's logic exactly, rulesets first and classic branch protection as the fallback, so a repo the audit calls `ready` is one preflight will not fail.
+2. The default branch has at least one named required status check. A rule that turns status checks on but names none fails, as it does in bootstrap and preflight. Rulesets come first and classic branch protection is the fallback, so a repo the audit calls `ready` is one preflight will not fail.
 3. The three labels exist, compared case-insensitively because the Actions runtime is.
 4. Dependabot vulnerability alerts are enabled.
 5. `.github/dependabot.yml` exists. A `.github/dependabot.yaml` is a failure, because Dependabot only reads `.yml`.
-6. The caller workflow is present and well formed: both triggers, `labeled` in `types`, a commit SHA rather than a tag, and complete `permissions` in both the workflow-level and job-level blocks.
-7. The repo allows the merge method the workflow is configured to use. Nothing else catches this, and a repo with squash disabled passes preflight and then fails at `gh pr merge --auto --squash`.
+6. The caller workflow is present and well formed: both triggers, `labeled` in `types`, a commit SHA rather than a tag, and `pull-requests: write`, `contents: write` and `statuses: write` in both the workflow-level and job-level blocks. A leftover `security-events: read` is allowed but not needed.
+7. The repo allows the merge method the workflow will use: the caller's `merge-method`, or squash when it passes none. For a repo that has not adopted yet, `--merge-method` sets the method to check. Nothing else catches this, and a repo with squash disabled passes preflight and then fails at `gh pr merge --squash`.
+8. Classic branch protection does not restrict who can push to the default branch, or allows the GitHub Actions app when it does.
 
-It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, label colour drift, and "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside.
+It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, a ruleset that restricts updates to the default branch (its bypass list needs an admin token to read), label colour drift, and "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside.
 
 ### Output
 
@@ -403,6 +406,19 @@ The labels only choose candidates. They are not proof a PR passed, because a tri
 The job merges directly rather than enabling auto-merge, so nothing it starts can outlive the evidence it checked. It reads the PR's merge state from the pulls API and merges only a PR that is `clean`, `has_hooks` or `unstable`, the states `gh` itself treats as mergeable at once. Any other state, such as `blocked` while a required check runs or a required review is missing, skips the PR until the next run. The merge is pinned to the head commit whose evidence was just checked with `--match-head-commit`, so a commit pushed in between makes GitHub refuse it. A PR whose auto-merge a person already enabled is skipped, since GitHub merges it on its own.
 
 Two other designs were considered. A check run from a dedicated job would need `checks: read` to read back on private repos, a new permission all the same, and its name carries the caller's job name as a prefix that this workflow cannot know. Re-running the gates in the scheduled job is not possible, because `dependabot/fetch-metadata` only runs on a pull request event.
+
+A merge made with `GITHUB_TOKEN` does not start other workflows, so a workflow that runs `on: push` to the default branch, such as a dev build, does not run after this job merges a PR. GitHub does this to stop workflows triggering each other in a loop. To run one after a scheduled merge, add a `workflow_run` trigger for this workflow to it:
+
+```yaml
+on:
+    push:
+        branches: [trunk]
+    workflow_run:
+        workflows: ['Dependabot auto-merge']
+        types: [completed]
+```
+
+`workflow_run` runs on the default branch, so it builds what the merge just landed. It also fires after runs that merged nothing, so check `github.event.workflow_run.conclusion` or the commit if that matters. A PR a person merges, or one GitHub merges after a person enabled auto-merge, starts `push` workflows as usual.
 
 Limits of the evidence: any other workflow in your repo that holds `statuses: write` and uses `GITHUB_TOKEN` also writes as `github-actions[bot]`, so it could write this context. Only people who can already change workflows can set that up.
 

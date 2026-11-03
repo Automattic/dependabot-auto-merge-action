@@ -102,15 +102,17 @@ jobs:
                   # path — so they are checked first.
                   ENC_BRANCH=$(printf '%s' "$DEFAULT_BRANCH" | jq -sRr '@uri')
 
+                  # A rule or protection that names no check holds nothing
+                  # back, so only named checks count, as in bootstrap.sh.
                   RULESET_CHECKS=0
                   if RULES_JSON=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$ENC_BRANCH?per_page=100" 2>&1); then
-                      RULESET_CHECKS=$(echo "$RULES_JSON" | jq '[.[] | select(.type == "required_status_checks")] | length' 2>/dev/null || echo 0)
+                      RULESET_CHECKS=$(echo "$RULES_JSON" | jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]?] | length' 2>/dev/null || echo 0)
                   else
                       echo "::warning::Preflight: could not read branch rulesets — $(echo "$RULES_JSON" | head -c 300 | tr '\n' ' '). Falling back to classic branch protection check."
                   fi
 
                   if [ "$RULESET_CHECKS" -gt 0 ]; then
-                      echo "OK: default branch '$DEFAULT_BRANCH' has $RULESET_CHECKS ruleset-based required status check rule(s)."
+                      echo "OK: default branch '$DEFAULT_BRANCH' has $RULESET_CHECKS ruleset-based required status check(s)."
                   else
                       # No ruleset checks — check classic branch protection.
                       # .protected is readable without admin; the /protection
@@ -126,7 +128,7 @@ jobs:
 
                       if [ "$PROTECTED" = "true" ]; then
                           if PROT_JSON=$(gh api "repos/$GITHUB_REPOSITORY/branches/$ENC_BRANCH/protection" 2>&1); then
-                              HAS_CHECKS=$(echo "$PROT_JSON" | jq '.required_status_checks != null')
+                              HAS_CHECKS=$(echo "$PROT_JSON" | jq '((.required_status_checks.contexts // []) + (.required_status_checks.checks // []) | length) > 0')
                               if [ "$HAS_CHECKS" = "true" ]; then
                                   echo "OK: classic branch protection on '$DEFAULT_BRANCH' requires status checks."
                               else
