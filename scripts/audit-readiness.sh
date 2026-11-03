@@ -749,12 +749,13 @@ phase_activity() {
 # --- phase 4: classic branch protection, per repo -----------------------------
 #
 # Only reached for repos the bulk sweep leaves undecided. Follows preflight's
-# chain exactly (branches/{b} -> .protected -> branches/{b}/protection ->
-# .required_status_checks != null), not bootstrap's, so the audit's verdict
-# can never contradict the job it exists to predict.
+# chain exactly (branches/{b} -> its .protection summary, or .protected and
+# branches/{b}/protection when there is none -> named checks), not
+# bootstrap's, so the audit's verdict can never contradict the job it exists
+# to predict.
 
 probe_repo() {
-    local repo=$1 node branch enc out
+    local repo=$1 node branch enc out summary
     local checks_status="" checks_detail="" config_status="" config_detail="" manifest_count=""
     local token_status="" token_detail=""
 
@@ -783,9 +784,21 @@ probe_repo() {
             if ! out=$(api_rest "repos/$repo/branches/$enc"); then
                 checks_status=unknown
                 checks_detail="cannot read branch '$branch': $(api_err)"
-            elif [[ $(jq -r '.protected' <<<"$out" 2>/dev/null) != true ]]; then
+            elif [[ $(jq -r 'if (.protection.enabled | type) == "boolean" then .protection.enabled else .protected end' <<<"$out" 2>/dev/null) != true ]]; then
+                # .protected is also true for a ruleset alone; the
+                # .protection summary is classic protection only.
                 checks_status=fail
-                checks_detail="default branch '$branch' is not protected and has no ruleset checks"
+                checks_detail="default branch '$branch' has no classic branch protection and no ruleset checks"
+            elif summary=$(jq -e '.protection | select(.enabled == true)' <<<"$out" 2>/dev/null); then
+                # Classic protection's checks, readable without admin.
+                out=$summary
+                if [[ $(jq -r '.required_status_checks | if ((.contexts // []) + (.checks // []) | length) > 0 then "set" else "none" end' <<<"$out" 2>/dev/null) == set ]]; then
+                    checks_status=pass
+                    checks_detail="classic branch protection requires status checks on '$branch'"
+                else
+                    checks_status=fail
+                    checks_detail="branch '$branch' is protected but requires no status checks"
+                fi
             elif ! out=$(api_rest "repos/$repo/branches/$enc/protection"); then
                 # Admin-only endpoint. Preflight warns and continues here; so do we.
                 checks_status=unknown

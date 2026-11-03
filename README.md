@@ -180,7 +180,7 @@ Your default branch needs a branch protection rule (or ruleset) that names at le
 
 If classic branch protection turns on "Restrict who can push to matching branches", add the GitHub Actions app to that list. The scheduled merge runs as the GitHub Actions app, so GitHub refuses it otherwise. A ruleset with "Restrict updates" needs GitHub Actions on its bypass list for the same reason.
 
-Prefer a **ruleset** (Settings → Rules → Rulesets): the preflight job can fully verify ruleset-based required status checks with the default `GITHUB_TOKEN`. Classic branch protection details are only readable by admin tokens, so with classic protection the preflight can confirm the branch is protected but only warns that it cannot verify the checks themselves. If neither is configured, preflight fails with an error pointing back here. (`scripts/bootstrap.sh` creates a ruleset, so bootstrapped repos are fully verifiable by preflight.)
+Prefer a **ruleset** (Settings → Rules → Rulesets). The preflight job verifies both with the default `GITHUB_TOKEN`: ruleset checks from the branch's rules, and classic protection's checks from the summary the branch endpoint carries. On a host whose branch endpoint has no such summary, classic protection details are only readable by admin tokens, so preflight confirms the branch is protected and warns that it cannot verify the checks. If neither names a check, preflight fails with an error pointing back here. (`scripts/bootstrap.sh` creates a ruleset.)
 
 Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Security**). Gate 1 reads them through the Dependabot alerts API. fetch-metadata's own alert lookup is left off, because it can match a dismissed alert and its match skips the open and applicability checks.
 
@@ -204,7 +204,7 @@ Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Se
 | `unknown` | your token cannot see it |
 | `na` | the repo has no npm or Composer manifest, so the check cannot apply |
 
-**`unknown` is not `fail`.** Several of the settings this audit reads are only visible to a token with write or admin access, and classic branch protection details need admin outright. A repo you cannot fully see is reported `unknown`, never as broken. A repo is `ready` only when nothing failed and nothing is unknown.
+**`unknown` is not `fail`.** Several of the settings this audit reads are only visible to a token with write or admin access. A repo you cannot fully see is reported `unknown`, never as broken. A repo is `ready` only when nothing failed and nothing is unknown.
 
 ### What it checks
 
@@ -383,12 +383,12 @@ The labels are mutually exclusive states, and from v1.6 the workflow enforces th
 Verifies the repo is actually configured for auto-merge before either merge path runs, and fails fast with actionable errors instead of letting `gh pr merge --auto` fail late (or silently never queue). Two checks:
 
 1. **"Allow auto-merge" is enabled** on the repo. Disabled → the job fails with an error pointing at the setting.
-2. **The default branch has required status checks** — ruleset-based checks are verified first; if none, the job falls back to classic branch protection. No ruleset checks and no protection rule → the job fails.
+2. **The default branch has named required status checks** — ruleset-based checks are verified first; if none, the job falls back to classic branch protection. A ruleset or protection rule that turns status checks on but names none does not count. No named check anywhere → the job fails.
 
 Two cases warn and continue instead of failing, because the condition is unverifiable rather than known-bad:
 
 - The token cannot see the "Allow auto-merge" setting (it's only returned to tokens with push access).
-- The branch has classic protection, but the token cannot read its details (the endpoint requires admin — the standard `GITHUB_TOKEN` limitation). Migrating to rulesets makes this fully verifiable.
+- The branch has classic protection, the host's branch endpoint carries no protection summary, and the token cannot read the details (the endpoint requires admin — the standard `GITHUB_TOKEN` limitation). Migrating to rulesets makes this fully verifiable.
 
 A red preflight is intentional: it surfaces a repo where auto-merge could never have worked. It adds roughly 10–20 seconds of runner spin-up per Dependabot event.
 

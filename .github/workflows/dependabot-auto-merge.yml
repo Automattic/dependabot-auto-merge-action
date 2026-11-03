@@ -84,6 +84,7 @@ jobs:
             - name: Point gh at this host
               run: echo "GH_HOST=${GITHUB_SERVER_URL#https://}" >> "$GITHUB_ENV"
             - name: Check auto-merge setting and required status checks
+              id: preflight-checks
               run: |
                   FAIL=0
                   DOCS="$GITHUB_SERVER_URL/Automattic/dependabot-auto-merge-action#usage"
@@ -131,19 +132,25 @@ jobs:
                       echo "OK: default branch '$DEFAULT_BRANCH' has $RULESET_CHECKS ruleset-based required status check(s)."
                   else
                       # No ruleset checks — check classic branch protection.
-                      # .protected is readable without admin; the /protection
-                      # detail endpoint is admin-only, so an error there while
-                      # the branch IS protected means "cannot verify checks",
-                      # not "no checks" → warn and continue.
+                      # .protected is also true when only a ruleset applies,
+                      # so it cannot tell a ruleset that names no check from
+                      # classic protection. The branch's .protection summary
+                      # can, and names classic protection's checks, for any
+                      # token that reads the repo. Without that summary the
+                      # admin-only /protection endpoint is the fallback, and
+                      # an error there while the branch IS protected means
+                      # "cannot verify checks", not "no checks" → warn and
+                      # continue.
                       if BRANCH_JSON=$(gh api "repos/$GITHUB_REPOSITORY/branches/$ENC_BRANCH" 2>&1); then
-                          PROTECTED=$(echo "$BRANCH_JSON" | jq -r '.protected // false')
+                          PROTECTED=$(echo "$BRANCH_JSON" | jq -r 'if (.protection.enabled | type) == "boolean" then .protection.enabled else (.protected // false) end')
                       else
                           echo "::warning::Preflight: could not read default branch info — $(echo "$BRANCH_JSON" | head -c 300 | tr '\n' ' '). Skipping the required status checks verification."
                           PROTECTED="unknown"
                       fi
 
                       if [ "$PROTECTED" = "true" ]; then
-                          if PROT_JSON=$(gh api "repos/$GITHUB_REPOSITORY/branches/$ENC_BRANCH/protection" 2>&1); then
+                          if PROT_JSON=$(echo "$BRANCH_JSON" | jq -e '.protection | select(.enabled == true)' 2>/dev/null) ||
+                              PROT_JSON=$(gh api "repos/$GITHUB_REPOSITORY/branches/$ENC_BRANCH/protection" 2>&1); then
                               HAS_CHECKS=$(echo "$PROT_JSON" | jq '((.required_status_checks.contexts // []) + (.required_status_checks.checks // []) | length) > 0')
                               if [ "$HAS_CHECKS" = "true" ]; then
                                   echo "OK: classic branch protection on '$DEFAULT_BRANCH' requires status checks."
