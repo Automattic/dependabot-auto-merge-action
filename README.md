@@ -423,3 +423,7 @@ Limits of the evidence: any other workflow in your repo that holds `statuses: wr
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
 - The workflow requests no Dependabot alerts permission. The Gate 1 alerts lookup reads them with `secrets.token`.
 - The `token` secret reaches `dependabot/fetch-metadata`, a pinned third-party action, as well as the workflow's own `gh` calls. Scope it to Dependabot alerts and pull requests, read only.
+
+## Development
+
+Development happens on github.a8c.com, where branches, pull requests, reviews and CI run. This repo on github.com is a mirror. Its `main` and tags change only when a release is published, and each release is a copy of the github.a8c.com one. Pull requests opened on github.com are moved to github.a8c.com. [docs/releasing.md](docs/releasing.md) has the release steps.
