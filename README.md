@@ -36,7 +36,7 @@ permissions:
 
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7.1
         permissions:
             pull-requests: write
             contents: write
@@ -52,7 +52,7 @@ jobs:
 Pin to the commit SHA a release tag points at, with the tag in a trailing comment — the same way this repo pins third-party actions. Tags name releases; they are not pinning targets, and none of them float. Resolve the SHA with:
 
 ```bash
-gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.7 --jq .sha
+gh api repos/Automattic/dependabot-auto-merge-action/commits/v1.7.1 --jq .sha
 ```
 
 On GitHub Enterprise Server, set `GH_HOST` first, for example `export GH_HOST=github.a8c.com`. Every `gh` command in this README then talks to that host.
@@ -119,7 +119,7 @@ php bin/dependabot-directories owner/repo
 From v1.6 onward it is also attached to the [release](../../releases) as a single `dependabot-directories.phar`, alongside its `sha256`. That drops the Composer step:
 
 ```bash
-gh release download v1.7 --pattern 'dependabot-directories.phar*'
+gh release download v1.7.1 --pattern 'dependabot-directories.phar*'
 shasum -a 256 -c dependabot-directories.phar.sha256
 chmod +x dependabot-directories.phar
 ./dependabot-directories.phar owner/repo --dry-run
@@ -312,7 +312,7 @@ Create a PAT, or a fine-grained token with **Dependabot alerts: Read** on the ta
 ```yaml
 jobs:
     dependabot-auto-merge:
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.7.1
         permissions:
             pull-requests: write
             contents: write
