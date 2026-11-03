@@ -251,7 +251,7 @@ With `--org`, the audit guesses an owning team for each repository: the smallest
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup, and passed to `dependabot/fetch-metadata`, which also lists the PR's commits. `GITHUB_TOKEN` cannot read Dependabot alerts here, so any repository with indirect dependencies needs it. A fine-grained token needs **Dependabot alerts: Read** and, from v1.7, **Pull requests: Read**. Falls back to `GITHUB_TOKEN` when not passed. |
+| `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup. `GITHUB_TOKEN` cannot read Dependabot alerts here, so any repository with indirect dependencies needs it. A fine-grained token needs **Dependabot alerts: Read** only. Falls back to `GITHUB_TOKEN` when not passed. |
 
 ## Customisation examples
 
@@ -307,7 +307,7 @@ If the lookup succeeds but the later Dependabot alerts API call fails, what happ
 - **PR metadata named no advisory.** The API is the only advisory source, so the Gate 1 fallback step fails the job.
 - **PR metadata named an unscored advisory.** The API call is a best-effort attempt to recover a real score, so a failure only logs a warning and the PR goes to human review, exactly as if the API had never been consulted. The job stays green.
 
-Create a PAT, or a fine-grained token with **Dependabot alerts: Read** and **Pull requests: Read** on the target repo, and pass it as a secret. A token scoped to alerts alone fails the `dependabot/fetch-metadata` step with `Resource not accessible by personal access token` when it lists the PR's commits:
+Create a PAT, or a fine-grained token with **Dependabot alerts: Read** on the target repo, and pass it as a secret. v1.7 also passed the secret to `dependabot/fetch-metadata`, so on a private repo a token scoped to alerts alone failed that step with `Resource not accessible by personal access token` when it listed the PR's commits. From v1.7.1, fetch-metadata uses `GITHUB_TOKEN` and the secret needs alerts access only:
 
 ```yaml
 jobs:
@@ -438,7 +438,7 @@ Limits of the evidence: any other workflow in your repo that holds `statuses: wr
 - The scheduled merge never enables auto-merge, and it refuses a head commit that was not the one evaluated.
 - The `pull_request_target` trigger gives the workflow write access to the base repo; acting on trusted bot authors only is the standard mitigation.
 - The workflow requests no Dependabot alerts permission. The Gate 1 alerts lookup reads them with `secrets.token`.
-- The `token` secret reaches `dependabot/fetch-metadata`, a pinned third-party action, as well as the workflow's own `gh` calls. Scope it to Dependabot alerts and pull requests, read only.
+- The `token` secret reaches only the workflow's own `gh` calls, not `dependabot/fetch-metadata`, which gets `GITHUB_TOKEN`. Scope it to Dependabot alerts, read only.
 
 ## Development
 
