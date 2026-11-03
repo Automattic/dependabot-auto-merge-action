@@ -26,6 +26,18 @@ setup_file() {
     ! grep -q 'security-events' <<<"$block"
 }
 
+# fetch-metadata's alert lookup is off, so it needs the token only to list
+# the PR's commits. GITHUB_TOKEN can, and an alerts-only token cannot on a
+# private repo. Handing it the secret broke every Dependabot run on private
+# repos whose token was scoped to alerts alone.
+@test "fetch-metadata gets GITHUB_TOKEN, never the token secret" {
+    run grep -c 'uses: .*fetch-metadata@' "$WORKFLOW"
+    [ "$output" -eq 2 ]
+    run grep -A4 'uses: .*fetch-metadata@' "$WORKFLOW"
+    [ "$(grep -c 'github-token: \${{ github.token }}$' <<<"$output")" -eq 2 ]
+    ! grep -q 'secrets.token' <<<"$output"
+}
+
 # --- fast-track detection (QAO-765) ---------------------------------------
 
 @test "the fast-track detection runs on every evaluation" {

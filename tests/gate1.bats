@@ -63,14 +63,12 @@ gate1() {
     ! grep -q 'alert-lookup' <<<"$with"
 }
 
-# fetch-metadata should use the same token as the fallback, so a caller who
-# configured `secrets.token` gets one token throughout.
-@test "the metadata step uses the same token as the alerts fallback" {
-    token=$(extract_key meta with | sed -n 's/^github-token: //p')
-    fallback_token=$(extract_key gate1-fallback env | sed -n 's/^GH_TOKEN: //p')
-    [ -n "$token" ]
-    [ "$token" = "$fallback_token" ]
-    grep -qF 'secrets.token' <<<"$token"
+# The alerts fallback is the only reader of Dependabot alerts, so it is the
+# step that needs the token secret. fetch-metadata gets GITHUB_TOKEN, which
+# tests/wiring.bats checks.
+@test "the alerts fallback reads alerts with the token secret" {
+    token=$(extract_key gate1-fallback env | sed -n 's/^GH_TOKEN: //p')
+    [ "$token" = '${{ secrets.token || github.token }}' ]
 }
 
 # Steps cannot share functions and callers never check this repo out, so the

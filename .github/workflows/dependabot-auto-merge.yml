@@ -4,7 +4,7 @@ on:
     workflow_call:
         secrets:
             token:
-                description: 'Token that can read Dependabot alerts, used by the Gate 1 alerts lookup and passed to dependabot/fetch-metadata, which lists the PR commits. GITHUB_TOKEN cannot read Dependabot alerts here, so any repository with indirect dependencies needs this secret. A fine-grained token needs Dependabot alerts read and Pull requests read. Falls back to GITHUB_TOKEN when not passed.'
+                description: 'Token that can read Dependabot alerts, used by the Gate 1 alerts lookup. GITHUB_TOKEN cannot read Dependabot alerts here, so any repository with indirect dependencies needs this secret. A fine-grained token needs Dependabot alerts read only. Falls back to GITHUB_TOKEN when not passed.'
                 required: false
         inputs:
             event-name:
@@ -176,6 +176,11 @@ jobs:
     # since fetch-metadata treats any non-empty value as on. Gate 1 reads
     # Dependabot alerts only through the fallback in evaluate-pr, which checks
     # that an alert is open and applies to the update.
+    #
+    # With the alert lookup off, fetch-metadata only lists the PR's commits,
+    # which GITHUB_TOKEN can do. The token secret stays with the alerts
+    # lookup, so a token scoped to Dependabot alerts alone is enough. On a
+    # private repo such a token cannot list a PR's commits.
     metadata:
         name: Fetch Dependabot metadata
         runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || '["ubuntu-latest"]') }}
@@ -191,7 +196,7 @@ jobs:
               id: meta
               with:
                   compat-lookup: true
-                  github-token: ${{ secrets.token || github.token }}
+                  github-token: ${{ github.token }}
 
     metadata-ghes:
         name: Fetch Dependabot metadata
@@ -208,7 +213,7 @@ jobs:
               id: meta
               with:
                   compat-lookup: true
-                  github-token: ${{ secrets.token || github.token }}
+                  github-token: ${{ github.token }}
                   # Dependabot's commits on GitHub Enterprise Server do not
                   # carry the signature fetch-metadata checks for on
                   # github.com.
