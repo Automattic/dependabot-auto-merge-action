@@ -238,6 +238,11 @@ repo_fields() {
         requiresStatusChecks
         requiredStatusCheckContexts
         requiredApprovingReviewCount
+        restrictsPushes
+        pushAllowances(first: 100) {
+          totalCount
+          nodes { actor { __typename ... on App { slug } } }
+        }
       }
       rules(first: 25) {
         totalCount
@@ -785,7 +790,7 @@ probe_repo() {
                 # Admin-only endpoint. Preflight warns and continues here; so do we.
                 checks_status=unknown
                 checks_detail="branch '$branch' is protected but its protection details need an admin token"
-            elif [[ $(jq -r '.required_status_checks | if . == null then "null" else "set" end' <<<"$out" 2>/dev/null) == set ]]; then
+            elif [[ $(jq -r '.required_status_checks | if ((.contexts // []) + (.checks // []) | length) > 0 then "set" else "none" end' <<<"$out" 2>/dev/null) == set ]]; then
                 checks_status=pass
                 checks_detail="classic branch protection requires status checks on '$branch'"
             else
@@ -1002,10 +1007,11 @@ assemble() {
         def label_entry($set; $want):
             (($set.nodes // []) | map(select((.name | ascii_downcase) == ($want | ascii_downcase))) | first);
 
-        # Merge method the repo must allow for the configured --merge-method.
-        def merge_allowed($n):
-            if   $merge_method == "squash" then $n.squashMergeAllowed
-            elif $merge_method == "merge"  then $n.mergeCommitAllowed
+        # Merge method the repo must allow. An adopted caller says which one
+        # the workflow will use; --merge-method plans the rest.
+        def merge_allowed($n; $method):
+            if   $method == "squash" then $n.squashMergeAllowed
+            elif $method == "merge"  then $n.mergeCommitAllowed
             else $n.rebaseMergeAllowed end;
 
         def manifests($n):
@@ -1030,6 +1036,15 @@ assemble() {
                 (caller_shape($t)) as $shape
                 | ($t | capture("dependabot-auto-merge\\.yml@(?<ref>[0-9A-Za-z._-]+)") // {}) as $m
                 | ($t | capture("dependabot-auto-merge\\.yml@[0-9A-Za-z._-]+\\s*#\\s*(?<v>[A-Za-z0-9._-]+)") // {}) as $vc
+                | ($t | capture("(^|\\n)\\s*merge-method\\s*:\\s*[^a-z\\s]?(?<mm>[a-z]+)") // {}) as $mm
+                # Both the workflow-level and job-level blocks must carry
+                # every permission, so each must appear at least twice. The
+                # workflow has not requested security-events since v1.7, so a
+                # caller may keep or drop it.
+                | (["pull-requests: write", "contents: write", "statuses: write"]
+                   | map(select(. as $p
+                                | ($p | sub(": "; "\\s*:\\s*")) as $re
+                                | [$t | match($re; "g")] | length < 2))) as $missing_perms
                 | {
                     present: true,
                     shape: $shape,
@@ -1042,14 +1057,11 @@ assemble() {
                       schedule: ($t | test("(^|\\n)\\s*schedule\\s*:")),
                       has_labeled: ($t | test("types\\s*:\\s*\\[[^\\]]*labeled"))
                     },
+                    # The workflow defaults to squash when the caller passes none.
+                    merge_method: ($mm.mm // "squash"),
                     permissions: {
-                      # Both the workflow-level and job-level blocks must carry
-                      # every permission, so each must appear at least twice.
-                      complete: (
-                        ([$t | match("pull-requests\\s*:\\s*write"; "g")] | length >= 2) and
-                        ([$t | match("contents\\s*:\\s*write"; "g")] | length >= 2) and
-                        ([$t | match("security-events\\s*:\\s*read"; "g")] | length >= 2)
-                      )
+                      complete: ($missing_perms | length == 0),
+                      missing: $missing_perms
                     }
                   }
               end;
@@ -1076,8 +1088,11 @@ assemble() {
           | ($manifest or $any_config) as $applicable
           | (($n.defaultBranchRef.rules.nodes // [])
               | map(select(.type == "REQUIRED_STATUS_CHECKS"))) as $rsc
+          | ($rsc | map(.parameters.requiredStatusChecks // [] | .[].context)) as $rsc_ctx
           | ($n.defaultBranchRef.branchProtectionRule) as $bpr
           | narrow_for($repo) as $nr
+          | caller_info($n) as $caller
+          | (if $caller.present then $caller.merge_method else $merge_method end) as $method
 
           # GitHub creates a private repo per security advisory when a
           # temporary private fork is opened, named <repo>-ghsa-xxxx-xxxx-xxxx.
@@ -1119,16 +1134,24 @@ assemble() {
                   end),
 
                 required_checks: (
-                  if ($rsc | length) > 0 then
+                  # A rule that names no check holds nothing back, so it
+                  # counts as none, as it does for bootstrap.sh and preflight.
+                  (if $bpr.requiresStatusChecks == true then ($bpr.requiredStatusCheckContexts // []) else [] end) as $bpr_ctx
+                  | if ($rsc_ctx | length) > 0 then
                     ($rsc | first) as $r
-                    | ($r.parameters.requiredStatusChecks // []) as $ctx
                     | check("pass";
-                        "ruleset \($r.repositoryRuleset.name // "?") requires \($ctx | length) check(s)";
+                        "ruleset \($r.repositoryRuleset.name // "?") requires \($rsc_ctx | length) check(s)";
                         "graphql")
-                      + {contexts: ($ctx | map(.context)), path: "ruleset"}
-                  elif ($bpr != null and $bpr.requiresStatusChecks == true) then
-                    check("pass"; "classic branch protection requires status checks"; "graphql")
-                      + {contexts: ($bpr.requiredStatusCheckContexts // []), path: "classic"}
+                      + {contexts: ($rsc_ctx + $bpr_ctx | unique), path: "ruleset"}
+                  elif ($bpr_ctx | length) > 0 then
+                    check("pass"; "classic branch protection requires \($bpr_ctx | length) check(s)"; "graphql")
+                      + {contexts: $bpr_ctx, path: "classic"}
+                  elif ($rsc | length) > 0 or $bpr.requiresStatusChecks == true then
+                    check("fail"; "required status checks are turned on for \($n.defaultBranchRef.name) but name no check, so nothing holds a merge back"; "graphql")
+                      + {contexts: [], path: (if ($rsc | length) > 0 then "ruleset" else "classic" end)}
+                  elif $bpr != null then
+                    check("fail"; "classic branch protection on \($n.defaultBranchRef.name) does not require status checks"; "graphql")
+                      + {contexts: [], path: "classic"}
                   elif ($nr.required_checks != null) then
                     check($nr.required_checks.status; $nr.required_checks.detail; "rest") + {path: "classic"}
                   elif ($n.defaultBranchRef == null) then
@@ -1175,7 +1198,7 @@ assemble() {
                   end),
 
                 caller_workflow: (
-                  caller_info($n) as $c
+                  $caller as $c
                   | if ($c.present | not) then
                       check("na"; "not adopted yet; this is the step the audit exists to plan"; "graphql")
                     elif ($c.shape != "recognized") then
@@ -1185,7 +1208,7 @@ assemble() {
                          (if ($c.triggers.pull_request_target | not) then "no pull_request_target trigger" else empty end),
                          (if ($c.triggers.schedule | not) then "no schedule trigger, so the age gate never fires" else empty end),
                          (if ($c.triggers.has_labeled | not) then "types: is missing `labeled`, so fast-track cannot work" else empty end),
-                         (if ($c.permissions.complete | not) then "permissions incomplete in the workflow-level or job-level block" else empty end)
+                         (if ($c.permissions.complete | not) then "\($c.permissions.missing | join(", ")) missing from the workflow-level or job-level permissions block" else empty end)
                        ]) as $problems
                       | if ($problems | length) == 0 then
                           check("pass"; "pinned \($c.ref) \(if $c.version_comment then "(# \($c.version_comment))" else "" end)"; "graphql")
@@ -1202,17 +1225,32 @@ assemble() {
                       + {secret: $nr.alerts_token.secret}
                   end),
 
-                merge_method: (
-                  if (merge_allowed($n) == null) then
+                merge_method: ((
+                  if (merge_allowed($n; $method) == null) then
                     check("unknown"; "your token cannot see the merge settings"; "graphql_error")
-                  elif merge_allowed($n) then
-                    check("pass"; "\($merge_method) merging is allowed"; "graphql")
+                  elif merge_allowed($n; $method) then
+                    check("pass"; "the repo allows `gh pr merge --\($method)`"; "graphql")
                   else
-                    check("fail"; "\($merge_method) merging is disabled, so `gh pr merge --auto --\($merge_method)` will fail"; "graphql")
+                    check("fail"; "the repo does not allow `gh pr merge --\($method)`, so the scheduled merge will fail"; "graphql")
+                  end)
+                  + {method: $method}),
+
+                # The scheduled merge pushes to the default branch as the
+                # GitHub Actions app. "Restrict who can push" refuses it
+                # unless that app is on the list.
+                push_restrictions: (
+                  if ($bpr == null) or ($bpr.restrictsPushes != true) then
+                    check("pass"; "no classic branch protection rule restricts who can push"; "graphql")
+                  elif ($bpr.pushAllowances.nodes // [] | any(.actor.__typename == "App" and .actor.slug == "github-actions")) then
+                    check("pass"; "pushes are restricted, and the GitHub Actions app is allowed"; "graphql")
+                  elif (($bpr.pushAllowances.totalCount // 0) > ($bpr.pushAllowances.nodes // [] | length)) then
+                    check("unknown"; "pushes are restricted and only part of the allow list was read; check that the GitHub Actions app is on it"; "graphql")
+                  else
+                    check("fail"; "classic branch protection restricts who can push to \($n.defaultBranchRef.name) and the GitHub Actions app is not allowed, so GitHub will refuse the scheduled merge (Settings > Branches > Restrict who can push)"; "graphql")
                   end)
               },
 
-              caller: caller_info($n),
+              caller: $caller,
 
               risks: ([
                 ($rsc | first | select(. != null) | select(.parameters.strictRequiredStatusChecksPolicy == true)
@@ -1224,6 +1262,12 @@ assemble() {
                 ($rsc | first | select(. != null) | select(.repositoryRuleset.enforcement != null and .repositoryRuleset.enforcement != "ACTIVE")
                   | {id: "ruleset_not_active", severity: "high",
                      detail: "ruleset \(.repositoryRuleset.name // "?") is in \(.repositoryRuleset.enforcement) mode and enforces nothing"}),
+                # Bypass lists need an admin token to read, so this stays a
+                # risk to check by hand rather than a verdict.
+                (($n.defaultBranchRef.rules.nodes // [])[]
+                  | select(.type == "UPDATE")
+                  | {id: "update_restricted", severity: "high",
+                     detail: "ruleset \(.repositoryRuleset.name // "?") restricts updates to the default branch; the scheduled merge is refused unless GitHub Actions can bypass it"}),
                 (($n.defaultBranchRef.rules.nodes // [])[]
                   | select(.type == "PULL_REQUEST")
                   | select((.parameters.requiredApprovingReviewCount // 0) > 0)
