@@ -252,8 +252,8 @@ With `--org`, the audit guesses an owning team for each repository: the smallest
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `app-client-id` | No | Client ID of a GitHub App with **Dependabot alerts: Read**. With `app-private-key`, the Gate 1 alerts lookup mints a token from the App, scoped to the calling repository, and uses it ahead of `token`. Pass it from a Dependabot secret. From v1.8. |
-| `app-private-key` | No | Private key of that App. Pass it from a Dependabot secret. From v1.8. |
+| `app-client-id` | No | Client ID of a GitHub App with **Dependabot alerts: Read**. With `app-private-key`, the Gate 1 alerts lookup mints a token from the App, scoped to the calling repository, and uses it ahead of `token`. Pass it from an Actions secret. From v1.8. |
+| `app-private-key` | No | Private key of that App. Pass it from an Actions secret. From v1.8. |
 | `token` | No | Token used to read Dependabot alerts, by the Gate 1 alerts lookup, when no App is passed. `GITHUB_TOKEN` cannot read Dependabot alerts here, so any repository with indirect dependencies needs the App or this secret. A fine-grained token needs **Dependabot alerts: Read** only. Falls back to `GITHUB_TOKEN` when not passed. |
 
 ## Customisation examples
@@ -316,7 +316,7 @@ The caller in [step 1](#1-create-the-caller-workflow-in-your-repo) passes an App
 
 1. Create a GitHub App owned by the organisation, with one repository permission, **Dependabot alerts: Read**, and no webhook.
 2. Install it on the organisation, on all repositories or on the ones that call this workflow.
-3. Store its client ID as `DEPENDABOT_APP_CLIENT_ID` and a private key as `DEPENDABOT_APP_PRIVATE_KEY`, as organisation **Dependabot** secrets. A run that Dependabot triggers can read only Dependabot secrets, so the same values stored as Actions secrets reach the workflow empty, and it falls back to `token` or `GITHUB_TOKEN`.
+3. Store its client ID as `DEPENDABOT_APP_CLIENT_ID` and a private key as `DEPENDABOT_APP_PRIVATE_KEY`, as organisation **Actions** secrets. The caller runs on `pull_request_target`, which reads Actions secrets even when Dependabot triggers it. The same values stored only as Dependabot secrets reach the workflow empty, and it falls back to `token` or `GITHUB_TOKEN`.
 
 When both secrets are passed and the token cannot be minted, for example because the App is not installed on the repository, the job fails at the minting step with the action's error. It does not fall back to `token`.
 
@@ -344,7 +344,7 @@ Store it as a repository or organisation secret named `DEPENDABOT_ALERTS_TOKEN` 
 
 `scripts/audit-readiness.sh` reads the secrets the job that calls this workflow passes.
 
-- **App secrets.** Each one must exist as a Dependabot secret, in the repository or in the organisation with a visibility that reaches the repository. Listing the organisation's Dependabot secrets needs organisation admin, and GitHub has no endpoint for the ones shared with a single repository, so without that access the check reports `unknown`. A caller that passes only one of the two fails.
+- **App secrets.** Each one must exist as an Actions secret, at repo or organisation level. A caller that passes only one of the two fails.
 - **Token.** It confirms an Actions secret by that name exists, at repo or organisation level.
 - **Neither.** The check fails, because the workflow then falls back to `GITHUB_TOKEN`.
 

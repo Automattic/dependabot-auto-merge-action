@@ -4,10 +4,10 @@ on:
     workflow_call:
         secrets:
             app-client-id:
-                description: 'Client ID of a GitHub App with Dependabot alerts read. With app-private-key, the Gate 1 alerts lookup mints a token from the App, scoped to this repository, and uses it ahead of token. Pass it from a Dependabot secret: Dependabot-triggered runs cannot read Actions secrets.'
+                description: 'Client ID of a GitHub App with Dependabot alerts read. With app-private-key, the Gate 1 alerts lookup mints a token from the App, scoped to this repository, and uses it ahead of token. Pass it from an Actions secret. The caller runs on pull_request_target, which reads Actions secrets even when Dependabot triggers it.'
                 required: false
             app-private-key:
-                description: 'Private key of the GitHub App named by app-client-id. Pass it from a Dependabot secret.'
+                description: 'Private key of the GitHub App named by app-client-id. Pass it from an Actions secret.'
                 required: false
             token:
                 description: 'Token that can read Dependabot alerts, used by the Gate 1 alerts lookup when no App is passed. GITHUB_TOKEN cannot read Dependabot alerts here, so any repository with indirect dependencies needs the App or this secret. A fine-grained token needs Dependabot alerts read only. Falls back to GITHUB_TOKEN when not passed.'

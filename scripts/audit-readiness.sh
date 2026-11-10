@@ -458,51 +458,27 @@ secret_listed() { jq -e --arg n "$1" '(.secrets // []) | any(.name == $n)' >/dev
 # Whether the secrets list on stdin is one page of a longer list.
 secret_list_partial() { jq -e '(.total_count // 0) > ((.secrets // []) | length)' >/dev/null 2>&1; }
 
-# Whether the Dependabot secret $2 reaches repository $1, whose privacy is
-# $3 (true, false or empty when unknown). Prints status<TAB>detail. Only
-# Dependabot secrets count: a Dependabot-triggered run cannot read Actions
-# secrets. GitHub has no endpoint listing the organisation's Dependabot
-# secrets shared with one repository, so the organisation list is read and
-# the secret's visibility decides. That list needs organisation admin, and
-# without it the answer is unknown, not fail.
-dependabot_secret_status() {
-    local repo=$1 name=$2 private=$3 owner=${1%%/*} list org_list visibility shared
-    if ! list=$(api_rest "repos/$repo/dependabot/secrets?per_page=100"); then
-        printf 'unknown\t%s' "cannot list the repository's Dependabot secrets (needs admin); could not confirm '$name'"
+# Whether the Actions secret $2 reaches repository $1, as a repository
+# secret or an organisation secret shared with it. Prints status<TAB>detail.
+# The caller runs on pull_request_target, which reads Actions secrets even
+# when Dependabot triggers it. Listing repository secrets needs admin, and
+# not knowing is unknown, not fail.
+actions_secret_status() {
+    local repo=$1 name=$2 list org_list
+    if ! list=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
+        printf 'unknown\t%s' "cannot list repository secrets (needs admin); could not confirm '$name'"
     elif secret_listed "$name" <<<"$list"; then
-        printf 'pass\t%s' "Dependabot secret '$name' exists"
+        printf 'pass\t%s' "secret '$name' exists"
     elif secret_list_partial <<<"$list"; then
-        printf 'unknown\t%s' "the repository has more than 100 Dependabot secrets and only the first 100 were read; could not confirm '$name'"
-    elif ! org_list=$(api_rest "orgs/$owner/dependabot/secrets?per_page=100"); then
-        printf 'unknown\t%s' "no repository Dependabot secret named '$name', and cannot list the organisation's Dependabot secrets (needs organisation admin); could not confirm one"
+        printf 'unknown\t%s' "the repository has more than 100 secrets and only the first 100 were read; could not confirm '$name'"
+    elif ! org_list=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100"); then
+        printf 'unknown\t%s' "no repository secret named '$name', and cannot list the organisation secrets shared with it; could not confirm one"
+    elif secret_listed "$name" <<<"$org_list"; then
+        printf 'pass\t%s' "organisation secret '$name' is shared with this repository"
+    elif secret_list_partial <<<"$org_list"; then
+        printf 'unknown\t%s' "more than 100 organisation secrets are shared with this repository and only the first 100 were read; could not confirm '$name'"
     else
-        visibility=$(jq -r --arg n "$name" '[(.secrets // [])[] | select(.name == $n) | .visibility][0] // empty' <<<"$org_list" 2>/dev/null)
-        case $visibility:$private in
-            all:*)
-                printf 'pass\t%s' "organisation Dependabot secret '$name' is visible to all repositories" ;;
-            private:true)
-                printf 'pass\t%s' "organisation Dependabot secret '$name' is visible to private and internal repositories" ;;
-            private:false)
-                printf 'fail\t%s' "organisation Dependabot secret '$name' is visible to private and internal repositories only, and this one is public" ;;
-            private:*)
-                printf 'unknown\t%s' "organisation Dependabot secret '$name' is visible to private and internal repositories only, and this repository's visibility is unknown" ;;
-            selected:*)
-                if ! shared=$(api_rest "orgs/$owner/dependabot/secrets/$name/repositories?per_page=100"); then
-                    printf 'unknown\t%s' "organisation Dependabot secret '$name' is shared with selected repositories, and that list cannot be read"
-                elif jq -e --arg r "$repo" '(.repositories // []) | any(.full_name == $r)' >/dev/null 2>&1 <<<"$shared"; then
-                    printf 'pass\t%s' "organisation Dependabot secret '$name' is shared with this repository"
-                elif jq -e '(.total_count // 0) > ((.repositories // []) | length)' >/dev/null 2>&1 <<<"$shared"; then
-                    printf 'unknown\t%s' "organisation Dependabot secret '$name' is shared with more than 100 repositories and only the first 100 were read"
-                else
-                    printf 'fail\t%s' "organisation Dependabot secret '$name' is not shared with this repository"
-                fi ;;
-            *)
-                if secret_list_partial <<<"$org_list"; then
-                    printf 'unknown\t%s' "the organisation has more than 100 Dependabot secrets and only the first 100 were read; could not confirm '$name'"
-                else
-                    printf 'fail\t%s' "no Dependabot secret named '$name' in the repository or the organisation"
-                fi ;;
-        esac
+        printf 'fail\t%s' "no secret named '$name'"
     fi
 }
 
@@ -929,11 +905,10 @@ probe_repo() {
     # GITHUB_TOKEN cannot read the Dependabot alerts API under any
     # configuration, so a repo without a credential loses every
     # indirect-dependency security PR. A caller passes either a GitHub App
-    # (app-client-id and app-private-key, which must be Dependabot secrets) or
-    # a token. Secret *values* are never readable; names are, which is enough
+    # (app-client-id and app-private-key) or a token, both as Actions secrets. Secret *values* are never readable; names are, which is enough
     # to tell "wired" from "not wired".
-    local want_secret repo_secrets org_secrets caller_text app_id="" app_key=""
-    local id_result key_result id_status key_status private
+    local want_secret caller_text app_id="" app_key="" result
+    local id_result key_result id_status key_status
     caller_text=$(jq -r '.caller.text // empty' <<<"$node" 2>/dev/null)
     if [[ -n $caller_text ]]; then
         want_secret=$(caller_secret token <<<"$caller_text")
@@ -950,10 +925,8 @@ probe_repo() {
         # The workflow mints from the App ahead of any token, so the token
         # does not matter here.
         want_secret="$app_id,$app_key"
-        # Not `// empty`: that drops a false isPrivate too.
-        private=$(jq -r 'if .isPrivate == null then "" else .isPrivate end' <<<"$node" 2>/dev/null)
-        id_result=$(dependabot_secret_status "$repo" "$app_id" "$private")
-        key_result=$(dependabot_secret_status "$repo" "$app_key" "$private")
+        id_result=$(actions_secret_status "$repo" "$app_id")
+        key_result=$(actions_secret_status "$repo" "$app_key")
         id_status=${id_result%%$'\t'*}
         key_status=${key_result%%$'\t'*}
         if [[ $id_status == fail ]]; then
@@ -970,7 +943,7 @@ probe_repo() {
             token_detail=${key_result#*$'\t'}
         else
             token_status=pass
-            token_detail="GitHub App secrets '$app_id' and '$app_key' reach this repository as Dependabot secrets"
+            token_detail="GitHub App secrets '$app_id' and '$app_key' reach this repository"
         fi
     elif [[ -n $app_id || -n $app_key ]]; then
         # One App secret alone mints nothing, and the workflow falls back to
@@ -988,30 +961,13 @@ probe_repo() {
     elif [[ -z $want_secret ]]; then
         token_status=fail
         token_detail="the caller passes no GitHub App or token secret, so the workflow falls back to GITHUB_TOKEN, which cannot read the Dependabot alerts API"
-    elif ! repo_secrets=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
-        # Listing repository secrets needs admin. Not knowing is not a failure.
-        token_status=unknown
-        token_detail="cannot list repository secrets (needs admin); could not confirm '$want_secret'"
-    elif secret_listed "$want_secret" <<<"$repo_secrets"; then
-        token_status=pass
-        token_detail="secret '$want_secret' exists"
-    elif secret_list_partial <<<"$repo_secrets"; then
-        token_status=unknown
-        token_detail="the repository has more than 100 secrets and only the first 100 were read; could not confirm '$want_secret'"
-    elif ! org_secrets=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100"); then
-        # The secret may be shared from the organisation. Without that list
-        # its absence is not known, so this is not a failure either.
-        token_status=unknown
-        token_detail="no repository secret named '$want_secret', and cannot list the organisation secrets shared with it; could not confirm one"
-    elif secret_listed "$want_secret" <<<"$org_secrets"; then
-        token_status=pass
-        token_detail="organisation secret '$want_secret' is shared with this repository"
-    elif secret_list_partial <<<"$org_secrets"; then
-        token_status=unknown
-        token_detail="more than 100 organisation secrets are shared with this repository and only the first 100 were read; could not confirm '$want_secret'"
     else
-        token_status=fail
-        token_detail="no secret named '$want_secret'; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
+        result=$(actions_secret_status "$repo" "$want_secret")
+        token_status=${result%%$'\t'*}
+        token_detail=${result#*$'\t'}
+        if [[ $token_status == fail ]]; then
+            token_detail="$token_detail; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
+        fi
     fi
 
     jq -cn --arg r "$repo" \
