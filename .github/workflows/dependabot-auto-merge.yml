@@ -179,73 +179,13 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
                   GH_ENTERPRISE_TOKEN: ${{ github.token }}
 
-    # Reads the Dependabot metadata for evaluate-pr. github.a8c.com allows only
-    # actions mirrored into its third-party-actions org, and a runner fetches
-    # every action in a job before the first step, so a step-level `if:`
-    # cannot choose between the two. Each host gets its own job instead, and
-    # only one of them runs. Both pin the same fetch-metadata commit.
-    #
-    # The compatibility lookup is opt-in. Without it every score reads 0 and
-    # Gate 3 never sees a real one. The alert lookup stays off by omission,
-    # since fetch-metadata treats any non-empty value as on. Gate 1 reads
-    # Dependabot alerts only through the fallback in evaluate-pr, which checks
-    # that an alert is open and applies to the update.
-    #
-    # With the alert lookup off, fetch-metadata only lists the PR's commits,
-    # which GITHUB_TOKEN can do. The token secret stays with the alerts
-    # lookup, so a token scoped to Dependabot alerts alone is enough. On a
-    # private repo such a token cannot list a PR's commits.
-    metadata:
-        name: Fetch Dependabot metadata
-        runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || '["ubuntu-latest"]') }}
-        needs: preflight
-        if: github.server_url == 'https://github.com' && inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
-        outputs:
-            ghsa-id: ${{ steps.meta.outputs.ghsa-id }}
-            cvss: ${{ steps.meta.outputs.cvss }}
-            dependency-type: ${{ steps.meta.outputs.dependency-type }}
-            updated-dependencies-json: ${{ steps.meta.outputs.updated-dependencies-json }}
-        steps:
-            - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
-              id: meta
-              with:
-                  compat-lookup: true
-                  github-token: ${{ github.token }}
-
-    metadata-ghes:
-        name: Fetch Dependabot metadata
-        runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || '["self-hosted","secex","gha-runner-2cpu-4gb"]') }}
-        needs: preflight
-        if: github.server_url != 'https://github.com' && inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
-        outputs:
-            ghsa-id: ${{ steps.meta.outputs.ghsa-id }}
-            cvss: ${{ steps.meta.outputs.cvss }}
-            dependency-type: ${{ steps.meta.outputs.dependency-type }}
-            updated-dependencies-json: ${{ steps.meta.outputs.updated-dependencies-json }}
-        steps:
-            - uses: third-party-actions/dependabot-fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
-              id: meta
-              with:
-                  compat-lookup: true
-                  github-token: ${{ github.token }}
-                  # Dependabot's commits on GitHub Enterprise Server do not
-                  # carry the signature fetch-metadata checks for on
-                  # github.com.
-                  skip-commit-verification: true
-
     # Runs on every Dependabot PR event. Checks eligibility gates and labels
     # the PR accordingly. The age gate is handled by the scheduled job below.
     evaluate-pr:
         name: Evaluate security PR eligibility
         runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || (github.server_url == 'https://github.com' && '["ubuntu-latest"]' || '["self-hosted","secex","gha-runner-2cpu-4gb"]')) }}
-        needs: [preflight, metadata, metadata-ghes]
-        # One metadata job is always skipped, and a skipped need skips this
-        # job unless the condition says otherwise.
-        if: |
-            !failure() && !cancelled() &&
-            needs.preflight.result == 'success' &&
-            (needs.metadata.result == 'success' || needs.metadata-ghes.result == 'success') &&
-            inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
+        needs: preflight
+        if: inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
         # One evaluation per PR at a time. record-eligibility reads the
         # existing statuses before it writes, so two runs at the same head
         # could interleave and leave a success that the later verdict should
@@ -266,25 +206,72 @@ jobs:
             - name: Point gh at this host
               run: echo "GH_HOST=${GITHUB_SERVER_URL#https://}" >> "$GITHUB_ENV"
 
-            # Re-expose whichever metadata job ran as steps.meta, so the gates
-            # below read it the same way on both hosts.
-            - name: Collect Dependabot metadata
-              id: meta
+            # Reads the Dependabot metadata. github.a8c.com allows only
+            # actions mirrored into its third-party-actions org, and it
+            # refuses to start a run whose files name any other action, even
+            # in a job or a called workflow that would be skipped. So the
+            # action path is not written in a `uses:` line. This step picks
+            # it for the host and writes a one-step local action that the
+            # next step runs. Only the path comes from the expression, and
+            # this job never checks out PR code, so nothing from the PR
+            # reaches the file. Both hosts pin the same fetch-metadata commit.
+            - name: Choose fetch-metadata for this host
+              id: meta-action
+              # Explicit so the step runs under `-e -o pipefail` and the bats
+              # suite can drive the extracted script with exactly these flags.
+              shell: bash
               env:
-                  GHSA_ID: ${{ needs.metadata.outputs.ghsa-id || needs.metadata-ghes.outputs.ghsa-id }}
-                  CVSS: ${{ needs.metadata.outputs.cvss || needs.metadata-ghes.outputs.cvss }}
-                  DEPENDENCY_TYPE: ${{ needs.metadata.outputs.dependency-type || needs.metadata-ghes.outputs.dependency-type }}
-                  UPDATED_DEPENDENCIES_JSON: ${{ needs.metadata.outputs.updated-dependencies-json || needs.metadata-ghes.outputs.updated-dependencies-json }}
+                  ACTION_REF: ${{ github.server_url == 'https://github.com' && 'dependabot/fetch-metadata' || 'third-party-actions/dependabot-fetch-metadata' }}
+                  ACTION_SHA: 25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
               run: |
+                  dir="$GITHUB_WORKSPACE/.dependabot-auto-merge/fetch-metadata"
+                  mkdir -p "$dir"
+                  # The runner would expand a literal dollar-brace-brace in
+                  # this script, so the generated file's expressions are
+                  # spelled through $e.
+                  e='$'
                   {
-                      echo "ghsa-id=$GHSA_ID"
-                      echo "cvss=$CVSS"
-                      echo "dependency-type=$DEPENDENCY_TYPE"
-                      DELIM="EOF_$(openssl rand -hex 8)"
-                      echo "updated-dependencies-json<<$DELIM"
-                      printf '%s\n' "$UPDATED_DEPENDENCIES_JSON"
-                      echo "$DELIM"
-                  } >> "$GITHUB_OUTPUT"
+                      echo "name: fetch-metadata"
+                      echo "inputs:"
+                      echo "    github-token:"
+                      echo "        required: true"
+                      echo "    skip-commit-verification:"
+                      echo "        required: true"
+                      echo "outputs:"
+                      for out in ghsa-id cvss dependency-type updated-dependencies-json; do
+                          echo "    $out:"
+                          echo "        value: ${e}{{ steps.meta.outputs.$out }}"
+                      done
+                      echo "runs:"
+                      echo "    using: composite"
+                      echo "    steps:"
+                      echo "        - uses: $ACTION_REF@$ACTION_SHA"
+                      echo "          id: meta"
+                      echo "          with:"
+                      echo "              compat-lookup: true"
+                      echo "              github-token: ${e}{{ inputs.github-token }}"
+                      echo "              skip-commit-verification: ${e}{{ inputs.skip-commit-verification }}"
+                  } > "$dir/action.yml"
+
+            # The compatibility lookup is opt-in. Without it every score reads
+            # 0 and Gate 3 never sees a real one. The alert lookup stays off
+            # by omission, since fetch-metadata treats any non-empty value as
+            # on. Gate 1 reads Dependabot alerts only through the fallback
+            # below, which checks that an alert is open and applies to the
+            # update.
+            #
+            # With the alert lookup off, fetch-metadata only lists the PR's
+            # commits, which GITHUB_TOKEN can do. The token secret stays with
+            # the alerts lookup, so a token scoped to Dependabot alerts alone
+            # is enough. On a private repo such a token cannot list a PR's
+            # commits. Dependabot's commits on GitHub Enterprise Server do not
+            # carry the signature fetch-metadata checks for on github.com.
+            - name: Fetch Dependabot metadata
+              id: meta
+              uses: ./.dependabot-auto-merge/fetch-metadata
+              with:
+                  github-token: ${{ github.token }}
+                  skip-commit-verification: ${{ github.server_url != 'https://github.com' }}
 
             # A person who can merge fast-tracks a PR with GitHub's own
             # "Enable auto-merge" button. GitHub checks their permission and

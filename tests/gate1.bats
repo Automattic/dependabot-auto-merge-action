@@ -57,10 +57,14 @@ gate1() {
 # lookup stays off: fetch-metadata only checks that the value is non-empty,
 # so even `false` would turn it on, and the lookup can pass Gate 1 on a
 # dismissed alert. The alerts fallback checks that an alert is open.
+# The inputs live in the local action that the meta-action step writes.
 @test "the metadata step enables the compatibility lookup and leaves the alert lookup off" {
-    with=$(extract_key meta with)
-    grep -qxF 'compat-lookup: true' <<<"$with"
-    ! grep -q 'alert-lookup' <<<"$with"
+    GITHUB_WORKSPACE="$BATS_TEST_TMPDIR" ACTION_REF=dependabot/fetch-metadata ACTION_SHA=0 \
+        bash -e -o pipefail <(extract_run meta-action)
+    action=$(cat "$BATS_TEST_TMPDIR/.dependabot-auto-merge/fetch-metadata/action.yml")
+    grep -qxF '              compat-lookup: true' <<<"$action"
+    ! grep -q 'alert-lookup' <<<"$action"
+    ! grep -q 'alert-lookup' <<<"$(extract_key meta with)"
 }
 
 # The alerts fallback is the only reader of Dependabot alerts, so it is the

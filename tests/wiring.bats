@@ -31,11 +31,76 @@ setup_file() {
 # private repo. Handing it the secret broke every Dependabot run on private
 # repos whose token was scoped to alerts alone.
 @test "fetch-metadata gets GITHUB_TOKEN, never the token secret" {
-    run grep -c 'uses: .*fetch-metadata@' "$WORKFLOW"
-    [ "$output" -eq 2 ]
-    run grep -A4 'uses: .*fetch-metadata@' "$WORKFLOW"
-    [ "$(grep -c 'github-token: \${{ github.token }}$' <<<"$output")" -eq 2 ]
-    ! grep -q 'secrets.token' <<<"$output"
+    run extract_key meta with
+    [ "$(grep -c '^github-token: \${{ github.token }}$' <<<"$output")" -eq 1 ]
+    ! grep -q 'secrets\.' <<<"$output"
+}
+
+# --- fetch-metadata on both hosts (QAO-477) ---------------------------------
+
+# github.a8c.com refuses to start a run whose files name an action it does
+# not mirror, even in a skipped job or a skipped called workflow. Every v1.7
+# run there failed at startup on `dependabot/fetch-metadata`. The path may
+# appear only as a string the host-choosing step reads.
+@test "no uses line names fetch-metadata directly" {
+    ! grep -E '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]+[^.[:space:]].*fetch-metadata' "$WORKFLOW"
+}
+
+@test "fetch-metadata runs from the local action the step before writes" {
+    run extract_key meta uses
+    [ "$output" = "./.dependabot-auto-merge/fetch-metadata" ]
+    [ "$(grep -n 'id: meta-action$' "$WORKFLOW" | cut -d: -f1)" -lt "$(grep -n 'id: meta$' "$WORKFLOW" | cut -d: -f1)" ]
+}
+
+@test "each host gets its own fetch-metadata path at the same pinned commit" {
+    run extract_key meta-action env
+    grep -qF "ACTION_REF: \${{ github.server_url == 'https://github.com' && 'dependabot/fetch-metadata' || 'third-party-actions/dependabot-fetch-metadata' }}" <<<"$output"
+    grep -qF 'ACTION_SHA: 25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0' <<<"$output"
+}
+
+@test "commit verification is skipped on GitHub Enterprise Server only" {
+    run extract_key meta with
+    grep -qxF "skip-commit-verification: \${{ github.server_url != 'https://github.com' }}" <<<"$output"
+}
+
+# Write the local action as the step would for ACTION_REF $1, into a fresh
+# workspace, and print the file.
+write_meta_action() {
+    local ws="$BATS_TEST_TMPDIR/ws"
+    rm -rf "$ws" && mkdir -p "$ws"
+    GITHUB_WORKSPACE="$ws" ACTION_REF="$1" \
+        ACTION_SHA=25dd0e34f4fe68f24cc83900b1fe3fe149efef98 \
+        bash -e -o pipefail <(extract_run meta-action)
+    cat "$ws/.dependabot-auto-merge/fetch-metadata/action.yml"
+}
+
+@test "the local action pins the chosen path and passes the inputs through" {
+    run write_meta_action third-party-actions/dependabot-fetch-metadata
+    [ "$status" -eq 0 ]
+    grep -qxF '        - uses: third-party-actions/dependabot-fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98' <<<"$output"
+    grep -qxF '              compat-lookup: true' <<<"$output"
+    grep -qxF '              github-token: ${{ inputs.github-token }}' <<<"$output"
+    grep -qxF '              skip-commit-verification: ${{ inputs.skip-commit-verification }}' <<<"$output"
+    # The alert lookup stays off by omission.
+    ! grep -q 'alert-lookup' <<<"$output"
+}
+
+@test "the local action exposes every fetch-metadata output the gates read" {
+    run write_meta_action dependabot/fetch-metadata
+    [ "$status" -eq 0 ]
+    grep -qxF '        - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98' <<<"$output"
+    used=$(grep -oE 'steps\.meta\.outputs\.[a-z-]+' "$WORKFLOW" | sed 's/.*\.//' | sort -u)
+    [ -n "$used" ]
+    for out in $used; do
+        grep -qxF "    $out:" <<<"$output"
+        grep -qxF "        value: \${{ steps.meta.outputs.$out }}" <<<"$output"
+    done
+}
+
+@test "the PR is evaluated without waiting on a metadata job" {
+    run awk '/^    evaluate-pr:/{p=1} p && /^ +needs:/{print; exit}' "$WORKFLOW"
+    [ "$output" = "        needs: preflight" ]
+    ! grep -qE '^    metadata(-ghes)?:' "$WORKFLOW"
 }
 
 # --- GitHub App alerts token (QAO-477) -------------------------------------
