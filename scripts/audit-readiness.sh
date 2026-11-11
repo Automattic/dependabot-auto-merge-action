@@ -1216,6 +1216,33 @@ assemble() {
                   }
               end;
 
+        # Every host a caller lists in SECEX_EGRESS_RULES, from each place the
+        # key is set. Comments are dropped first. The value may sit on the key
+        # line or, as a block scalar (>-, |) or plain multi-line scalar, on
+        # the more-indented lines below it. Entries split on commas and
+        # whitespace, with quotes removed.
+        def egress_hosts($t):
+            ($t // "" | split("\n") | map(sub("(^|\\s)#.*$"; ""))) as $l
+            | ($l | length) as $len
+            | range(0; $len) as $i
+            | ($l[$i] | capture("^(?<ind>\\s*)SECEX_EGRESS_RULES\\s*:\\s*(?<v>.*?)\\s*$")) as $m
+            | (if ($m.v | test("^([|>][-+0-9]*)?$")) then
+                 (first(range($i + 1; $len) as $j
+                        | select(($l[$j] | test("^\\s*$") | not)
+                                 and (($l[$j] | capture("^(?<s>\\s*)").s | length) <= ($m.ind | length)))
+                        | $j) // $len) as $end
+                 | $l[$i + 1:$end] | join(" ")
+               else $m.v end)
+            | gsub("[\"\\x27]"; "")
+            | splits("[,\\s]+")
+            | select(. != "");
+
+        # True when an egress host entry admits $host, either exactly or
+        # through a leading *. wildcard.
+        def egress_allows($t; $host):
+            any(egress_hosts($t);
+                . as $e | $e == $host or (($e | startswith("*.")) and ($host | endswith($e[1:]))));
+
         def check($status; $detail; $source): {status: $status, detail: $detail, source: $source};
 
         def days_since($ts):
@@ -1434,13 +1461,9 @@ assemble() {
                 # every compatibility score as 0 and Gate 3 sends each
                 # direct-dependency PR to review. Safe, so a risk, not a fail.
                 # SecEx is specific to github.a8c.com, so other enterprise
-                # hosts are left alone. Comments are stripped first so a
-                # commented-out rule does not read as configured.
+                # hosts are left alone.
                 (select($host == "github.a8c.com" and $caller.present == true
-                        and (($n.caller.text // "") | split("\n")
-                             | map(sub("(^|\\s)#.*$"; ""))
-                             | any(test("SECEX_EGRESS_RULES\\s*:.*dependabot-badges\\.githubapp\\.com"))
-                             | not))
+                        and (egress_allows($n.caller.text; "dependabot-badges.githubapp.com") | not))
                   | {id: "compat_score_unreachable", severity: "medium",
                      detail: "the caller does not list dependabot-badges.githubapp.com in SECEX_EGRESS_RULES; SecEx runners read egress rules from the caller only, so every compatibility score reads as 0 and Gate 3 sends each direct-dependency PR to review"}),
                 # Colours must stay in sync with the LABELS array in scripts/bootstrap.sh.

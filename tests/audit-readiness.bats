@@ -796,6 +796,30 @@ EOF
     [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
 }
 
+@test "on GHES a folded egress rule with the badges host is no risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: >-\n    github.a8c.com,*.github.a8c.com,\n    dependabot-badges.githubapp.com\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+@test "on GHES a folded egress rule ends at the next key" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: >-\n    github.a8c.com\n  OTHER: dependabot-badges.githubapp.com\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
+@test "on GHES a wildcard that covers the badges host is no risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'github.a8c.com,*.githubapp.com'"'"'\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+@test "on GHES a host that only ends in the badges host is a risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'xdependabot-badges.githubapp.com'"'"'\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
 # SecEx runs only on github.a8c.com, so another enterprise host has no
 # egress rules to check.
 @test "on another enterprise host the egress rules do not matter" {
