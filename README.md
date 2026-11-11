@@ -226,7 +226,7 @@ The audit reads each repository's caller from `.github/workflows/dependabot-auto
 8. Classic branch protection does not restrict who can push to the default branch, or allows the GitHub Actions app when it does.
 9. A credential that can read Dependabot alerts reaches the repo as an Actions secret, at repo or organisation level. For a caller, that is the App secrets or the token it passes. A repo that has not adopted yet passes with `DEPENDABOT_APP_CLIENT_ID` and `DEPENDABOT_APP_PRIVATE_KEY`, or with the token named by `--alerts-token-secret`. One App secret without the other fails.
 
-It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, a ruleset that restricts updates to the default branch (its bypass list needs an admin token to read), label colour drift, "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside, and, on GitHub Enterprise Server, a caller whose `SECEX_EGRESS_RULES` does not list `dependabot-badges.githubapp.com`.
+It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, a ruleset that restricts updates to the default branch (its bypass list needs an admin token to read), label colour drift, "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside, and, on github.a8c.com, a caller whose `SECEX_EGRESS_RULES` does not list `dependabot-badges.githubapp.com`.
 
 ### Output
 

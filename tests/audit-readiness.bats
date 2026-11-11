@@ -15,6 +15,9 @@ setup() {
     mkdir -p "$GH_STUB_DIR"
     : >"$GH_STUB_LOG"
     PATH="$REPO_ROOT/tests/stubs:$PATH"
+    # The script reads GH_HOST, so a value from the developer's shell would
+    # change what the tests see. Tests that need a host set it per call.
+    unset GH_HOST
 }
 
 fixture() {
@@ -778,6 +781,26 @@ EOF
 @test "on GHES egress rules with the badges host are no risk" {
     repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'github.a8c.com,*.github.a8c.com,dependabot-badges.githubapp.com'"'"'\n\njobs:\n")'
     GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+@test "on GHES a commented-out egress rule with the badges host is a risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  # SECEX_EGRESS_RULES: '"'"'github.a8c.com,*.github.a8c.com,dependabot-badges.githubapp.com'"'"'\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
+@test "on GHES a trailing comment naming the badges host is a risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'github.a8c.com'"'"' # dependabot-badges.githubapp.com\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
+# SecEx runs only on github.a8c.com, so another enterprise host has no
+# egress rules to check.
+@test "on another enterprise host the egress rules do not matter" {
+    repo_set
+    GH_HOST=ghe.example.com run_audit
     [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
 }
 

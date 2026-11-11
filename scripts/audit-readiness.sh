@@ -1433,8 +1433,14 @@ assemble() {
                 # caller only. Without the badges host, fetch-metadata reads
                 # every compatibility score as 0 and Gate 3 sends each
                 # direct-dependency PR to review. Safe, so a risk, not a fail.
-                (select($host != "github.com" and $caller.present == true
-                        and (($n.caller.text // "") | test("SECEX_EGRESS_RULES\\s*:[^\\n]*dependabot-badges\\.githubapp\\.com") | not))
+                # SecEx is specific to github.a8c.com, so other enterprise
+                # hosts are left alone. Comments are stripped first so a
+                # commented-out rule does not read as configured.
+                (select($host == "github.a8c.com" and $caller.present == true
+                        and (($n.caller.text // "") | split("\n")
+                             | map(sub("(^|\\s)#.*$"; ""))
+                             | any(test("SECEX_EGRESS_RULES\\s*:.*dependabot-badges\\.githubapp\\.com"))
+                             | not))
                   | {id: "compat_score_unreachable", severity: "medium",
                      detail: "the caller does not list dependabot-badges.githubapp.com in SECEX_EGRESS_RULES; SecEx runners read egress rules from the caller only, so every compatibility score reads as 0 and Gate 3 sends each direct-dependency PR to review"}),
                 # Colours must stay in sync with the LABELS array in scripts/bootstrap.sh.
