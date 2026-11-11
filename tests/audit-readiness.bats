@@ -910,6 +910,21 @@ EOF
     [ "$(log_count 'repos/acme/widgets/actions/organization-secrets')" -eq 1 ]
 }
 
+@test "a serial run reads each repository's own secret lists" {
+    # --jobs 1 probes every repo in one shell, so lists kept for one repo
+    # must not answer for the next.
+    repo_set_many '. * {nameWithOwner: "acme/one", caller: null}' \
+                  '. * {nameWithOwner: "acme/two", caller: null}'
+    secrets_fixture "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY" acme/one
+    secrets_fixture "" acme/two
+    run "$SCRIPT" --repo acme/one --repo acme/two --out-dir "$OUT" --format jsonl --jobs 1
+    [ "$status" -eq 0 ]
+    run jq -r '"\(.repo) \(.checks.alerts_token.status)"' "$OUT/repos.jsonl"
+    grep -qx 'acme/one pass' <<<"$output"
+    grep -qx 'acme/two fail' <<<"$output"
+    [ "$(log_count 'repos/acme/two/actions/secrets')" -eq 1 ]
+}
+
 @test "a repo not adopted yet with neither the App nor the token fails" {
     repo_set '.caller = null'
     secrets_fixture "SOMETHING_ELSE"
