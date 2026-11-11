@@ -1,0 +1,34 @@
+# This repository's own caller. The reusable workflow already has the name
+# dependabot-auto-merge.yml here, so audit this file with
+# `scripts/audit-readiness.sh --caller-path .github/workflows/dependabot-auto-merge-self.yml`.
+#
+# It calls a released SHA, not ./, so a change to the workflow reaches this
+# repository only through a release, as it does every other caller.
+name: Dependabot auto-merge
+
+on:
+    pull_request_target:
+        types: [opened, synchronize, reopened, labeled, auto_merge_enabled]
+    schedule:
+        - cron: '0 9 * * *'
+
+permissions:
+    pull-requests: write
+    contents: write
+    statuses: write
+
+jobs:
+    dependabot-auto-merge:
+        # github.com is a mirror. Its main changes only at release time, and
+        # pull requests are moved to github.a8c.com.
+        if: github.server_url != 'https://github.com'
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@0d4760c15b06689e86b75dd552d8ee11a4fb9c60 # v1.8.1
+        permissions:
+            pull-requests: write
+            contents: write
+            statuses: write
+        with:
+            event-name: ${{ github.event_name }}
+        secrets:
+            app-client-id: ${{ secrets.DEPENDABOT_APP_CLIENT_ID }}
+            app-private-key: ${{ secrets.DEPENDABOT_APP_PRIVATE_KEY }}
