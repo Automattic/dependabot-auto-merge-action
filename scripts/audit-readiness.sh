@@ -66,6 +66,11 @@ Expectations:
                              not name one itself. Default
                              QUALITYOPS_DEPENDABOT_ALERTS_TOKEN, the name
                              already in use in the Automattic org.
+  --caller-path <path>       Where the caller workflow lives in each repository.
+                             Default .github/workflows/dependabot-auto-merge.yml.
+                             Every repository in the run is read at this path,
+                             so audit a repository with a differently named
+                             caller on its own.
   --expect-ref <sha>         Caller workflows are compared against this ref.
                              Unresolvable means unknown, never fail.
   --team-overrides <file>    Default scripts/audit-team-overrides.tsv.
@@ -265,7 +270,7 @@ repo_fields() {
     sirt: labels(first: 20, query: $(gql_str "$REVIEW_LABEL"))     { nodes { name color description } }
     depYml:  object(expression: "HEAD:.github/dependabot.yml")  { ... on Blob { byteSize } }
     depYaml: object(expression: "HEAD:.github/dependabot.yaml") { ... on Blob { byteSize } }
-    caller:  object(expression: "HEAD:.github/workflows/dependabot-auto-merge.yml") {
+    caller:  object(expression: $(gql_str "HEAD:$CALLER_PATH")) {
       ... on Blob { byteSize isTruncated text }
     }
     root: object(expression: "HEAD:") { ... on Tree { entries { name type } } }
@@ -418,14 +423,15 @@ record_graphql_errors() {
     ' <<<"$body" >>"$WORK/errors.jsonl" 2>/dev/null || true
 }
 
-# Print the secret the caller passes as `token` to the reusable workflow,
-# nothing when the calling job passes none, or "?" when that job cannot be
-# found. Only the job that calls dependabot-auto-merge.yml counts, since a
-# `token:` in another job does not reach it, and the value may be quoted.
-# The job is the nearest line above `uses:` indented less than it, and runs
-# until the next line indented no more than the job key.
-caller_token_secret() {
-    awk '
+# Print the secret the caller passes to the reusable workflow as $1 (token,
+# app-client-id or app-private-key), nothing when the calling job passes
+# none, or "?" when that job cannot be found. Only the job that calls
+# dependabot-auto-merge.yml counts, since a secret in another job does not
+# reach it, and the value may be quoted. The job is the nearest line above
+# `uses:` indented less than it, and runs until the next line indented no
+# more than the job key.
+caller_secret() {
+    awk -v key="$1" '
         { line[NR] = $0 }
         END {
             for (i = 1; i <= NR; i++) if (line[i] ~ /dependabot-auto-merge\.yml@/) { u = i; break }
@@ -440,7 +446,7 @@ caller_token_secret() {
             for (i = j + 1; i <= NR; i++) {
                 if (line[i] ~ /^[ ]*(#|$)/) continue
                 if (match(line[i], /[^ ]/) - 1 <= ji) break
-                if (line[i] ~ /^[ ]*token[ ]*:[ ]*["\047]?\$\{\{[ ]*secrets\.[A-Za-z0-9_]+/) {
+                if (line[i] ~ "^[ ]*" key "[ ]*:[ ]*[\"\047]?[$][{][{][ ]*secrets[.][A-Za-z0-9_]+") {
                     s = line[i]
                     sub(/.*secrets\./, "", s)
                     sub(/[^A-Za-z0-9_].*/, "", s)
@@ -456,6 +462,30 @@ secret_listed() { jq -e --arg n "$1" '(.secrets // []) | any(.name == $n)' >/dev
 
 # Whether the secrets list on stdin is one page of a longer list.
 secret_list_partial() { jq -e '(.total_count // 0) > ((.secrets // []) | length)' >/dev/null 2>&1; }
+
+# Whether the Actions secret $2 reaches repository $1, as a repository
+# secret or an organisation secret shared with it. Prints status<TAB>detail.
+# The caller runs on pull_request_target, which reads Actions secrets even
+# when Dependabot triggers it. Listing repository secrets needs admin, and
+# not knowing is unknown, not fail.
+actions_secret_status() {
+    local repo=$1 name=$2 list org_list
+    if ! list=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
+        printf 'unknown\t%s' "cannot list repository secrets (needs admin); could not confirm '$name'"
+    elif secret_listed "$name" <<<"$list"; then
+        printf 'pass\t%s' "secret '$name' exists"
+    elif secret_list_partial <<<"$list"; then
+        printf 'unknown\t%s' "the repository has more than 100 secrets and only the first 100 were read; could not confirm '$name'"
+    elif ! org_list=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100"); then
+        printf 'unknown\t%s' "no repository secret named '$name', and cannot list the organisation secrets shared with it; could not confirm one"
+    elif secret_listed "$name" <<<"$org_list"; then
+        printf 'pass\t%s' "organisation secret '$name' is shared with this repository"
+    elif secret_list_partial <<<"$org_list"; then
+        printf 'unknown\t%s' "more than 100 organisation secrets are shared with this repository and only the first 100 were read; could not confirm '$name'"
+    else
+        printf 'fail\t%s' "no secret named '$name'"
+    fi
+}
 
 # A node for a repository nothing could be read from. It keeps the repo visible
 # and lets every check resolve to unknown, which is the honest answer.
@@ -875,51 +905,74 @@ probe_repo() {
         fi
     fi
 
-    # --- is an alerts token actually wired up? --------------------------------
+    # --- is an alerts credential actually wired up? ---------------------------
     #
     # GITHUB_TOKEN cannot read the Dependabot alerts API under any
-    # configuration, so a repo without this secret loses every
-    # indirect-dependency security PR. Secret *values* are never readable;
-    # names are, which is enough to tell "wired" from "not wired".
-    local want_secret repo_secrets org_secrets caller_text
+    # configuration, so a repo without a credential loses every
+    # indirect-dependency security PR. A caller passes either a GitHub App
+    # (app-client-id and app-private-key) or a token, both as Actions secrets. Secret *values* are never readable; names are, which is enough
+    # to tell "wired" from "not wired".
+    local want_secret caller_text app_id="" app_key="" result
+    local id_result key_result id_status key_status
     caller_text=$(jq -r '.caller.text // empty' <<<"$node" 2>/dev/null)
     if [[ -n $caller_text ]]; then
-        want_secret=$(caller_token_secret <<<"$caller_text")
+        want_secret=$(caller_secret token <<<"$caller_text")
+        app_id=$(caller_secret app-client-id <<<"$caller_text")
+        app_key=$(caller_secret app-private-key <<<"$caller_text")
     else
         # Not adopted yet. Check for the secret the rollout will wire up.
         want_secret=$ALERTS_TOKEN_SECRET
     fi
+    [[ $app_id == "?" ]] && app_id=""
+    [[ $app_key == "?" ]] && app_key=""
 
-    if [[ $want_secret == "?" ]]; then
+    if [[ -n $app_id && -n $app_key ]]; then
+        # The workflow mints from the App ahead of any token, so the token
+        # does not matter here.
+        want_secret="$app_id,$app_key"
+        id_result=$(actions_secret_status "$repo" "$app_id")
+        key_result=$(actions_secret_status "$repo" "$app_key")
+        id_status=${id_result%%$'\t'*}
+        key_status=${key_result%%$'\t'*}
+        if [[ $id_status == fail ]]; then
+            token_status=fail
+            token_detail="${id_result#*$'\t'}; the App token cannot be minted"
+        elif [[ $key_status == fail ]]; then
+            token_status=fail
+            token_detail="${key_result#*$'\t'}; the App token cannot be minted"
+        elif [[ $id_status == unknown ]]; then
+            token_status=unknown
+            token_detail=${id_result#*$'\t'}
+        elif [[ $key_status == unknown ]]; then
+            token_status=unknown
+            token_detail=${key_result#*$'\t'}
+        else
+            token_status=pass
+            token_detail="GitHub App secrets '$app_id' and '$app_key' reach this repository"
+        fi
+    elif [[ -n $app_id || -n $app_key ]]; then
+        # One App secret alone mints nothing, and the workflow falls back to
+        # the token. Passing half an App is a mistake worth naming.
+        want_secret="$app_id$app_key"
+        token_status=fail
+        if [[ -n $app_id ]]; then
+            token_detail="the caller passes app-client-id but not app-private-key, so the workflow cannot mint the App token"
+        else
+            token_detail="the caller passes app-private-key but not app-client-id, so the workflow cannot mint the App token"
+        fi
+    elif [[ $want_secret == "?" ]]; then
         token_status=unknown
         token_detail="cannot find the job that calls the workflow in the caller, so cannot tell which secret it passes"
     elif [[ -z $want_secret ]]; then
         token_status=fail
-        token_detail="the caller passes no token secret, so the workflow falls back to GITHUB_TOKEN, which cannot read the Dependabot alerts API"
-    elif ! repo_secrets=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
-        # Listing repository secrets needs admin. Not knowing is not a failure.
-        token_status=unknown
-        token_detail="cannot list repository secrets (needs admin); could not confirm '$want_secret'"
-    elif secret_listed "$want_secret" <<<"$repo_secrets"; then
-        token_status=pass
-        token_detail="secret '$want_secret' exists"
-    elif secret_list_partial <<<"$repo_secrets"; then
-        token_status=unknown
-        token_detail="the repository has more than 100 secrets and only the first 100 were read; could not confirm '$want_secret'"
-    elif ! org_secrets=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100"); then
-        # The secret may be shared from the organisation. Without that list
-        # its absence is not known, so this is not a failure either.
-        token_status=unknown
-        token_detail="no repository secret named '$want_secret', and cannot list the organisation secrets shared with it; could not confirm one"
-    elif secret_listed "$want_secret" <<<"$org_secrets"; then
-        token_status=pass
-        token_detail="organisation secret '$want_secret' is shared with this repository"
-    elif secret_list_partial <<<"$org_secrets"; then
-        token_status=unknown
-        token_detail="more than 100 organisation secrets are shared with this repository and only the first 100 were read; could not confirm '$want_secret'"
+        token_detail="the caller passes no GitHub App or token secret, so the workflow falls back to GITHUB_TOKEN, which cannot read the Dependabot alerts API"
     else
-        token_status=fail
-        token_detail="no secret named '$want_secret'; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
+        result=$(actions_secret_status "$repo" "$want_secret")
+        token_status=${result%%$'\t'*}
+        token_detail=${result#*$'\t'}
+        if [[ $token_status == fail ]]; then
+            token_detail="$token_detail; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
+        fi
     fi
 
     jq -cn --arg r "$repo" \
@@ -1232,7 +1285,7 @@ assemble() {
 
                 alerts_token: (
                   if ($nr.alerts_token == null) then
-                    check("unknown"; "the alerts-token secret was not checked"; "rest")
+                    check("unknown"; "the alerts credential was not checked"; "rest")
                   else
                     check($nr.alerts_token.status; $nr.alerts_token.detail; "rest")
                       + {secret: $nr.alerts_token.secret}
@@ -1550,6 +1603,9 @@ PENDING_LABEL="auto-merge-pending"
 REVIEW_LABEL="sirt-review-required"
 EXPECT_REF=""
 ALERTS_TOKEN_SECRET="QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+# This repository's own caller cannot use the default name, because the
+# reusable workflow already has it.
+CALLER_PATH=".github/workflows/dependabot-auto-merge.yml"
 TEAM_OVERRIDES=""
 EXCLUDE_TEAMS="$DEFAULT_EXCLUDE_TEAMS"
 MAX_TEAM_SIZE="25%"
@@ -1634,6 +1690,11 @@ while [[ $# -gt 0 ]]; do
             [[ $2 != -* ]] || die_usage "--expect-ref needs a value, got option '$2'"
             EXPECT_REF=$2; shift 2 ;;
         --expect-ref=*) EXPECT_REF=${1#--expect-ref=}; shift ;;
+        --caller-path)
+            need_value "$1" $#
+            [[ $2 != -* ]] || die_usage "--caller-path needs a value, got option '$2'"
+            CALLER_PATH=$2; shift 2 ;;
+        --caller-path=*) CALLER_PATH=${1#--caller-path=}; shift ;;
         --alerts-token-secret)
             need_value "$1" $#
             [[ $2 != -* ]] || die_usage "--alerts-token-secret needs a value, got option '$2'"

@@ -17,8 +17,8 @@ setup_file() {
 
 # --- permissions (QAO-767) --------------------------------------------------
 
-# Alerts are read with secrets.token, so the workflow requests no alerts
-# permission. A called workflow cannot hold a permission its caller did not
+# Alerts are read with a token minted from the caller's App, or with
+# secrets.token, so the workflow requests no alerts permission. A called workflow cannot hold a permission its caller did not
 # grant, so requesting either scope would refuse to start some callers.
 @test "the workflow requests no Dependabot alerts permission" {
     block=$(awk '/^permissions:/{p=1; next} p && /^[^ #]/{exit} p' "$WORKFLOW" | grep -v '^ *#')
@@ -31,11 +31,145 @@ setup_file() {
 # private repo. Handing it the secret broke every Dependabot run on private
 # repos whose token was scoped to alerts alone.
 @test "fetch-metadata gets GITHUB_TOKEN, never the token secret" {
-    run grep -c 'uses: .*fetch-metadata@' "$WORKFLOW"
-    [ "$output" -eq 2 ]
-    run grep -A4 'uses: .*fetch-metadata@' "$WORKFLOW"
-    [ "$(grep -c 'github-token: \${{ github.token }}$' <<<"$output")" -eq 2 ]
-    ! grep -q 'secrets.token' <<<"$output"
+    run extract_key meta with
+    [ "$(grep -c '^github-token: \${{ github.token }}$' <<<"$output")" -eq 1 ]
+    ! grep -q 'secrets\.' <<<"$output"
+}
+
+# --- fetch-metadata on both hosts (QAO-477) ---------------------------------
+
+# github.a8c.com refuses to start a run whose files name an action it does
+# not mirror, even in a skipped job or a skipped called workflow. Every v1.7
+# run there failed at startup on `dependabot/fetch-metadata`. The path may
+# appear only as a string the host-choosing step reads.
+@test "no uses line names fetch-metadata directly" {
+    ! grep -E '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]+[^.[:space:]].*fetch-metadata' "$WORKFLOW"
+}
+
+@test "fetch-metadata runs from the local action the step before writes" {
+    run extract_key meta uses
+    [ "$output" = "./.dependabot-auto-merge/fetch-metadata" ]
+    [ "$(grep -n 'id: meta-action$' "$WORKFLOW" | cut -d: -f1)" -lt "$(grep -n 'id: meta$' "$WORKFLOW" | cut -d: -f1)" ]
+}
+
+@test "each host gets its own fetch-metadata path at the same pinned commit" {
+    run extract_key meta-action env
+    grep -qF "ACTION_REF: \${{ github.server_url == 'https://github.com' && 'dependabot/fetch-metadata' || 'third-party-actions/dependabot-fetch-metadata' }}" <<<"$output"
+    grep -qF 'ACTION_SHA: 25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0' <<<"$output"
+}
+
+@test "commit verification is skipped on GitHub Enterprise Server only" {
+    run extract_key meta with
+    grep -qxF "skip-commit-verification: \${{ github.server_url != 'https://github.com' }}" <<<"$output"
+}
+
+# Write the local action as the step would for ACTION_REF $1, into a fresh
+# workspace, and print the file.
+write_meta_action() {
+    local ws="$BATS_TEST_TMPDIR/ws"
+    rm -rf "$ws" && mkdir -p "$ws"
+    GITHUB_WORKSPACE="$ws" ACTION_REF="$1" \
+        ACTION_SHA=25dd0e34f4fe68f24cc83900b1fe3fe149efef98 \
+        bash -e -o pipefail <(extract_run meta-action)
+    cat "$ws/.dependabot-auto-merge/fetch-metadata/action.yml"
+}
+
+@test "the local action pins the chosen path and passes the inputs through" {
+    run write_meta_action third-party-actions/dependabot-fetch-metadata
+    [ "$status" -eq 0 ]
+    grep -qxF '        - uses: third-party-actions/dependabot-fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98' <<<"$output"
+    grep -qxF '              compat-lookup: true' <<<"$output"
+    grep -qxF '              github-token: ${{ inputs.github-token }}' <<<"$output"
+    grep -qxF '              skip-commit-verification: ${{ inputs.skip-commit-verification }}' <<<"$output"
+    # The alert lookup stays off by omission.
+    ! grep -q 'alert-lookup' <<<"$output"
+}
+
+@test "the local action exposes every fetch-metadata output the gates read" {
+    run write_meta_action dependabot/fetch-metadata
+    [ "$status" -eq 0 ]
+    grep -qxF '        - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98' <<<"$output"
+    used=$(grep -oE 'steps\.meta\.outputs\.[a-z-]+' "$WORKFLOW" | sed 's/.*\.//' | sort -u)
+    [ -n "$used" ]
+    for out in $used; do
+        grep -qxF "    $out:" <<<"$output"
+        grep -qxF "        value: \${{ steps.meta.outputs.$out }}" <<<"$output"
+    done
+}
+
+@test "the PR is evaluated without waiting on a metadata job" {
+    run awk '/^    evaluate-pr:/{p=1} p && /^ +needs:/{print; exit}' "$WORKFLOW"
+    [ "$output" = "        needs: preflight" ]
+    ! grep -qE '^    metadata(-ghes)?:' "$WORKFLOW"
+}
+
+# --- GitHub App alerts token (QAO-477) -------------------------------------
+
+# Print the step whose id is $1, from its `- ` line to the next step.
+step_block() {
+    awk -v id="$1" '
+        /^ +- (name|uses|id|run):/ { if (hit) exit; buf = "" }
+        { buf = buf $0 "\n" }
+        $0 ~ "^ +id: " id "$" { hit = 1 }
+        hit && !printed { printf "%s", buf; printed = 1; next }
+        hit { print }
+    ' "$WORKFLOW"
+}
+
+@test "the App token is minted with the pinned action" {
+    run step_block app-token
+    grep -qF 'uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0' <<<"$output"
+}
+
+@test "the App token reads Dependabot alerts in this repository only" {
+    run extract_key app-token with
+    [ "$(grep -c 'permission-' <<<"$output")" -eq 1 ]
+    grep -qF 'permission-vulnerability-alerts: read' <<<"$output"
+    grep -qF 'repositories: ${{ github.event.repository.name }}' <<<"$output"
+    grep -qF 'owner: ${{ github.repository_owner }}' <<<"$output"
+}
+
+@test "the App token is minted only when both App secrets are passed" {
+    grep -qF "APP_CONFIGURED: \${{ secrets.app-client-id != '' && secrets.app-private-key != '' }}" "$WORKFLOW"
+    grep -qF "env.APP_CONFIGURED == 'true'" <<<"$(extract_if app-token)"
+}
+
+# Minting costs an API call and a token on every evaluation, so it runs only
+# when the alerts lookup will.
+@test "the App token is minted only when the alerts lookup runs" {
+    fallback=$(extract_if gate1-fallback)
+    mint=$(extract_if app-token)
+    [ -n "$fallback" ] && [ -n "$mint" ]
+    while IFS= read -r line; do
+        grep -qF "$line" <<<"$mint"
+    done <<<"$fallback"
+}
+
+@test "the App token is minted before the alerts lookup" {
+    mint=$(grep -n '^ *id: app-token$' "$WORKFLOW" | cut -d: -f1)
+    fallback=$(grep -n '^ *id: gate1-fallback$' "$WORKFLOW" | cut -d: -f1)
+    [ -n "$mint" ] && [ -n "$fallback" ]
+    [ "$mint" -lt "$fallback" ]
+}
+
+@test "the alerts lookup prefers the App token, then the token secret, then GITHUB_TOKEN" {
+    run extract_key gate1-fallback env
+    [ "$(grep -cF 'GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.token || github.token }}' <<<"$output")" -eq 1 ]
+    [ "$(grep -cF 'GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token || secrets.token || github.token }}' <<<"$output")" -eq 1 ]
+}
+
+@test "only the alerts lookup receives the App token" {
+    [ "$(grep -c 'steps.app-token.outputs.token' "$WORKFLOW")" -eq 2 ]
+    [ "$(step_block gate1-fallback | grep -c 'steps.app-token.outputs.token')" -eq 2 ]
+}
+
+# The token reaches the step as GH_TOKEN, which gh reads without printing.
+# A step that echoed it, or wrote it to GITHUB_ENV or GITHUB_OUTPUT, would
+# put a live credential in the log or hand it to every later step.
+@test "nothing prints or exports the App token" {
+    ! grep -qE '(echo|printf).*(GH_TOKEN|GH_ENTERPRISE_TOKEN|app-token)' "$WORKFLOW"
+    ! grep -qE '(GH_TOKEN|GH_ENTERPRISE_TOKEN).*>> *"?\$(GITHUB_ENV|GITHUB_OUTPUT)' "$WORKFLOW"
+    ! grep -qE 'outputs:.*app-token|: \$\{\{ *steps\.app-token\.outputs\.token *\}\}$' "$WORKFLOW"
 }
 
 # --- fast-track detection (QAO-765) ---------------------------------------
