@@ -467,27 +467,56 @@ secret_listed() { jq -e --arg n "$1" '(.secrets // []) | any(.name == $n)' >/dev
 # Whether the secrets list on stdin is one page of a longer list.
 secret_list_partial() { jq -e '(.total_count // 0) > ((.secrets // []) | length)' >/dev/null 2>&1; }
 
+# The repository and organisation secret lists for one repository, read at
+# most once each. The org list is read only when a name is not in the repo
+# list. Keyed by repository, so a serial run never reuses another's lists.
+SL_REPO="" SL_REPO_STATE="" SL_REPO_JSON="" SL_ORG_STATE="" SL_ORG_JSON=""
+
 # Whether the Actions secret $2 reaches repository $1, as a repository
-# secret or an organisation secret shared with it. Prints status<TAB>detail.
+# secret or an organisation secret shared with it. Sets SECRET_RESULT to
+# status<TAB>detail. It runs in the calling shell, not in $(...), so the
+# lists it reads are kept for the next name.
 # The caller runs on pull_request_target, which reads Actions secrets even
 # when Dependabot triggers it. Listing repository secrets needs admin, and
 # not knowing is unknown, not fail.
 actions_secret_status() {
-    local repo=$1 name=$2 list org_list
-    if ! list=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
-        printf 'unknown\t%s' "cannot list repository secrets (needs admin); could not confirm '$name'"
-    elif secret_listed "$name" <<<"$list"; then
-        printf 'pass\t%s' "secret '$name' exists"
-    elif secret_list_partial <<<"$list"; then
-        printf 'unknown\t%s' "the repository has more than 100 secrets and only the first 100 were read; could not confirm '$name'"
-    elif ! org_list=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100"); then
-        printf 'unknown\t%s' "no repository secret named '$name', and cannot list the organisation secrets shared with it; could not confirm one"
-    elif secret_listed "$name" <<<"$org_list"; then
-        printf 'pass\t%s' "organisation secret '$name' is shared with this repository"
-    elif secret_list_partial <<<"$org_list"; then
-        printf 'unknown\t%s' "more than 100 organisation secrets are shared with this repository and only the first 100 were read; could not confirm '$name'"
+    local repo=$1 name=$2
+    if [[ $SL_REPO != "$repo" ]]; then
+        SL_REPO=$repo SL_ORG_STATE="" SL_ORG_JSON=""
+        if SL_REPO_JSON=$(api_rest "repos/$repo/actions/secrets?per_page=100"); then
+            SL_REPO_STATE=ok
+        else
+            SL_REPO_STATE=err
+        fi
+    fi
+
+    if [[ $SL_REPO_STATE == err ]]; then
+        SECRET_RESULT=$(printf 'unknown\t%s' "cannot list repository secrets (needs admin); could not confirm '$name'")
+        return
+    elif secret_listed "$name" <<<"$SL_REPO_JSON"; then
+        SECRET_RESULT=$(printf 'pass\t%s' "secret '$name' exists")
+        return
+    elif secret_list_partial <<<"$SL_REPO_JSON"; then
+        SECRET_RESULT=$(printf 'unknown\t%s' "the repository has more than 100 secrets and only the first 100 were read; could not confirm '$name'")
+        return
+    fi
+
+    if [[ -z $SL_ORG_STATE ]]; then
+        if SL_ORG_JSON=$(api_rest "repos/$repo/actions/organization-secrets?per_page=100"); then
+            SL_ORG_STATE=ok
+        else
+            SL_ORG_STATE=err
+        fi
+    fi
+
+    if [[ $SL_ORG_STATE == err ]]; then
+        SECRET_RESULT=$(printf 'unknown\t%s' "no repository secret named '$name', and cannot list the organisation secrets shared with it; could not confirm one")
+    elif secret_listed "$name" <<<"$SL_ORG_JSON"; then
+        SECRET_RESULT=$(printf 'pass\t%s' "organisation secret '$name' is shared with this repository")
+    elif secret_list_partial <<<"$SL_ORG_JSON"; then
+        SECRET_RESULT=$(printf 'unknown\t%s' "more than 100 organisation secrets are shared with this repository and only the first 100 were read; could not confirm '$name'")
     else
-        printf 'fail\t%s' "no secret named '$name'"
+        SECRET_RESULT=$(printf 'fail\t%s' "no secret named '$name'")
     fi
 }
 
@@ -500,8 +529,8 @@ actions_secret_status() {
 # GITHUB_TOKEN.
 no_caller_alerts_status() {
     local repo=$1 id_result key_result tok_result id_status key_status tok_status
-    id_result=$(actions_secret_status "$repo" "$APP_CLIENT_ID_SECRET")
-    key_result=$(actions_secret_status "$repo" "$APP_PRIVATE_KEY_SECRET")
+    actions_secret_status "$repo" "$APP_CLIENT_ID_SECRET"; id_result=$SECRET_RESULT
+    actions_secret_status "$repo" "$APP_PRIVATE_KEY_SECRET"; key_result=$SECRET_RESULT
     id_status=${id_result%%$'\t'*}
     key_status=${key_result%%$'\t'*}
 
@@ -524,7 +553,7 @@ no_caller_alerts_status() {
         return
     fi
 
-    tok_result=$(actions_secret_status "$repo" "$ALERTS_TOKEN_SECRET")
+    actions_secret_status "$repo" "$ALERTS_TOKEN_SECRET"; tok_result=$SECRET_RESULT
     tok_status=${tok_result%%$'\t'*}
     want_secret=$ALERTS_TOKEN_SECRET
     if [[ $tok_status == pass ]]; then
@@ -984,8 +1013,8 @@ probe_repo() {
         # The workflow mints from the App ahead of any token, so the token
         # does not matter here.
         want_secret="$app_id,$app_key"
-        id_result=$(actions_secret_status "$repo" "$app_id")
-        key_result=$(actions_secret_status "$repo" "$app_key")
+        actions_secret_status "$repo" "$app_id"; id_result=$SECRET_RESULT
+        actions_secret_status "$repo" "$app_key"; key_result=$SECRET_RESULT
         id_status=${id_result%%$'\t'*}
         key_status=${key_result%%$'\t'*}
         if [[ $id_status == fail ]]; then
@@ -1021,7 +1050,7 @@ probe_repo() {
         token_status=fail
         token_detail="the caller passes no GitHub App or token secret, so the workflow falls back to GITHUB_TOKEN, which cannot read the Dependabot alerts API"
     else
-        result=$(actions_secret_status "$repo" "$want_secret")
+        actions_secret_status "$repo" "$want_secret"; result=$SECRET_RESULT
         token_status=${result%%$'\t'*}
         token_detail=${result#*$'\t'}
         if [[ $token_status == fail ]]; then

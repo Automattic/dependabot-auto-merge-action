@@ -890,6 +890,26 @@ EOF
     grep -qF "no secret named 'DEPENDABOT_APP_PRIVATE_KEY'" <<<"$(rec .checks.alerts_token.detail)"
 }
 
+@test "a repo not adopted yet with only the App private key fails and names the client ID" {
+    repo_set '.caller = null'
+    secrets_fixture "DEPENDABOT_APP_PRIVATE_KEY,QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    grep -qF "no secret named 'DEPENDABOT_APP_CLIENT_ID'" <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "a repo not adopted yet reads each secret list once" {
+    # Three names are checked, and an org-wide sweep with --no-cache pays for
+    # every repeat.
+    repo_set '.caller = null'
+    secrets_fixture "SOMETHING_ELSE"
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --no-cache
+    [ "$status" -eq 0 ]
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    [ "$(log_count 'repos/acme/widgets/actions/secrets')" -eq 1 ]
+    [ "$(log_count 'repos/acme/widgets/actions/organization-secrets')" -eq 1 ]
+}
+
 @test "a repo not adopted yet with neither the App nor the token fails" {
     repo_set '.caller = null'
     secrets_fixture "SOMETHING_ELSE"
