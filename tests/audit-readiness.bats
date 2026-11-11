@@ -870,6 +870,80 @@ EOF
     [ "$(rec .checks.alerts_token.status)" = "pass" ]
 }
 
+@test "a repo not adopted yet passes with the App secrets and no token" {
+    # The README caller passes the App, so the org secrets p2 relies on are
+    # enough before the caller exists.
+    repo_set '.caller = null'
+    secrets_fixture ""
+    org_secrets_fixture "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+    [ "$(rec .checks.alerts_token.secret)" = "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY" ]
+    [ "$(rec '.blockers | index("alerts_token")')" = "null" ]
+}
+
+@test "a repo not adopted yet with half an App fails and names the missing secret" {
+    repo_set '.caller = null'
+    secrets_fixture "DEPENDABOT_APP_CLIENT_ID,QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    grep -qF "no secret named 'DEPENDABOT_APP_PRIVATE_KEY'" <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "a repo not adopted yet with only the App private key fails and names the client ID" {
+    repo_set '.caller = null'
+    secrets_fixture "DEPENDABOT_APP_PRIVATE_KEY,QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    grep -qF "no secret named 'DEPENDABOT_APP_CLIENT_ID'" <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "a repo not adopted yet reads each secret list once" {
+    # Three names are checked, and an org-wide sweep with --no-cache pays for
+    # every repeat.
+    repo_set '.caller = null'
+    secrets_fixture "SOMETHING_ELSE"
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl --no-cache
+    [ "$status" -eq 0 ]
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    [ "$(log_count 'repos/acme/widgets/actions/secrets')" -eq 1 ]
+    [ "$(log_count 'repos/acme/widgets/actions/organization-secrets')" -eq 1 ]
+}
+
+@test "a serial run reads each repository's own secret lists" {
+    # --jobs 1 probes every repo in one shell, so lists kept for one repo
+    # must not answer for the next.
+    repo_set_many '. * {nameWithOwner: "acme/one", caller: null}' \
+                  '. * {nameWithOwner: "acme/two", caller: null}'
+    secrets_fixture "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY" acme/one
+    secrets_fixture "" acme/two
+    run "$SCRIPT" --repo acme/one --repo acme/two --out-dir "$OUT" --format jsonl --jobs 1
+    [ "$status" -eq 0 ]
+    run jq -r '"\(.repo) \(.checks.alerts_token.status)"' "$OUT/repos.jsonl"
+    grep -qx 'acme/one pass' <<<"$output"
+    grep -qx 'acme/two fail' <<<"$output"
+    [ "$(log_count 'repos/acme/two/actions/secrets')" -eq 1 ]
+}
+
+@test "a repo not adopted yet with neither the App nor the token fails" {
+    repo_set '.caller = null'
+    secrets_fixture "SOMETHING_ELSE"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    [ "$(rec '.blockers | index("alerts_token") != null')" = "true" ]
+    grep -qF "DEPENDABOT_APP_CLIENT_ID" <<<"$(rec .checks.alerts_token.detail)"
+    grep -qF "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN" <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "a repo not adopted yet whose secrets cannot be listed is unknown" {
+    repo_set '.caller = null'
+    rm -f "$GH_STUB_DIR/GET_repos_acme_widgets_actions_secrets_per_page_100"
+    fixture GET_repos_acme_widgets_actions_secrets_per_page_100.err <<<'gh: Not Found (HTTP 404)'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "unknown" ]
+    [ "$(rec '.blockers | index("alerts_token")')" = "null" ]
+}
+
 @test "--alerts-token-secret changes the name looked for" {
     repo_set '.caller = null'
     secrets_fixture "WOO_ALERTS_TOKEN"

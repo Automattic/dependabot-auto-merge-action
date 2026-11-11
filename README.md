@@ -219,6 +219,7 @@ The audit reads each repository's caller from `.github/workflows/dependabot-auto
 6. The caller workflow is present and well formed: both triggers, `labeled` in `types`, a commit SHA rather than a tag, and `pull-requests: write`, `contents: write` and `statuses: write` in both the workflow-level and job-level blocks. A leftover `security-events: read` is allowed but not needed.
 7. The repo allows the merge method the workflow will use: the caller's `merge-method`, or squash when it passes none. For a repo that has not adopted yet, `--merge-method` sets the method to check. Nothing else catches this, and a repo with squash disabled passes preflight and then fails at `gh pr merge --squash`.
 8. Classic branch protection does not restrict who can push to the default branch, or allows the GitHub Actions app when it does.
+9. A credential that can read Dependabot alerts reaches the repo as an Actions secret, at repo or organisation level. For a caller, that is the App secrets or the token it passes. A repo that has not adopted yet passes with `DEPENDABOT_APP_CLIENT_ID` and `DEPENDABOT_APP_PRIVATE_KEY`, or with the token named by `--alerts-token-secret`. One App secret without the other fails.
 
 It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, a ruleset that restricts updates to the default branch (its bypass list needs an admin token to read), label colour drift, and "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside.
 
@@ -384,7 +385,7 @@ Dependabot publishes a compatibility score only for updates it has enough CI dat
 
 Before v1.7 the compatibility lookup was never enabled and Gate 3 never ran, so direct-dependency PRs went to `pending-label` with no compatibility check. Expect more reviews of this kind after upgrading.
 
-What to do: check the update yourself, and apply the `fast-track-label` if it is safe to merge.
+What to do: check the update yourself, and if it is safe to merge, enable auto-merge on the PR with the button or `gh pr merge --auto`.
 
 ### A security PR got no label at all
 
