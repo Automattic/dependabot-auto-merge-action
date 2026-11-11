@@ -870,6 +870,45 @@ EOF
     [ "$(rec .checks.alerts_token.status)" = "pass" ]
 }
 
+@test "a repo not adopted yet passes with the App secrets and no token" {
+    # The README caller passes the App, so the org secrets p2 relies on are
+    # enough before the caller exists.
+    repo_set '.caller = null'
+    secrets_fixture ""
+    org_secrets_fixture "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "pass" ]
+    [ "$(rec .checks.alerts_token.secret)" = "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY" ]
+    [ "$(rec '.blockers | index("alerts_token")')" = "null" ]
+}
+
+@test "a repo not adopted yet with half an App fails and names the missing secret" {
+    repo_set '.caller = null'
+    secrets_fixture "DEPENDABOT_APP_CLIENT_ID,QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    grep -qF "no secret named 'DEPENDABOT_APP_PRIVATE_KEY'" <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "a repo not adopted yet with neither the App nor the token fails" {
+    repo_set '.caller = null'
+    secrets_fixture "SOMETHING_ELSE"
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "fail" ]
+    [ "$(rec '.blockers | index("alerts_token") != null')" = "true" ]
+    grep -qF "DEPENDABOT_APP_CLIENT_ID" <<<"$(rec .checks.alerts_token.detail)"
+    grep -qF "QUALITYOPS_DEPENDABOT_ALERTS_TOKEN" <<<"$(rec .checks.alerts_token.detail)"
+}
+
+@test "a repo not adopted yet whose secrets cannot be listed is unknown" {
+    repo_set '.caller = null'
+    rm -f "$GH_STUB_DIR/GET_repos_acme_widgets_actions_secrets_per_page_100"
+    fixture GET_repos_acme_widgets_actions_secrets_per_page_100.err <<<'gh: Not Found (HTTP 404)'
+    run_audit
+    [ "$(rec .checks.alerts_token.status)" = "unknown" ]
+    [ "$(rec '.blockers | index("alerts_token")')" = "null" ]
+}
+
 @test "--alerts-token-secret changes the name looked for" {
     repo_set '.caller = null'
     secrets_fixture "WOO_ALERTS_TOKEN"

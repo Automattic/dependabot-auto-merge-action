@@ -62,10 +62,14 @@ Expectations:
   --fast-track-label <name>  Default security-fast-track.
   --pending-label <name>     Default auto-merge-pending.
   --review-label <name>      Default sirt-review-required.
-  --alerts-token-secret <n>  Secret name to look for when a caller workflow does
-                             not name one itself. Default
+  --alerts-token-secret <n>  Token secret to look for in a repository with no
+                             caller workflow. Default
                              QUALITYOPS_DEPENDABOT_ALERTS_TOKEN, the name
-                             already in use in the Automattic org.
+                             already in use in the Automattic org. Such a
+                             repository also passes with the README's App
+                             secrets, DEPENDABOT_APP_CLIENT_ID and
+                             DEPENDABOT_APP_PRIVATE_KEY, and one without the
+                             other fails.
   --caller-path <path>       Where the caller workflow lives in each repository.
                              Default .github/workflows/dependabot-auto-merge.yml.
                              Every repository in the run is read at this path,
@@ -484,6 +488,55 @@ actions_secret_status() {
         printf 'unknown\t%s' "more than 100 organisation secrets are shared with this repository and only the first 100 were read; could not confirm '$name'"
     else
         printf 'fail\t%s' "no secret named '$name'"
+    fi
+}
+
+# The alerts credential for repository $1, which has no caller yet. Sets
+# want_secret, token_status and token_detail in the caller's scope.
+#
+# Both App secrets pass, since the README caller passes them. Otherwise the
+# configured token passes. One App secret without the other fails and names
+# the missing one, because the README caller would then fall back to
+# GITHUB_TOKEN.
+no_caller_alerts_status() {
+    local repo=$1 id_result key_result tok_result id_status key_status tok_status
+    id_result=$(actions_secret_status "$repo" "$APP_CLIENT_ID_SECRET")
+    key_result=$(actions_secret_status "$repo" "$APP_PRIVATE_KEY_SECRET")
+    id_status=${id_result%%$'\t'*}
+    key_status=${key_result%%$'\t'*}
+
+    if [[ $id_status == pass && $key_status == pass ]]; then
+        want_secret="$APP_CLIENT_ID_SECRET,$APP_PRIVATE_KEY_SECRET"
+        token_status=pass
+        token_detail="GitHub App secrets '$APP_CLIENT_ID_SECRET' and '$APP_PRIVATE_KEY_SECRET' reach this repository"
+        return
+    fi
+    if [[ $id_status == pass && $key_status == fail ]]; then
+        want_secret="$APP_CLIENT_ID_SECRET,$APP_PRIVATE_KEY_SECRET"
+        token_status=fail
+        token_detail="${key_result#*$'\t'}, though '$APP_CLIENT_ID_SECRET' exists; the App token cannot be minted"
+        return
+    fi
+    if [[ $id_status == fail && $key_status == pass ]]; then
+        want_secret="$APP_CLIENT_ID_SECRET,$APP_PRIVATE_KEY_SECRET"
+        token_status=fail
+        token_detail="${id_result#*$'\t'}, though '$APP_PRIVATE_KEY_SECRET' exists; the App token cannot be minted"
+        return
+    fi
+
+    tok_result=$(actions_secret_status "$repo" "$ALERTS_TOKEN_SECRET")
+    tok_status=${tok_result%%$'\t'*}
+    want_secret=$ALERTS_TOKEN_SECRET
+    if [[ $tok_status == pass ]]; then
+        token_status=pass
+        token_detail=${tok_result#*$'\t'}
+    elif [[ $tok_status == unknown || $id_status == unknown || $key_status == unknown ]]; then
+        token_status=unknown
+        token_detail="could not confirm the GitHub App secrets '$APP_CLIENT_ID_SECRET' and '$APP_PRIVATE_KEY_SECRET' or the token '$ALERTS_TOKEN_SECRET'"
+    else
+        want_secret="$APP_CLIENT_ID_SECRET,$APP_PRIVATE_KEY_SECRET,$ALERTS_TOKEN_SECRET"
+        token_status=fail
+        token_detail="no GitHub App secrets '$APP_CLIENT_ID_SECRET' and '$APP_PRIVATE_KEY_SECRET' and no token '$ALERTS_TOKEN_SECRET'; GITHUB_TOKEN cannot read the Dependabot alerts API, so every indirect-dependency security PR will fail"
     fi
 }
 
@@ -919,14 +972,15 @@ probe_repo() {
         want_secret=$(caller_secret token <<<"$caller_text")
         app_id=$(caller_secret app-client-id <<<"$caller_text")
         app_key=$(caller_secret app-private-key <<<"$caller_text")
-    else
-        # Not adopted yet. Check for the secret the rollout will wire up.
-        want_secret=$ALERTS_TOKEN_SECRET
     fi
     [[ $app_id == "?" ]] && app_id=""
     [[ $app_key == "?" ]] && app_key=""
 
-    if [[ -n $app_id && -n $app_key ]]; then
+    if [[ -z $caller_text ]]; then
+        # Not adopted yet. The README caller passes the App, and the token
+        # caller passes the configured token, so either one is ready.
+        no_caller_alerts_status "$repo"
+    elif [[ -n $app_id && -n $app_key ]]; then
         # The workflow mints from the App ahead of any token, so the token
         # does not matter here.
         want_secret="$app_id,$app_key"
@@ -1603,6 +1657,9 @@ PENDING_LABEL="auto-merge-pending"
 REVIEW_LABEL="sirt-review-required"
 EXPECT_REF=""
 ALERTS_TOKEN_SECRET="QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+# The App secret names the README caller passes.
+APP_CLIENT_ID_SECRET="DEPENDABOT_APP_CLIENT_ID"
+APP_PRIVATE_KEY_SECRET="DEPENDABOT_APP_PRIVATE_KEY"
 # This repository's own caller cannot use the default name, because the
 # reusable workflow already has it.
 CALLER_PATH=".github/workflows/dependabot-auto-merge.yml"
