@@ -878,6 +878,30 @@ EOF
     [ "$(rec .checks.alerts_token.status)" = "pass" ]
 }
 
+@test "the caller is read from the default path" {
+    repo_set
+    run_audit
+    grep -qF 'HEAD:.github/workflows/dependabot-auto-merge.yml' "$GH_STUB_LOG"
+}
+
+# This repository's own caller cannot use the default name, which the
+# reusable workflow already has.
+@test "--caller-path reads the caller from another path" {
+    repo_set
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format jsonl \
+        --caller-path .github/workflows/dependabot-auto-merge-self.yml
+    [ "$status" -eq 0 ]
+    grep -qF 'HEAD:.github/workflows/dependabot-auto-merge-self.yml' "$GH_STUB_LOG"
+    ! grep -qF 'HEAD:.github/workflows/dependabot-auto-merge.yml' "$GH_STUB_LOG"
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+}
+
+@test "--caller-path needs a value" {
+    run "$SCRIPT" --repo acme/widgets --caller-path
+    [ "$status" -ne 0 ]
+    [[ $output == *"--caller-path needs a value"* ]]
+}
+
 @test "an adopted caller that passes no token fails, whatever secrets exist" {
     # The workflow then falls back to GITHUB_TOKEN.
     repo_set '.caller.text |= sub("\n    secrets:\n      token: \\$\\{\\{ secrets.QUALITYOPS_DEPENDABOT_ALERTS_TOKEN \\}\\}"; "")'

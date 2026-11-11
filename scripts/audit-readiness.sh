@@ -66,6 +66,11 @@ Expectations:
                              not name one itself. Default
                              QUALITYOPS_DEPENDABOT_ALERTS_TOKEN, the name
                              already in use in the Automattic org.
+  --caller-path <path>       Where the caller workflow lives in each repository.
+                             Default .github/workflows/dependabot-auto-merge.yml.
+                             Every repository in the run is read at this path,
+                             so audit a repository with a differently named
+                             caller on its own.
   --expect-ref <sha>         Caller workflows are compared against this ref.
                              Unresolvable means unknown, never fail.
   --team-overrides <file>    Default scripts/audit-team-overrides.tsv.
@@ -265,7 +270,7 @@ repo_fields() {
     sirt: labels(first: 20, query: $(gql_str "$REVIEW_LABEL"))     { nodes { name color description } }
     depYml:  object(expression: "HEAD:.github/dependabot.yml")  { ... on Blob { byteSize } }
     depYaml: object(expression: "HEAD:.github/dependabot.yaml") { ... on Blob { byteSize } }
-    caller:  object(expression: "HEAD:.github/workflows/dependabot-auto-merge.yml") {
+    caller:  object(expression: $(gql_str "HEAD:$CALLER_PATH")) {
       ... on Blob { byteSize isTruncated text }
     }
     root: object(expression: "HEAD:") { ... on Tree { entries { name type } } }
@@ -1598,6 +1603,9 @@ PENDING_LABEL="auto-merge-pending"
 REVIEW_LABEL="sirt-review-required"
 EXPECT_REF=""
 ALERTS_TOKEN_SECRET="QUALITYOPS_DEPENDABOT_ALERTS_TOKEN"
+# This repository's own caller cannot use the default name, because the
+# reusable workflow already has it.
+CALLER_PATH=".github/workflows/dependabot-auto-merge.yml"
 TEAM_OVERRIDES=""
 EXCLUDE_TEAMS="$DEFAULT_EXCLUDE_TEAMS"
 MAX_TEAM_SIZE="25%"
@@ -1682,6 +1690,11 @@ while [[ $# -gt 0 ]]; do
             [[ $2 != -* ]] || die_usage "--expect-ref needs a value, got option '$2'"
             EXPECT_REF=$2; shift 2 ;;
         --expect-ref=*) EXPECT_REF=${1#--expect-ref=}; shift ;;
+        --caller-path)
+            need_value "$1" $#
+            [[ $2 != -* ]] || die_usage "--caller-path needs a value, got option '$2'"
+            CALLER_PATH=$2; shift 2 ;;
+        --caller-path=*) CALLER_PATH=${1#--caller-path=}; shift ;;
         --alerts-token-secret)
             need_value "$1" $#
             [[ $2 != -* ]] || die_usage "--alerts-token-secret needs a value, got option '$2'"

@@ -196,6 +196,8 @@ Dependabot vulnerability alerts must also be enabled (**Settings → Advanced Se
 
 `--repo` is repeatable and needs no organisation read access, so a team lead can audit exactly their own repositories. `--org` sweeps a whole organisation.
 
+The audit reads each repository's caller from `.github/workflows/dependabot-auto-merge.yml`. A repository whose caller has another name needs `--caller-path`, and since every repository in the run is read at that path, audit it on its own. This repository is one: the default name belongs to the reusable workflow, so its own caller lives elsewhere and an organisation sweep reports it blocked.
+
 ### Every check reports one of four states
 
 | State | Meaning |
