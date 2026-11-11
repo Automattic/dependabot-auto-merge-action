@@ -260,3 +260,14 @@ job_block() {
     grep -qE 'gh pr merge "' "$WORKFLOW"
     ! grep -E 'gh pr merge "' "$WORKFLOW" | grep -qE -- '--auto|--disable-auto'
 }
+
+# SecEx runners read egress rules from the caller, so the README caller must
+# carry the same value as this workflow, including the badges host.
+@test "the README caller carries the workflow's SECEX_EGRESS_RULES" {
+    local want readme
+    want=$(grep -E "^    SECEX_EGRESS_RULES:" "$REPO_ROOT/.github/workflows/dependabot-auto-merge.yml")
+    readme=$(awk '/^# \.github\/workflows\/dependabot-auto-merge\.yml$/{on=1} on&&/^```$/{exit} on' "$REPO_ROOT/README.md")
+    [[ $want == *"dependabot-badges.githubapp.com"* ]]
+    grep -qxF -- "$want" <<<"$readme"
+    grep -qxF -- "$want" "$REPO_ROOT/.github/workflows/dependabot-auto-merge-self.yml"
+}

@@ -67,9 +67,11 @@ permissions:
     statuses: write
 
 # github.a8c.com runs jobs on SecEx runners, which drop outbound traffic to any
-# host not listed here. The runner reads this before the job starts, so it must
-# be a literal. github.com ignores it. The badges host serves the Gate 3
-# compatibility score that fetch-metadata looks up.
+# host not listed in SECEX_EGRESS_RULES. They read it from the workflow the run
+# started from, which is the caller, so this copy does not open anything. Each
+# caller sets the same value, as in the README. Without the badges host,
+# fetch-metadata reads every Gate 3 compatibility score as 0. github.com
+# ignores it.
 env:
     SECEX_EGRESS_RULES: 'github.a8c.com,*.github.a8c.com,dependabot-badges.githubapp.com'
 

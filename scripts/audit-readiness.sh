@@ -1142,6 +1142,7 @@ assemble() {
         --argjson include_forks "$INCLUDE_FORKS" \
         --argjson include_advisory_forks "$INCLUDE_ADVISORY_FORKS" \
         --arg audited_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg host "${GH_HOST:-github.com}" \
         '
         # Read from files rather than passed as arguments: on a large org
         # either one outgrows the 128 KB Linux allows a single argument.
@@ -1428,6 +1429,14 @@ assemble() {
                 (select($trusted and $n.hasVulnerabilityAlertsEnabled == true and ($n.everAlerts.totalCount // 0) == 0 and $manifest)
                   | {id: "alerts_enabled_no_alerts_ever", severity: "medium",
                      detail: "alerts are on but none have ever been raised; a stub or unresolvable lockfile silences Dependabot exactly like this"}),
+                # SecEx runners on github.a8c.com read egress rules from the
+                # caller only. Without the badges host, fetch-metadata reads
+                # every compatibility score as 0 and Gate 3 sends each
+                # direct-dependency PR to review. Safe, so a risk, not a fail.
+                (select($host != "github.com" and $caller.present == true
+                        and (($n.caller.text // "") | test("SECEX_EGRESS_RULES\\s*:[^\\n]*dependabot-badges\\.githubapp\\.com") | not))
+                  | {id: "compat_score_unreachable", severity: "medium",
+                     detail: "the caller does not list dependabot-badges.githubapp.com in SECEX_EGRESS_RULES; SecEx runners read egress rules from the caller only, so every compatibility score reads as 0 and Gate 3 sends each direct-dependency PR to review"}),
                 # Colours must stay in sync with the LABELS array in scripts/bootstrap.sh.
                 ([{want: $ft, set: $n.ft, color: "0075ca"},
                   {want: $pend, set: $n.pend, color: "e4e669"},
