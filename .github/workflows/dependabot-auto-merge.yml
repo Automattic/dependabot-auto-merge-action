@@ -33,6 +33,10 @@ on:
                 description: 'Merge strategy passed to gh pr merge: squash, merge, or rebase.'
                 type: string
                 default: 'squash'
+            merge-mode:
+                description: 'Who merges a PR that clears every gate. unattended: the scheduled job merges it once it passes the age gate. human-only: the gates, labels and review comments run as usual, the scheduled job never merges, and a person merges each PR.'
+                type: string
+                default: 'unattended'
             fast-track-label:
                 description: 'Marker label applied when a person enables auto-merge on a PR, which bypasses the gates. Applying the label by hand does nothing.'
                 type: string
@@ -83,8 +87,11 @@ jobs:
     preflight:
         name: Preflight — repo auto-merge configuration
         runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || (github.server_url == 'https://github.com' && '["ubuntu-latest"]' || '["self-hosted","secex","gha-runner-2cpu-4gb"]')) }}
+        # A human-only repo has nothing to merge on a schedule, so its
+        # scheduled run stops here. Any other value runs, so a mistyped mode
+        # reaches the check below and fails, rather than skipping quietly.
         if: |
-            inputs.event-name == 'schedule' ||
+            (inputs.event-name == 'schedule' && inputs.merge-mode != 'human-only') ||
             (inputs.event-name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]')
         steps:
             # gh talks to github.com unless told otherwise, so point it at
@@ -97,6 +104,27 @@ jobs:
               run: |
                   FAIL=0
                   DOCS="$GITHUB_SERVER_URL/Automattic/dependabot-auto-merge-action#usage"
+
+                  case "$MERGE_MODE" in
+                      unattended | human-only) ;;
+                      *)
+                          echo "::error::Preflight: merge-mode is '$MERGE_MODE'. Expected unattended or human-only."
+                          exit 1
+                          ;;
+                  esac
+
+                  # Both checks below protect a merge nobody watches. In
+                  # human-only mode the workflow merges nothing, and a person
+                  # sees CI before merging, so a finding is a warning there.
+                  # Failing would stop the gates and the review routing too.
+                  problem() {
+                      if [ "$MERGE_MODE" = human-only ]; then
+                          echo "::warning::$1"
+                      else
+                          echo "::error::$1"
+                          FAIL=1
+                      fi
+                  }
 
                   # --- Check 1: "Allow auto-merge" repo setting ---------------
                   # allow_auto_merge is only returned to tokens with push
@@ -115,8 +143,7 @@ jobs:
                           echo "OK: 'Allow auto-merge' is enabled on $GITHUB_REPOSITORY."
                           ;;
                       false)
-                          echo "::error::Preflight: 'Allow auto-merge' is disabled on $GITHUB_REPOSITORY, so gh pr merge --auto cannot work. Enable it under Settings → General → Pull Requests → Allow auto-merge. Setup docs: $DOCS (section '4. Enable auto-merge on the repo (manual alternative)')."
-                          FAIL=1
+                          problem "Preflight: 'Allow auto-merge' is disabled on $GITHUB_REPOSITORY, so gh pr merge --auto cannot work. Enable it under Settings → General → Pull Requests → Allow auto-merge. Setup docs: $DOCS (section '4. Enable auto-merge on the repo (manual alternative)')."
                           ;;
                       *)
                           echo "::warning::Preflight: this token cannot see the 'Allow auto-merge' setting (requires push access) — skipping the check. If auto-merge fails later, verify Settings → General → Pull Requests → Allow auto-merge."
@@ -164,20 +191,19 @@ jobs:
                               if [ "$HAS_CHECKS" = "true" ]; then
                                   echo "OK: classic branch protection on '$DEFAULT_BRANCH' requires status checks."
                               else
-                                  echo "::error::Preflight: branch protection on '$DEFAULT_BRANCH' has no required status checks, so GitHub will never queue an auto-merge. Add at least one required status check via a ruleset (Settings → Rules → Rulesets) or the branch protection rule (Settings → Branches). Setup docs: $DOCS (section '5. Branch protection (manual alternative)')."
-                                  FAIL=1
+                                  problem "Preflight: branch protection on '$DEFAULT_BRANCH' has no required status checks, so GitHub will never queue an auto-merge. Add at least one required status check via a ruleset (Settings → Rules → Rulesets) or the branch protection rule (Settings → Branches). Setup docs: $DOCS (section '5. Branch protection (manual alternative)')."
                               fi
                           else
                               echo "::warning::Preflight: '$DEFAULT_BRANCH' has classic branch protection, but this token cannot read its details (endpoint requires admin). Assuming required status checks are configured — auto-merge will fail later if they are not. Consider migrating to rulesets, which this check can verify."
                           fi
                       elif [ "$PROTECTED" = "false" ]; then
-                          echo "::error::Preflight: default branch '$DEFAULT_BRANCH' has no ruleset-based required status checks and no classic branch protection rule. gh pr merge --auto needs at least one required status check to queue against. Add one via a ruleset (Settings → Rules → Rulesets, recommended) or classic branch protection (Settings → Branches). Setup docs: $DOCS (section '5. Branch protection (manual alternative)')."
-                          FAIL=1
+                          problem "Preflight: default branch '$DEFAULT_BRANCH' has no ruleset-based required status checks and no classic branch protection rule. gh pr merge --auto needs at least one required status check to queue against. Add one via a ruleset (Settings → Rules → Rulesets, recommended) or classic branch protection (Settings → Branches). Setup docs: $DOCS (section '5. Branch protection (manual alternative)')."
                       fi
                   fi
 
                   exit "$FAIL"
               env:
+                  MERGE_MODE: ${{ inputs.merge-mode }}
                   GH_TOKEN: ${{ github.token }}
                   GH_ENTERPRISE_TOKEN: ${{ github.token }}
 
@@ -963,7 +989,9 @@ jobs:
         name: Scheduled merge of eligible PRs
         runs-on: ${{ fromJSON(inputs.runner != '' && inputs.runner || (github.server_url == 'https://github.com' && '["ubuntu-latest"]' || '["self-hosted","secex","gha-runner-2cpu-4gb"]')) }}
         needs: preflight
-        if: inputs.event-name == 'schedule'
+        # Exactly unattended, so a mode this job does not recognise never
+        # merges, even if preflight let it through.
+        if: inputs.event-name == 'schedule' && inputs.merge-mode == 'unattended'
         steps:
             # gh talks to github.com unless told otherwise, so point it at
             # the host this run is on. GH_ENTERPRISE_TOKEN beside each

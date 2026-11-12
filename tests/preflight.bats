@@ -25,6 +25,7 @@ setup() {
     REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
     export GITHUB_REPOSITORY="acme/widgets"
     export GITHUB_SERVER_URL="https://github.com"
+    export MERGE_MODE=unattended
     export GH_STUB_DIR="$BATS_TEST_TMPDIR/fixtures"
     export GH_STUB_LOG="$BATS_TEST_TMPDIR/gh-calls.log"
     mkdir -p "$GH_STUB_DIR"
@@ -147,4 +148,37 @@ preflight_step() {
     run preflight_step
     [ "$status" -eq 1 ]
     [[ $output == *"::error::Preflight: 'Allow auto-merge' is disabled"* ]]
+}
+
+# --- merge mode (QAO-697) ---------------------------------------------------
+
+# A human-only repo merges nothing on its own, and a person sees CI before
+# merging. Failing preflight there would also stop the gates and the review
+# routing, which a human-only repo still wants.
+
+@test "human-only warns, rather than fails, when auto-merge is off" {
+    export MERGE_MODE=human-only
+    printf '%s' '{"allow_auto_merge":false,"default_branch":"main"}' >"$GH_STUB_DIR/GET_repos_acme_widgets"
+    rules_fixture "$(ruleset_rule sandbox-ci)"
+    run preflight_step
+    [ "$status" -eq 0 ]
+    [[ $output == *"::warning::Preflight: 'Allow auto-merge' is disabled"* ]]
+    [[ $output != *"::error::"* ]]
+}
+
+@test "human-only warns, rather than fails, when no check is required" {
+    export MERGE_MODE=human-only
+    branch_with_summary false false >"$GH_STUB_DIR/$BRANCH_KEY"
+    run preflight_step
+    [ "$status" -eq 0 ]
+    [[ $output == *"::warning::Preflight: default branch 'main' has no ruleset-based required status checks"* ]]
+    [[ $output != *"::error::"* ]]
+}
+
+@test "an unrecognised merge mode fails before any API call" {
+    export MERGE_MODE=human_only
+    run preflight_step
+    [ "$status" -eq 1 ]
+    [[ $output == *"::error::Preflight: merge-mode is 'human_only'. Expected unattended or human-only."* ]]
+    [ ! -s "$GH_STUB_LOG" ]
 }

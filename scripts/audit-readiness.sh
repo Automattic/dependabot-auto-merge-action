@@ -1179,14 +1179,83 @@ assemble() {
             elif (($t | [match("(^|\\n)---"; "g")] | length) > 1) then "unrecognized: multiple documents"
             else "recognized" end;
 
+        def indent: capture("^(?<s>[ \\t]*)").s | length;
+
+        # The job that calls this workflow, in caller text $tc with comments
+        # dropped: its lines, its key indentation and the range of line
+        # indices it spans. A job is a mapping, so its keys can come in any
+        # order, and with: may sit above uses: as well as below it. Null
+        # when no job calls the workflow.
+        def calling_job($tc):
+            ($tc | split("\n")) as $l
+            | [range(0; $l | length) | select(($l[.] | test("^[ \\t]*$")) | not)] as $lines
+            | ([$lines[] | select($l[.] | test("^[ \\t]*uses[ \\t]*:[ \\t]*\\S*dependabot-auto-merge\\.yml@"))] | first) as $u
+            | if $u == null then null
+              else
+                ($l[$u] | indent) as $ui
+                # The job key is the last line above uses: indented less
+                # than its keys, and the job ends at the next such line.
+                | {l: $l, lines: $lines, ui: $ui,
+                   start: ([$lines[] | select(. < $u and ($l[.] | indent) < $ui)] | last // -1),
+                   end: ([$lines[] | select(. > $u and ($l[.] | indent) < $ui)] | first // ($l | length))}
+              end;
+
+        # The line index of the calling job key $key, or null.
+        def job_key($job; $key):
+            [$job.lines[] | select(. > $job.start and . < $job.end
+                                   and ($job.l[.] | indent) == $job.ui
+                                   and ($job.l[.] | test("^[ \\t]*" + $key + "[ \\t]*:")))] | first;
+
+        # True when the calling job writes with: with its value on the same
+        # line, such as a one-line flow mapping. The audit does not parse
+        # that, so it reports the caller as unrecognized rather than read
+        # every input as its default.
+        def with_inline($tc):
+            calling_job($tc) as $job
+            | if $job == null then false
+              else job_key($job; "with") as $w
+                | $w != null and ($job.l[$w] | test("^[ \\t]*with[ \\t]*:[ \\t]*\\S"))
+              end;
+
+        # The lines of the with: block in the calling job, from caller text $tc
+        # with comments dropped. Inputs are read from here only, so a
+        # workflow_dispatch input or any other key of the same name
+        # elsewhere in the file is never taken for one.
+        def with_block($tc):
+            calling_job($tc) as $job
+            | if $job == null then ""
+              else job_key($job; "with") as $w
+                | if $w == null or ($job.l[$w] | test("^[ \\t]*with[ \\t]*:[ \\t]*\\S")) then ""
+                  else
+                    ([$job.lines[] | select(. > $w and ($job.l[.] | indent) <= $job.ui)] | first // ($job.l | length)) as $wend
+                    | $job.l[$w + 1:$wend] | join("\n")
+                  end
+              end;
+
+        # The value of input $name in the with: block of caller text $tc, or
+        # null. Only a value on the same line as the key counts.
+        def input_value($tc; $name):
+            [with_block($tc) | match("(^|\\n)[ \\t]*" + $name + "[ \\t]*:[ \\t]*([^\\n]*)"; "g")
+             | .captures[1].string
+             | sub("[ \\t]+$"; "") | sub("^[\"\\x27]"; "") | sub("[\"\\x27]$"; "")
+             | select(length > 0)]
+            | first // null;
+
         def caller_info($n):
             ($n.caller.text // "") as $t
             | if ($n.caller == null) then {present: false}
               else
-                (caller_shape($t)) as $shape
+                ($t | split("\n") | map(sub("(^|\\s)#.*$"; "")) | join("\n")) as $tc
+                | (caller_shape($t)
+                   | if . == "recognized" and with_inline($tc) then "unrecognized: with: on one line" else . end) as $shape
                 | ($t | capture("dependabot-auto-merge\\.yml@(?<ref>[0-9A-Za-z._-]+)") // {}) as $m
                 | ($t | capture("dependabot-auto-merge\\.yml@[0-9A-Za-z._-]+\\s*#\\s*(?<v>[A-Za-z0-9._-]+)") // {}) as $vc
                 | ($t | capture("(^|\\n)\\s*merge-method\\s*:\\s*[^a-z\\s]?(?<mm>[a-z]+)") // {}) as $mm
+                # Inputs whose value matters are read from $tc, which has
+                # comments dropped, so a commented-out example does not count.
+                | {v: input_value($tc; "merge-mode")} as $mmode
+                | {v: input_value($tc; "review-team")} as $rteam
+                | ($t | test("(^|\\n)\\s*schedule\\s*:")) as $has_schedule
                 # Both the workflow-level and job-level blocks must carry
                 # every permission, so each must appear at least twice. The
                 # workflow has not requested security-events since v1.7, so a
@@ -1209,6 +1278,20 @@ assemble() {
                     },
                     # The workflow defaults to squash when the caller passes none.
                     merge_method: ($mm.mm // "squash"),
+                    # Who merges a PR that clears the gates. Before the
+                    # merge-mode input, a caller made a repo human-only by
+                    # dropping its schedule trigger, so that still counts.
+                    merge_mode: (
+                      # An expression is decided at run time, so the
+                      # audit cannot say which mode it picks.
+                      # A caller the audit cannot parse gets no guessed mode.
+                      if $shape != "recognized" then {mode: "unknown", source: "unparsed"}
+                      elif ($mmode.v // "") | startswith("${{") then {mode: "unknown", source: "expression"}
+                      elif ($mmode.v // "") == "human-only" then {mode: "human-only", source: "input"}
+                      elif ($mmode.v // "unattended") != "unattended" then {mode: $mmode.v, source: "input", invalid: true}
+                      elif ($has_schedule | not) and ($mmode.v == null) then {mode: "human-only", source: "no schedule trigger"}
+                      else {mode: "unattended", source: (if $mmode.v then "input" else "default" end)} end),
+                    review_team: ($rteam.v // null),
                     permissions: {
                       complete: ($missing_perms | length == 0),
                       missing: $missing_perms
@@ -1383,7 +1466,8 @@ assemble() {
                     else
                       ([ (if $c.ref_kind != "sha" then "pinned to \($c.ref) rather than a commit SHA" else empty end),
                          (if ($c.triggers.pull_request_target | not) then "no pull_request_target trigger" else empty end),
-                         (if ($c.triggers.schedule | not) then "no schedule trigger, so the age gate never fires" else empty end),
+                         (if $c.merge_mode.invalid then "merge-mode \($c.merge_mode.mode) is neither unattended nor human-only, so preflight fails every run" else empty end),
+                         (if ($c.triggers.schedule | not) and $c.merge_mode.mode == "unattended" then "merge-mode is unattended but there is no schedule trigger, so nothing merges" else empty end),
                          (if ($c.triggers.has_labeled | not) then "types: is missing `labeled`, so fast-track cannot work" else empty end),
                          (if ($c.permissions.complete | not) then "\($c.permissions.missing | join(", ")) missing from the workflow-level or job-level permissions block" else empty end)
                        ]) as $problems
@@ -1466,6 +1550,12 @@ assemble() {
                         and (egress_allows($n.caller.text; "dependabot-badges.githubapp.com") | not))
                   | {id: "compat_score_unreachable", severity: "medium",
                      detail: "the caller does not list dependabot-badges.githubapp.com in SECEX_EGRESS_RULES; SecEx runners read egress rules from the caller only, so every compatibility score reads as 0 and Gate 3 sends each direct-dependency PR to review"}),
+                # review-team is the only input that mentions a person when
+                # a PR is routed to review. Without it the review label and
+                # comment reach nobody, in either merge mode.
+                (select($caller.present == true and $caller.shape == "recognized" and $caller.review_team == null)
+                  | {id: "review_team_unset", severity: "medium",
+                     detail: "the caller sets no review-team, so a PR routed to review gets a label and a comment that mention nobody"}),
                 # Colours must stay in sync with the LABELS array in scripts/bootstrap.sh.
                 ([{want: $ft, set: $n.ft, color: "0075ca"},
                   {want: $pend, set: $n.pend, color: "e4e669"},
@@ -1499,6 +1589,19 @@ assemble() {
                                 detail: "the sweep never returned this repository, so nothing could be read",
                                 source: "sweep_incomplete"}
                  else . end)
+             else . end)
+
+          # A human-only repo merges nothing on its own, so a setting that
+          # only stops the merge this workflow makes cannot block it. Preflight
+          # warns on these in that mode rather than failing. The detail is
+          # kept, since a person who enables auto-merge still needs them.
+          | (if .caller.merge_mode.mode == "human-only" then
+               .checks |= with_entries(
+                 if ((.key | IN("auto_merge", "required_checks", "merge_method", "push_restrictions"))
+                     and .value.status == "fail")
+                 then .value |= (.status = "na" | .detail = "human-only, so this does not block: \(.detail)")
+                 else . end)
+               | .risks |= map(select(.id | IN("approval_rule", "update_restricted") | not))
              else . end)
 
           # Verdict, in this order so `unknown` can never be laundered into `fail`.
@@ -1614,6 +1717,7 @@ render_table() {
     jq -r '
         [.repo,
          .verdict,
+         (.caller.merge_mode.mode // "-"),
          (.owner.team // "(unassigned)"),
          (if .wave.band == null then "-" else ("w" + (.wave.band | tostring)) end),
          (if .verdict == "na" then "no dependencies to scan"
@@ -1622,9 +1726,9 @@ render_table() {
           else "-" end)]
         | @tsv
     ' | {
-        printf '%-58s %-8s %-22s %-4s %s\n' "REPOSITORY" "VERDICT" "TEAM" "WAVE" "BLOCKERS"
-        while IFS=$'\t' read -r repo verdict team wave blockers; do
-            printf '%-58s %-8s %-22s %-4s %s\n' "$repo" "$verdict" "$team" "$wave" "$blockers"
+        printf '%-58s %-8s %-11s %-22s %-4s %s\n' "REPOSITORY" "VERDICT" "MODE" "TEAM" "WAVE" "BLOCKERS"
+        while IFS=$'\t' read -r repo verdict mode team wave blockers; do
+            printf '%-58s %-8s %-11s %-22s %-4s %s\n' "$repo" "$verdict" "$mode" "$team" "$wave" "$blockers"
         done
     }
 }
@@ -1660,6 +1764,11 @@ render_summary() {
           ($all | group_by(.adoption) | sort_by(-length) | .[]
                 | "  \(length | tostring | (. + "    ")[0:4]) \(.[0].adoption)"),
           "",
+          # Which adopted repos merge on their own.
+          "Merge mode:",
+          ($all | map(select(.caller.merge_mode != null)) | group_by(.caller.merge_mode.mode) | sort_by(-length) | .[]
+                | "  \(length | tostring | (. + "    ")[0:4]) \(.[0].caller.merge_mode.mode)"),
+          "",
           # The alerts token is one central secret, not per-repo work, so
           # counting it as work makes this number 0 everywhere and useless.
           # Report both: what a team can finish alone, and what it can finish
@@ -1682,12 +1791,13 @@ render_summary() {
 }
 
 render_csv() {
-    printf 'repo,verdict,team,wave_band,wave_score,auto_merge,required_checks,labels,vuln_alerts,dependabot_config,caller_workflow,merge_method,blockers,risks\n'
+    printf 'repo,verdict,team,wave_band,wave_score,auto_merge,required_checks,labels,vuln_alerts,dependabot_config,caller_workflow,merge_method,merge_mode,blockers,risks\n'
     jq -r '
         [.repo, .verdict, (.owner.team // ""), .wave.band, .wave.score,
          .checks.auto_merge.status, .checks.required_checks.status, .checks.labels.status,
          .checks.vuln_alerts.status, .checks.dependabot_config.status,
          .checks.caller_workflow.status, .checks.merge_method.status,
+         (.caller.merge_mode.mode // ""),
          (.blockers | join(" ")), (.risks | map(.id) | join(" "))]
         | @csv
     '
