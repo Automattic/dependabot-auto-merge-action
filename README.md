@@ -34,6 +34,11 @@ permissions:
     contents: write
     statuses: write
 
+# github.a8c.com only. SecEx runners read egress rules from this file, not from
+# the workflow it calls. github.com ignores it.
+env:
+    SECEX_EGRESS_RULES: 'github.a8c.com,*.github.a8c.com,dependabot-badges.githubapp.com'
+
 jobs:
     dependabot-auto-merge:
         uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@<sha> # v1.8
@@ -221,7 +226,7 @@ The audit reads each repository's caller from `.github/workflows/dependabot-auto
 8. Classic branch protection does not restrict who can push to the default branch, or allows the GitHub Actions app when it does.
 9. A credential that can read Dependabot alerts reaches the repo as an Actions secret, at repo or organisation level. For a caller, that is the App secrets or the token it passes. A repo that has not adopted yet passes with `DEPENDABOT_APP_CLIENT_ID` and `DEPENDABOT_APP_PRIVATE_KEY`, or with the token named by `--alerts-token-secret`. One App secret without the other fails.
 
-It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, a ruleset that restricts updates to the default branch (its bypass list needs an admin token to read), label colour drift, and "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside.
+It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, a ruleset that restricts updates to the default branch (its bypass list needs an admin token to read), label colour drift, "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside, and, on github.a8c.com, a caller whose `SECEX_EGRESS_RULES` does not list `dependabot-badges.githubapp.com`.
 
 ### Output
 
@@ -381,7 +386,7 @@ What to do: trigger a fresh evaluation. Any new PR event does it, such as applyi
 
 ### A PR was routed for review with "the compatibility score for ... was unavailable"
 
-Dependabot publishes a compatibility score only for updates it has enough CI data on, and fetch-metadata reports a missing score as `0`. The workflow treats `0`, and anything that is not a whole number from 1 to 100, as no score, so the PR goes to review rather than reading as a 0% score. In a grouped update every direct dependency needs a score, and the comment names the first one without.
+Dependabot publishes a compatibility score only for updates it has enough CI data on, and fetch-metadata reports a missing score as `0`. It also reports `0` when it cannot reach `dependabot-badges.githubapp.com`, which is what happens on github.a8c.com when the caller's `SECEX_EGRESS_RULES` does not list that host. The audit reports this as the `compat_score_unreachable` risk. The workflow treats `0`, and anything that is not a whole number from 1 to 100, as no score, so the PR goes to review rather than reading as a 0% score. In a grouped update every direct dependency needs a score, and the comment names the first one without.
 
 Before v1.7 the compatibility lookup was never enabled and Gate 3 never ran, so direct-dependency PRs went to `pending-label` with no compatibility check. Expect more reviews of this kind after upgrading.
 

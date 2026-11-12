@@ -17,6 +17,11 @@ permissions:
     contents: write
     statuses: write
 
+# SecEx runners read egress rules from this file, not from the workflow it
+# calls. The badges host serves the Gate 3 compatibility score.
+env:
+    SECEX_EGRESS_RULES: 'github.a8c.com,*.github.a8c.com,dependabot-badges.githubapp.com'
+
 jobs:
     dependabot-auto-merge:
         # github.com is a mirror. Its main changes only at release time, and

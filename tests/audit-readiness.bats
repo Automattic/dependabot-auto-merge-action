@@ -15,6 +15,9 @@ setup() {
     mkdir -p "$GH_STUB_DIR"
     : >"$GH_STUB_LOG"
     PATH="$REPO_ROOT/tests/stubs:$PATH"
+    # The script reads GH_HOST, so a value from the developer's shell would
+    # change what the tests see. Tests that need a host set it per call.
+    unset GH_HOST
 }
 
 fixture() {
@@ -756,6 +759,85 @@ EOF
     run_audit
     [ "$(rec .checks.caller_workflow.status)" = "pass" ]
     [ "$(rec .checks.alerts_token.status)" = "pass" ]
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+# --- SecEx egress for the compatibility score ---------------------------------
+
+@test "on GHES a caller without the badges host in SECEX_EGRESS_RULES is a risk" {
+    repo_set
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+    [ "$(rec .verdict)" = "ready" ]
+}
+
+@test "on GHES egress rules that leave out the badges host are a risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'github.a8c.com,*.github.a8c.com'"'"'\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
+@test "on GHES egress rules with the badges host are no risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'github.a8c.com,*.github.a8c.com,dependabot-badges.githubapp.com'"'"'\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+@test "on GHES a commented-out egress rule with the badges host is a risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  # SECEX_EGRESS_RULES: '"'"'github.a8c.com,*.github.a8c.com,dependabot-badges.githubapp.com'"'"'\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
+@test "on GHES a trailing comment naming the badges host is a risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'github.a8c.com'"'"' # dependabot-badges.githubapp.com\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
+@test "on GHES a folded egress rule with the badges host is no risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: >-\n    github.a8c.com,*.github.a8c.com,\n    dependabot-badges.githubapp.com\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+@test "on GHES a folded egress rule ends at the next key" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: >-\n    github.a8c.com\n  OTHER: dependabot-badges.githubapp.com\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
+@test "on GHES a wildcard that covers the badges host is no risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'github.a8c.com,*.githubapp.com'"'"'\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+@test "on GHES a host that only ends in the badges host is a risk" {
+    repo_set '.caller.text |= sub("jobs:\n"; "env:\n  SECEX_EGRESS_RULES: '"'"'xdependabot-badges.githubapp.com'"'"'\n\njobs:\n")'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable") != null')" = "true" ]
+}
+
+# SecEx runs only on github.a8c.com, so another enterprise host has no
+# egress rules to check.
+@test "on another enterprise host the egress rules do not matter" {
+    repo_set
+    GH_HOST=ghe.example.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+@test "on github.com the egress rules do not matter" {
+    repo_set
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
+}
+
+@test "on GHES a repo with no caller has no egress risk" {
+    repo_set '.caller = null'
+    GH_HOST=github.a8c.com run_audit
+    [ "$(rec '.risks | map(.id) | index("compat_score_unreachable")')" = "null" ]
 }
 
 # The README's token caller is still supported, so it must pass too.

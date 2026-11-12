@@ -1142,6 +1142,7 @@ assemble() {
         --argjson include_forks "$INCLUDE_FORKS" \
         --argjson include_advisory_forks "$INCLUDE_ADVISORY_FORKS" \
         --arg audited_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg host "${GH_HOST:-github.com}" \
         '
         # Read from files rather than passed as arguments: on a large org
         # either one outgrows the 128 KB Linux allows a single argument.
@@ -1214,6 +1215,33 @@ assemble() {
                     }
                   }
               end;
+
+        # Every host a caller lists in SECEX_EGRESS_RULES, from each place the
+        # key is set. Comments are dropped first. The value may sit on the key
+        # line or, as a block scalar (>-, |) or plain multi-line scalar, on
+        # the more-indented lines below it. Entries split on commas and
+        # whitespace, with quotes removed.
+        def egress_hosts($t):
+            ($t // "" | split("\n") | map(sub("(^|\\s)#.*$"; ""))) as $l
+            | ($l | length) as $len
+            | range(0; $len) as $i
+            | ($l[$i] | capture("^(?<ind>\\s*)SECEX_EGRESS_RULES\\s*:\\s*(?<v>.*?)\\s*$")) as $m
+            | (if ($m.v | test("^([|>][-+0-9]*)?$")) then
+                 (first(range($i + 1; $len) as $j
+                        | select(($l[$j] | test("^\\s*$") | not)
+                                 and (($l[$j] | capture("^(?<s>\\s*)").s | length) <= ($m.ind | length)))
+                        | $j) // $len) as $end
+                 | $l[$i + 1:$end] | join(" ")
+               else $m.v end)
+            | gsub("[\"\\x27]"; "")
+            | splits("[,\\s]+")
+            | select(. != "");
+
+        # True when an egress host entry admits $host, either exactly or
+        # through a leading *. wildcard.
+        def egress_allows($t; $host):
+            any(egress_hosts($t);
+                . as $e | $e == $host or (($e | startswith("*.")) and ($host | endswith($e[1:]))));
 
         def check($status; $detail; $source): {status: $status, detail: $detail, source: $source};
 
@@ -1428,6 +1456,16 @@ assemble() {
                 (select($trusted and $n.hasVulnerabilityAlertsEnabled == true and ($n.everAlerts.totalCount // 0) == 0 and $manifest)
                   | {id: "alerts_enabled_no_alerts_ever", severity: "medium",
                      detail: "alerts are on but none have ever been raised; a stub or unresolvable lockfile silences Dependabot exactly like this"}),
+                # SecEx runners on github.a8c.com read egress rules from the
+                # caller only. Without the badges host, fetch-metadata reads
+                # every compatibility score as 0 and Gate 3 sends each
+                # direct-dependency PR to review. Safe, so a risk, not a fail.
+                # SecEx is specific to github.a8c.com, so other enterprise
+                # hosts are left alone.
+                (select($host == "github.a8c.com" and $caller.present == true
+                        and (egress_allows($n.caller.text; "dependabot-badges.githubapp.com") | not))
+                  | {id: "compat_score_unreachable", severity: "medium",
+                     detail: "the caller does not list dependabot-badges.githubapp.com in SECEX_EGRESS_RULES; SecEx runners read egress rules from the caller only, so every compatibility score reads as 0 and Gate 3 sends each direct-dependency PR to review"}),
                 # Colours must stay in sync with the LABELS array in scripts/bootstrap.sh.
                 ([{want: $ft, set: $n.ft, color: "0075ca"},
                   {want: $pend, set: $n.pend, color: "e4e669"},
