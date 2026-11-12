@@ -855,6 +855,34 @@ with_input() {
     [ "$(rec .caller.merge_mode.mode)" = "unattended" ]
 }
 
+# Found in the second review of #15. A job is a mapping, so with: can come
+# before uses:, and a with: the audit cannot read must not pass as defaults.
+@test "a with: block above uses: is still read" {
+    repo_set '.caller.text |= (sub("    with:\n      event-name: [^\n]*\n"; "")
+                               | sub("    uses: "; "    with:\n      event-name: ${{ github.event_name }}\n      merge-mode: human-only\n      review-team: acme/security\n    uses: "))'
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "human-only" ]
+    [ "$(rec .caller.review_team)" = "acme/security" ]
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+}
+
+@test "a with: on one line is unrecognized, not read as defaults" {
+    repo_set '.caller.text |= sub("    with:\n      event-name: [^\n]*\n"; "    with: {event-name: \"${{ github.event_name }}\", merge-mode: human-only}\n")'
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "unknown" ]
+    [[ "$(rec .checks.caller_workflow.detail)" == *"with: on one line"* ]]
+    [ "$(rec .caller.merge_mode.mode)" = "unknown" ]
+    [ "$(rec '.risks | map(.id) | index("review_team_unset")')" = "null" ]
+    [ "$(rec .verdict)" = "unknown" ]
+}
+
+@test "another job with its own with: block is not read" {
+    repo_set '.caller.text |= sub("jobs:\n"; "jobs:\n  other:\n    runs-on: ubuntu-latest\n    with:\n      merge-mode: human-only\n      review-team: acme/other\n    steps:\n      - run: echo\n")'
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "unattended" ]
+    [ "$(rec .caller.review_team)" = "null" ]
+}
+
 # Every check and risk human-only converts, each pinned on its own.
 @test "human-only turns each scheduled-merge check from fail to na" {
     local broken='. * {autoMergeAllowed: false, squashMergeAllowed: false}

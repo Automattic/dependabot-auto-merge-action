@@ -1181,28 +1181,54 @@ assemble() {
 
         def indent: capture("^(?<s>[ \\t]*)").s | length;
 
-        # The lines of the with: block in the job that calls this workflow,
-        # from caller text $tc with comments dropped. Inputs are read from
-        # here only, so a workflow_dispatch input or any other key of the
-        # same name elsewhere in the file is never taken for one, whether
-        # it is written as a block or on one line. A with: written as a
-        # one-line flow mapping reads as empty, so its inputs take their
-        # defaults.
-        def with_block($tc):
+        # The job that calls this workflow, in caller text $tc with comments
+        # dropped: its lines, its key indentation and the range of line
+        # indices it spans. A job is a mapping, so its keys can come in any
+        # order, and with: may sit above uses: as well as below it. Null
+        # when no job calls the workflow.
+        def calling_job($tc):
             ($tc | split("\n")) as $l
             | [range(0; $l | length) | select(($l[.] | test("^[ \\t]*$")) | not)] as $lines
             | ([$lines[] | select($l[.] | test("^[ \\t]*uses[ \\t]*:[ \\t]*\\S*dependabot-auto-merge\\.yml@"))] | first) as $u
-            | if $u == null then ""
+            | if $u == null then null
               else
                 ($l[$u] | indent) as $ui
-                # The job ends at the first line indented less than its keys.
-                | ([$lines[] | select(. > $u and ($l[.] | indent) < $ui)] | first // ($l | length)) as $end
-                | ([$lines[] | select(. > $u and . < $end and ($l[.] | indent) == $ui
-                                      and ($l[.] | test("^[ \\t]*with[ \\t]*:[ \\t]*$")))] | first) as $w
-                | if $w == null then ""
+                # The job key is the last line above uses: indented less
+                # than its keys, and the job ends at the next such line.
+                | {l: $l, lines: $lines, ui: $ui,
+                   start: ([$lines[] | select(. < $u and ($l[.] | indent) < $ui)] | last // -1),
+                   end: ([$lines[] | select(. > $u and ($l[.] | indent) < $ui)] | first // ($l | length))}
+              end;
+
+        # The line index of the calling job key $key, or null.
+        def job_key($job; $key):
+            [$job.lines[] | select(. > $job.start and . < $job.end
+                                   and ($job.l[.] | indent) == $job.ui
+                                   and ($job.l[.] | test("^[ \\t]*" + $key + "[ \\t]*:")))] | first;
+
+        # True when the calling job writes with: with its value on the same
+        # line, such as a one-line flow mapping. The audit does not parse
+        # that, so it reports the caller as unrecognized rather than read
+        # every input as its default.
+        def with_inline($tc):
+            calling_job($tc) as $job
+            | if $job == null then false
+              else job_key($job; "with") as $w
+                | $w != null and ($job.l[$w] | test("^[ \\t]*with[ \\t]*:[ \\t]*\\S"))
+              end;
+
+        # The lines of the with: block in the calling job, from caller text $tc
+        # with comments dropped. Inputs are read from here only, so a
+        # workflow_dispatch input or any other key of the same name
+        # elsewhere in the file is never taken for one.
+        def with_block($tc):
+            calling_job($tc) as $job
+            | if $job == null then ""
+              else job_key($job; "with") as $w
+                | if $w == null or ($job.l[$w] | test("^[ \\t]*with[ \\t]*:[ \\t]*\\S")) then ""
                   else
-                    ([$lines[] | select(. > $w and ($l[.] | indent) <= $ui)] | first // ($l | length)) as $wend
-                    | $l[$w + 1:$wend] | join("\n")
+                    ([$job.lines[] | select(. > $w and ($job.l[.] | indent) <= $job.ui)] | first // ($job.l | length)) as $wend
+                    | $job.l[$w + 1:$wend] | join("\n")
                   end
               end;
 
@@ -1219,13 +1245,14 @@ assemble() {
             ($n.caller.text // "") as $t
             | if ($n.caller == null) then {present: false}
               else
-                (caller_shape($t)) as $shape
+                ($t | split("\n") | map(sub("(^|\\s)#.*$"; "")) | join("\n")) as $tc
+                | (caller_shape($t)
+                   | if . == "recognized" and with_inline($tc) then "unrecognized: with: on one line" else . end) as $shape
                 | ($t | capture("dependabot-auto-merge\\.yml@(?<ref>[0-9A-Za-z._-]+)") // {}) as $m
                 | ($t | capture("dependabot-auto-merge\\.yml@[0-9A-Za-z._-]+\\s*#\\s*(?<v>[A-Za-z0-9._-]+)") // {}) as $vc
                 | ($t | capture("(^|\\n)\\s*merge-method\\s*:\\s*[^a-z\\s]?(?<mm>[a-z]+)") // {}) as $mm
-                # Inputs whose value matters, read with comments dropped, so
-                # a commented-out example does not count as set.
-                | ($t | split("\n") | map(sub("(^|\\s)#.*$"; "")) | join("\n")) as $tc
+                # Inputs whose value matters are read from $tc, which has
+                # comments dropped, so a commented-out example does not count.
                 | {v: input_value($tc; "merge-mode")} as $mmode
                 | {v: input_value($tc; "review-team")} as $rteam
                 | ($t | test("(^|\\n)\\s*schedule\\s*:")) as $has_schedule
@@ -1257,7 +1284,9 @@ assemble() {
                     merge_mode: (
                       # An expression is decided at run time, so the
                       # audit cannot say which mode it picks.
-                      if ($mmode.v // "") | startswith("${{") then {mode: "unknown", source: "expression"}
+                      # A caller the audit cannot parse gets no guessed mode.
+                      if $shape != "recognized" then {mode: "unknown", source: "unparsed"}
+                      elif ($mmode.v // "") | startswith("${{") then {mode: "unknown", source: "expression"}
                       elif ($mmode.v // "") == "human-only" then {mode: "human-only", source: "input"}
                       elif ($mmode.v // "unattended") != "unattended" then {mode: $mmode.v, source: "input", invalid: true}
                       elif ($has_schedule | not) and ($mmode.v == null) then {mode: "human-only", source: "no schedule trigger"}
