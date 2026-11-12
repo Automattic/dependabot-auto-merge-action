@@ -1179,12 +1179,37 @@ assemble() {
             elif (($t | [match("(^|\\n)---"; "g")] | length) > 1) then "unrecognized: multiple documents"
             else "recognized" end;
 
-        # The value of input $name in caller text $tc, or null. Only a value
-        # on the same line as the key counts. A key with nothing after it, as
-        # a workflow_dispatch input of the same name, is a mapping, not a
-        # value, so it is passed over rather than read as the next line.
+        def indent: capture("^(?<s>[ \\t]*)").s | length;
+
+        # The lines of the with: block in the job that calls this workflow,
+        # from caller text $tc with comments dropped. Inputs are read from
+        # here only, so a workflow_dispatch input or any other key of the
+        # same name elsewhere in the file is never taken for one, whether
+        # it is written as a block or on one line. A with: written as a
+        # one-line flow mapping reads as empty, so its inputs take their
+        # defaults.
+        def with_block($tc):
+            ($tc | split("\n")) as $l
+            | [range(0; $l | length) | select(($l[.] | test("^[ \\t]*$")) | not)] as $lines
+            | ([$lines[] | select($l[.] | test("^[ \\t]*uses[ \\t]*:[ \\t]*\\S*dependabot-auto-merge\\.yml@"))] | first) as $u
+            | if $u == null then ""
+              else
+                ($l[$u] | indent) as $ui
+                # The job ends at the first line indented less than its keys.
+                | ([$lines[] | select(. > $u and ($l[.] | indent) < $ui)] | first // ($l | length)) as $end
+                | ([$lines[] | select(. > $u and . < $end and ($l[.] | indent) == $ui
+                                      and ($l[.] | test("^[ \\t]*with[ \\t]*:[ \\t]*$")))] | first) as $w
+                | if $w == null then ""
+                  else
+                    ([$lines[] | select(. > $w and ($l[.] | indent) <= $ui)] | first // ($l | length)) as $wend
+                    | $l[$w + 1:$wend] | join("\n")
+                  end
+              end;
+
+        # The value of input $name in the with: block of caller text $tc, or
+        # null. Only a value on the same line as the key counts.
         def input_value($tc; $name):
-            [$tc | match("(^|\\n)[ \\t]*" + $name + "[ \\t]*:[ \\t]*([^\\n]*)"; "g")
+            [with_block($tc) | match("(^|\\n)[ \\t]*" + $name + "[ \\t]*:[ \\t]*([^\\n]*)"; "g")
              | .captures[1].string
              | sub("[ \\t]+$"; "") | sub("^[\"\\x27]"; "") | sub("[\"\\x27]$"; "")
              | select(length > 0)]

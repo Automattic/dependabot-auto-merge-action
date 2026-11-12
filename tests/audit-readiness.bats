@@ -830,6 +830,68 @@ with_input() {
     [ "$(rec '.risks | map(.id) | index("approval_rule")')" = "null" ]
 }
 
+# Found in review of #15: a flow-style dispatch input was read as the mode,
+# and any key of the same name elsewhere in the file could be. Inputs are
+# read from the with: block of the job that calls the workflow only.
+@test "a flow-style workflow_dispatch input named merge-mode is not read as the mode" {
+    local dispatch='  workflow_dispatch:\n    inputs:\n      merge-mode: {type: string, default: human-only}\n'
+    repo_set "$(printf '.caller.text |= sub("permissions:"; "%spermissions:")' "$dispatch")"
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "unattended" ]
+    [ "$(rec .caller.merge_mode.source)" = "default" ]
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+}
+
+@test "a review-team outside the with: block does not count as set" {
+    repo_set '.caller.text |= sub("permissions:"; "env:\n  review-team: acme/security\npermissions:")'
+    run_audit
+    [ "$(rec .caller.review_team)" = "null" ]
+    [ "$(rec '.risks | map(.id) | index("review_team_unset") != null')" = "true" ]
+}
+
+@test "an input under secrets: is not read as a with: input" {
+    repo_set '.caller.text |= sub("      token: "; "      merge-mode: human-only\n      token: ")'
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "unattended" ]
+}
+
+# Every check and risk human-only converts, each pinned on its own.
+@test "human-only turns each scheduled-merge check from fail to na" {
+    local broken='. * {autoMergeAllowed: false, squashMergeAllowed: false}
+        | .defaultBranchRef.rules.nodes = []
+        | .defaultBranchRef.branchProtectionRule = {requiresStatusChecks: false, requiredStatusCheckContexts: [],
+            restrictsPushes: true, pushAllowances: {totalCount: 0, nodes: []}}'
+    repo_set "$broken"
+    run_audit
+    for c in auto_merge required_checks merge_method push_restrictions; do
+        [ "$(rec ".checks.$c.status")" = "fail" ]
+    done
+    repo_set "$broken | $(with_input merge-mode human-only)"
+    run_audit
+    for c in auto_merge required_checks merge_method push_restrictions; do
+        [ "$(rec ".checks.$c.status")" = "na" ]
+        [[ "$(rec ".checks.$c.detail")" == "human-only, so this does not block: "* ]]
+    done
+    [ "$(rec .verdict)" = "ready" ]
+}
+
+@test "human-only drops the restricted-update risk" {
+    local rule='{type: "UPDATE", parameters: null, repositoryRuleset: {name: "Main rules", enforcement: "ACTIVE"}}'
+    repo_set ".defaultBranchRef.rules.nodes += [$rule]"
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("update_restricted") != null')" = "true" ]
+    repo_set ".defaultBranchRef.rules.nodes += [$rule] | $(with_input merge-mode human-only)"
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("update_restricted")')" = "null" ]
+}
+
+@test "human-only keeps the checks and risks a person still needs" {
+    repo_set ". * {hasVulnerabilityAlertsEnabled: false} | $(with_input merge-mode human-only)"
+    run_audit
+    [ "$(rec .checks.vuln_alerts.status)" = "fail" ]
+    [ "$(rec .verdict)" = "blocked" ]
+}
+
 @test "the table, csv and summary report the merge mode" {
     repo_set "$(with_input merge-mode human-only)"
     run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format table --format csv --format summary
