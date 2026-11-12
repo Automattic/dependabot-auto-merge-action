@@ -271,3 +271,26 @@ job_block() {
     grep -qxF -- "$want" <<<"$readme"
     grep -qxF -- "$want" "$REPO_ROOT/.github/workflows/dependabot-auto-merge-self.yml"
 }
+
+# --- merge mode (QAO-697) ---------------------------------------------------
+
+# The scheduled job is the only path that merges without a person, so the
+# mode has to gate it. Exactly unattended, so a typo never merges.
+@test "the scheduled merge runs in unattended mode only" {
+    grep -A6 '^    scheduled-merge:$' "$WORKFLOW" \
+        | grep -qxF "        if: inputs.event-name == 'schedule' && inputs.merge-mode == 'unattended'"
+}
+
+@test "a human-only schedule run skips preflight, and any other mode reaches it" {
+    block=$(job_block preflight)
+    grep -qF "(inputs.event-name == 'schedule' && inputs.merge-mode != 'human-only') ||" <<<"$block"
+}
+
+@test "the gates run whatever the merge mode" {
+    ! grep -qF 'merge-mode' <<<"$(job_block evaluate-pr)"
+}
+
+@test "preflight reads the merge mode" {
+    run extract_key preflight-checks env
+    grep -qxF 'MERGE_MODE: ${{ inputs.merge-mode }}' <<<"$output"
+}

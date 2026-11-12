@@ -729,11 +729,114 @@ EOF
     [[ "$(rec .checks.caller_workflow.detail)" == *"labeled"* ]]
 }
 
-@test "a missing schedule trigger fails, because the age gate never fires" {
-    repo_set '.caller.text |= sub("  schedule:\n    - cron: .0 9 \\* \\* \\*.\n"; "")'
+# --- merge mode (QAO-697) ---------------------------------------------------
+
+NO_SCHEDULE='.caller.text |= sub("  schedule:\n    - cron: .0 9 \\* \\* \\*.\n"; "")'
+
+# Set input $1 to $2 in the caller's with: block.
+with_input() {
+    printf '.caller.text |= sub("      event-name: "; "      %s: %s\n      event-name: ")' "$1" "$2"
+}
+
+@test "a caller that passes no merge-mode is unattended" {
+    repo_set
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "unattended" ]
+    [ "$(rec .caller.merge_mode.source)" = "default" ]
+}
+
+@test "merge-mode human-only is read from the caller" {
+    repo_set "$(with_input merge-mode "'human-only'")"
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "human-only" ]
+    [ "$(rec .caller.merge_mode.source)" = "input" ]
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+}
+
+# Before the input, dropping the schedule trigger was the only way to keep
+# merges human, so a caller that did it is reported as human-only.
+@test "a caller with no schedule trigger and no merge-mode is human-only" {
+    repo_set "$NO_SCHEDULE"
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "human-only" ]
+    [ "$(rec .caller.merge_mode.source)" = "no schedule trigger" ]
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+}
+
+@test "an explicit unattended mode with no schedule trigger fails, because nothing merges" {
+    repo_set "$NO_SCHEDULE | $(with_input merge-mode unattended)"
     run_audit
     [ "$(rec .checks.caller_workflow.status)" = "fail" ]
-    [[ "$(rec .checks.caller_workflow.detail)" == *"age gate"* ]]
+    [[ "$(rec .checks.caller_workflow.detail)" == *"no schedule trigger, so nothing merges"* ]]
+}
+
+@test "an unrecognised merge-mode fails, because preflight fails every run" {
+    repo_set "$(with_input merge-mode human_only)"
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "fail" ]
+    [[ "$(rec .checks.caller_workflow.detail)" == *"merge-mode human_only is neither unattended nor human-only"* ]]
+}
+
+@test "a commented-out merge-mode does not count" {
+    repo_set "$(with_input "# merge-mode" human-only)"
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "unattended" ]
+}
+
+# The workflow makes no merge in human-only mode, so the settings that only
+# its own merge needs cannot block the repo. Preflight warns on them there.
+@test "human-only does not block on the settings only the scheduled merge needs" {
+    repo_set ". * {autoMergeAllowed: false, squashMergeAllowed: false} | $(with_input merge-mode human-only)"
+    run_audit
+    [ "$(rec .verdict)" = "ready" ]
+    [ "$(rec .checks.auto_merge.status)" = "na" ]
+    [ "$(rec .checks.merge_method.status)" = "na" ]
+    [[ "$(rec .checks.auto_merge.detail)" == "human-only, so this does not block: "* ]]
+}
+
+@test "the same settings still block an unattended repo" {
+    repo_set ". * {autoMergeAllowed: false, squashMergeAllowed: false}"
+    run_audit
+    [ "$(rec .verdict)" = "blocked" ]
+    [ "$(rec .checks.auto_merge.status)" = "fail" ]
+    [ "$(rec .checks.merge_method.status)" = "fail" ]
+}
+
+@test "human-only drops the approval risk, since a person merges anyway" {
+    local rule='{type: "PULL_REQUEST", parameters: {__typename: "PullRequestParameters", requiredApprovingReviewCount: 1}, repositoryRuleset: {name: "Main rules", enforcement: "ACTIVE"}}'
+    repo_set ".defaultBranchRef.rules.nodes += [$rule]"
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("approval_rule") != null')" = "true" ]
+    repo_set ".defaultBranchRef.rules.nodes += [$rule] | $(with_input merge-mode human-only)"
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("approval_rule")')" = "null" ]
+}
+
+@test "the table, csv and summary report the merge mode" {
+    repo_set "$(with_input merge-mode human-only)"
+    run "$SCRIPT" --repo acme/widgets --out-dir "$OUT" --format table --format csv --format summary
+    [ "$status" -eq 0 ]
+    [[ $output == *"MODE"* ]]
+    grep -qE '^acme/widgets +ready +human-only ' <<<"$output"
+    [[ $output == *"merge_method,merge_mode,blockers"* ]]
+    [[ $output == *'"pass","human-only",'* ]]
+    grep -qE '^  1 +human-only$' <<<"$(sed -n '/^Merge mode:/,/^$/p' <<<"$output")"
+}
+
+# --- review routing (QAO-697) -----------------------------------------------
+
+@test "a caller with no review-team is a risk" {
+    repo_set
+    run_audit
+    [ "$(rec '.risks | map(.id) | index("review_team_unset") != null')" = "true" ]
+    [ "$(rec .verdict)" = "ready" ]
+}
+
+@test "a caller with a review-team is not" {
+    repo_set "$(with_input review-team "'acme/security'")"
+    run_audit
+    [ "$(rec .caller.review_team)" = "acme/security" ]
+    [ "$(rec '.risks | map(.id) | index("review_team_unset")')" = "null" ]
 }
 
 @test "permissions present in only one block fails" {
@@ -1674,4 +1777,25 @@ EOF
     fixture graphql_RepoSet <<<'{"data":null,"errors":[{"message":"boom"}]}'
     run_audit
     [ "$status" -ne 0 ] || [ "$(wc -l <"$OUT/repos.jsonl" | tr -d ' ')" -eq 0 ]
+}
+
+# The README's human-only example is what people copy to opt out, so the
+# audit has to read it as written: human-only, and routed to a team.
+@test "the README's human-only example reads as human-only with a review team" {
+    local readme_caller example
+    readme_caller=$(awk '/^# \.github\/workflows\/dependabot-auto-merge\.yml$/{on=1} on&&/^```$/{exit} on' "$REPO_ROOT/README.md" \
+        | sed 's/@<sha>/@8143c95d871e96dc12cb448aa1dde9c2abae694e/')
+    example=$(awk '/^Leave every merge to a person/{on=1} on&&/^    merge-mode:|^    review-team:/{print}' "$REPO_ROOT/README.md")
+    [ "$(wc -l <<<"$example")" -eq 2 ]
+    # Splice the example's inputs into the caller's with: block, at the
+    # caller's indentation. ENVIRON, since BSD awk refuses a newline in -v.
+    readme_caller=$(EX="$example" awk '{print} /^            event-name: /{n=split(ENVIRON["EX"], l, "\n"); for (i=1;i<=n;i++) {sub(/^ +/, "", l[i]); print "            " l[i]}}' <<<"$readme_caller")
+    repo_set ".caller.text = $(jq -n --arg t "$readme_caller" '$t')"
+    secrets_fixture ""
+    org_secrets_fixture "DEPENDABOT_APP_CLIENT_ID,DEPENDABOT_APP_PRIVATE_KEY"
+    run_audit
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+    [ "$(rec .caller.merge_mode.mode)" = "human-only" ]
+    [ "$(rec .caller.review_team)" = "my-org/my-team" ]
+    [ "$(rec '.risks | map(.id) | index("review_team_unset")')" = "null" ]
 }

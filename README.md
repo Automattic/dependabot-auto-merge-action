@@ -13,6 +13,17 @@ A reusable GitHub Actions workflow that automatically merges Dependabot security
 
 PRs that fail any gate are labelled `sirt-review-required` (or your custom label) and routed for human review. A person who can merge bypasses all gates by enabling auto-merge on the PR with GitHub's own button. The workflow then posts a one-time audit comment recording who enabled it, when, and a link to the workflow run, and applies the `security-fast-track` label as a marker.
 
+## Merge modes
+
+Each repository picks who merges a PR that clears every gate, with the `merge-mode` input.
+
+- **`unattended`** (the default). The scheduled job merges the PR once it passes the age gate. For simple and internal projects.
+- **`human-only`**. The gates, labels and review comments run as usual, but the scheduled job never merges. A person reviews and merges each PR, with the merge button once checks pass, or with "Enable auto-merge" while they are still running. For high-traffic projects, visible open source, and repositories whose default branch rides a deploy train.
+
+Set `review-team` in either mode. It is the only input that mentions anyone, so without it a PR routed to review gets a label and a comment that reach nobody. In `human-only` mode every PR waits on a person, so it matters more there.
+
+Before v1.9 the only way to keep merges human was to drop the `schedule` trigger from the caller. That still works, and the readiness audit reports such a caller as `human-only`, but the input says what it means.
+
 `sirt-review-required` and `auto-merge-pending` are mutually exclusive workflow states: every evaluation applies one and removes the other, so a re-evaluated PR — say after Dependabot rewrites the branch — never carries both.
 
 ## Usage
@@ -221,12 +232,14 @@ The audit reads each repository's caller from `.github/workflows/dependabot-auto
 3. The three labels exist, compared case-insensitively because the Actions runtime is.
 4. Dependabot vulnerability alerts are enabled.
 5. `.github/dependabot.yml` exists. A `.github/dependabot.yaml` is a failure, because Dependabot only reads `.yml`.
-6. The caller workflow is present and well formed: both triggers, `labeled` in `types`, a commit SHA rather than a tag, and `pull-requests: write`, `contents: write` and `statuses: write` in both the workflow-level and job-level blocks. A leftover `security-events: read` is allowed but not needed.
+6. The caller workflow is present and well formed: a `pull_request_target` trigger, a `schedule` trigger unless the repository is `human-only`, a `merge-mode` the workflow accepts, `labeled` in `types`, a commit SHA rather than a tag, and `pull-requests: write`, `contents: write` and `statuses: write` in both the workflow-level and job-level blocks. A leftover `security-events: read` is allowed but not needed.
 7. The repo allows the merge method the workflow will use: the caller's `merge-method`, or squash when it passes none. For a repo that has not adopted yet, `--merge-method` sets the method to check. Nothing else catches this, and a repo with squash disabled passes preflight and then fails at `gh pr merge --squash`.
 8. Classic branch protection does not restrict who can push to the default branch, or allows the GitHub Actions app when it does.
 9. A credential that can read Dependabot alerts reaches the repo as an Actions secret, at repo or organisation level. For a caller, that is the App secrets or the token it passes. A repo that has not adopted yet passes with `DEPENDABOT_APP_CLIENT_ID` and `DEPENDABOT_APP_PRIVATE_KEY`, or with the token named by `--alerts-token-secret`. One App secret without the other fails.
 
-It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, a ruleset that restricts updates to the default branch (its bypass list needs an admin token to read), label colour drift, "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside, and, on github.a8c.com, a caller whose `SECEX_EGRESS_RULES` does not list `dependabot-badges.githubapp.com`.
+It also reports risks, which never change a verdict: a strict required-status-checks policy, an approval rule a bot PR can never satisfy, a ruleset that is not in `ACTIVE` mode, a ruleset that restricts updates to the default branch (its bypass list needs an admin token to read), label colour drift, "alerts enabled but none ever raised", which is what a stub or unresolvable lockfile looks like from outside, on github.a8c.com, a caller whose `SECEX_EGRESS_RULES` does not list `dependabot-badges.githubapp.com`, and a caller with no `review-team`.
+
+Each adopted repository's merge mode is in its record, and in the `table`, `csv` and `summary` views. A caller with no `schedule` trigger and no `merge-mode` counts as `human-only`. For a `human-only` repository, the checks that only the scheduled merge needs (checks 1, 2, 7 and 8) report `na` rather than `fail`, keeping their detail, and the approval and restricted-update risks are dropped, since a person merges each PR.
 
 ### Output
 
@@ -250,10 +263,11 @@ With `--org`, the audit guesses an owning team for each repository: the smallest
 | `compatibility-threshold` | number | `80` | Minimum compatibility score % for Gate 3 (direct deps only). |
 | `age-days` | number | `7` | Days a PR must be open before the scheduled job merges it. |
 | `merge-method` | string | `'squash'` | `squash`, `merge`, or `rebase`. |
+| `merge-mode` | string | `'unattended'` | `unattended` or `human-only`. See [Merge modes](#merge-modes). Any other value fails preflight. |
 | `fast-track-label` | string | `'security-fast-track'` | Marker label applied when a person enables auto-merge on a PR. Applying it by hand does nothing. |
 | `review-label` | string | `'sirt-review-required'` | Label applied when a PR fails a gate. |
 | `pending-label` | string | `'auto-merge-pending'` | Label applied when a PR passes all gates and is waiting for the age gate. |
-| `review-team` | string | `''` | Optional. GitHub team slug (`org/team`) @-mentioned in review-required comments. |
+| `review-team` | string | `''` | GitHub team slug (`org/team`) @-mentioned in review-required comments. Optional, but without it nobody is told a PR needs review. |
 | `runner` | string | `''` | Optional. Runner labels for every job, as a JSON array such as `'["self-hosted","secex","gha-runner-2cpu-4gb"]'`. Empty picks `ubuntu-latest` on github.com and a SecEx runner on github.a8c.com. |
 
 ## Secrets
@@ -282,6 +296,15 @@ with:
     event-name: ${{ github.event_name }}
     merge-method: 'merge'
     review-team: 'my-org/security-team'
+```
+
+Leave every merge to a person, and tell the owning team about each PR the gates send to review:
+
+```yaml
+with:
+    event-name: ${{ github.event_name }}
+    merge-mode: 'human-only'
+    review-team: 'my-org/my-team'
 ```
 
 Use custom label names:
@@ -421,6 +444,8 @@ Two cases warn and continue instead of failing, because the condition is unverif
 - The token cannot see the "Allow auto-merge" setting (it's only returned to tokens with push access).
 - The branch has classic protection, the host's branch endpoint carries no protection summary, and the token cannot read the details (the endpoint requires admin — the standard `GITHUB_TOKEN` limitation). Migrating to rulesets makes this fully verifiable.
 
+In `human-only` mode both checks warn instead of failing, since the workflow merges nothing and a failed preflight would also stop the gates and the review routing. A scheduled run in that mode skips preflight and the scheduled merge altogether. A `merge-mode` other than `unattended` or `human-only` fails preflight on every run.
+
 A red preflight is intentional: it surfaces a repo where auto-merge could never have worked. It adds roughly 10–20 seconds of runner spin-up per Dependabot event.
 
 ### `evaluate-pr` job (triggers on `pull_request_target`)
@@ -437,7 +462,7 @@ Runs on every opened/updated/labelled Dependabot PR, and when a person enables a
 
 ### `scheduled-merge` job (triggers on `schedule`)
 
-Runs on the cron you define in the caller, after preflight passes. Finds open PRs labelled `pending-label` that are older than `age-days` days and merges each one GitHub would merge now — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set. That exclusion ignores case, matching how Actions, `gh pr edit` and `gh pr list --label` compare labels, so a `review-label` input whose casing differs from the repository label still excludes the PR.
+Runs on the cron you define in the caller, after preflight passes, and only when `merge-mode` is `unattended`. Finds open PRs labelled `pending-label` that are older than `age-days` days and merges each one GitHub would merge now — excluding any that also carry `review-label`, so a stale pending label can never put a human-review PR back in the merge set. That exclusion ignores case, matching how Actions, `gh pr edit` and `gh pr list --label` compare labels, so a `review-label` input whose casing differs from the repository label still excludes the PR.
 
 The labels only choose candidates. They are not proof a PR passed, because a triage user can apply `pending-label` or remove `review-label`, and evaluation never touches the labels of a routine version update. Each candidate merges only when the latest `dependabot-auto-merge/eligibility` status from `github-actions[bot]` on its current head commit is `success`. That status comes from evaluate-pr alone. Creating one takes `statuses: write`, which triage users do not have, and it belongs to one commit, so evidence for an earlier head does not carry over to a new one. A candidate with no evidence, or withdrawn evidence, is skipped with a warning. A failed status lookup skips the PR and fails the job, as a failed merge does.
 

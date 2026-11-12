@@ -31,6 +31,10 @@ Steps:
   4. Create or update the three labels the workflow depends on
   5. Enable Dependabot vulnerability alerts
 
+  Steps 1 to 3 serve the scheduled merge. A repository whose caller sets
+  merge-mode: human-only merges nothing on its own, and preflight only warns
+  when they are missing. A person who enables auto-merge still needs them.
+
 Options:
   --required-check <name>  Check-run name to require on the default branch when
                            no required status checks exist yet. Use the
