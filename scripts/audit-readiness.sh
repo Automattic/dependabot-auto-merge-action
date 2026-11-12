@@ -1179,6 +1179,17 @@ assemble() {
             elif (($t | [match("(^|\\n)---"; "g")] | length) > 1) then "unrecognized: multiple documents"
             else "recognized" end;
 
+        # The value of input $name in caller text $tc, or null. Only a value
+        # on the same line as the key counts. A key with nothing after it, as
+        # a workflow_dispatch input of the same name, is a mapping, not a
+        # value, so it is passed over rather than read as the next line.
+        def input_value($tc; $name):
+            [$tc | match("(^|\\n)[ \\t]*" + $name + "[ \\t]*:[ \\t]*([^\\n]*)"; "g")
+             | .captures[1].string
+             | sub("[ \\t]+$"; "") | sub("^[\"\\x27]"; "") | sub("[\"\\x27]$"; "")
+             | select(length > 0)]
+            | first // null;
+
         def caller_info($n):
             ($n.caller.text // "") as $t
             | if ($n.caller == null) then {present: false}
@@ -1190,8 +1201,8 @@ assemble() {
                 # Inputs whose value matters, read with comments dropped, so
                 # a commented-out example does not count as set.
                 | ($t | split("\n") | map(sub("(^|\\s)#.*$"; "")) | join("\n")) as $tc
-                | ($tc | capture("(^|\\n)\\s*merge-mode\\s*:\\s*[\"\\x27]?(?<v>[^\"\\x27\\s]+)") // {}) as $mmode
-                | ($tc | capture("(^|\\n)\\s*review-team\\s*:\\s*[\"\\x27]?(?<v>[^\"\\x27\\s]+)") // {}) as $rteam
+                | {v: input_value($tc; "merge-mode")} as $mmode
+                | {v: input_value($tc; "review-team")} as $rteam
                 | ($t | test("(^|\\n)\\s*schedule\\s*:")) as $has_schedule
                 # Both the workflow-level and job-level blocks must carry
                 # every permission, so each must appear at least twice. The
@@ -1219,7 +1230,10 @@ assemble() {
                     # merge-mode input, a caller made a repo human-only by
                     # dropping its schedule trigger, so that still counts.
                     merge_mode: (
-                      if ($mmode.v // "") == "human-only" then {mode: "human-only", source: "input"}
+                      # An expression is decided at run time, so the
+                      # audit cannot say which mode it picks.
+                      if ($mmode.v // "") | startswith("${{") then {mode: "unknown", source: "expression"}
+                      elif ($mmode.v // "") == "human-only" then {mode: "human-only", source: "input"}
                       elif ($mmode.v // "unattended") != "unattended" then {mode: $mmode.v, source: "input", invalid: true}
                       elif ($has_schedule | not) and ($mmode.v == null) then {mode: "human-only", source: "no schedule trigger"}
                       else {mode: "unattended", source: (if $mmode.v then "input" else "default" end)} end),

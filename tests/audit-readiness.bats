@@ -783,6 +783,24 @@ with_input() {
     [ "$(rec .caller.merge_mode.mode)" = "unattended" ]
 }
 
+# Found on the QAO-697 fixture: a workflow_dispatch input of the same name
+# came first, and the mode was read from the line after it as "type:".
+@test "a workflow_dispatch input named merge-mode is not read as the mode" {
+    local dispatch='  workflow_dispatch:\n    inputs:\n      merge-mode:\n        type: string\n        default: human-only\n'
+    repo_set "$(printf '.caller.text |= sub("permissions:"; "%spermissions:")' "$dispatch") | $(with_input merge-mode human-only)"
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "human-only" ]
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+}
+
+@test "a merge-mode set by an expression is unknown, not invalid" {
+    repo_set "$(with_input merge-mode "\${{ vars.MERGE_MODE }}")"
+    run_audit
+    [ "$(rec .caller.merge_mode.mode)" = "unknown" ]
+    [ "$(rec .caller.merge_mode.source)" = "expression" ]
+    [ "$(rec .checks.caller_workflow.status)" = "pass" ]
+}
+
 # The workflow makes no merge in human-only mode, so the settings that only
 # its own merge needs cannot block the repo. Preflight warns on them there.
 @test "human-only does not block on the settings only the scheduled merge needs" {
