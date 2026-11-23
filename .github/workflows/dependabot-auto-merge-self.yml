@@ -27,7 +27,7 @@ jobs:
         # github.com is a mirror. Its main changes only at release time, and
         # pull requests are moved to github.a8c.com.
         if: github.server_url != 'https://github.com'
-        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@0d4760c15b06689e86b75dd552d8ee11a4fb9c60 # v1.8.1
+        uses: Automattic/dependabot-auto-merge-action/.github/workflows/dependabot-auto-merge.yml@89949a072099163f39d096c60775dc75917e476b # v1.8.2
         permissions:
             pull-requests: write
             contents: write
